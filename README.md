@@ -53,6 +53,7 @@ python -m bili_recipe_notes "https://www.bilibili.com/video/BVxxxx"
 outputs/视频标题/
 ├── recipe.json
 ├── note.md
+├── llm_final_note.md
 ├── transcript.json
 └── images/
     ├── step_01.jpg
@@ -60,6 +61,8 @@ outputs/视频标题/
 ```
 
 `note.md` 为最终单一文档：会优先通过 opencode 重写为固定结构（配料信息 → 备菜 → 烹饪），并保留步骤配图。
+
+当启用 LLM 总结且调用成功时，会额外在同目录归档 `llm_final_note.md`，保存最终 LLM 版本。
 
 ## 后续计划
 

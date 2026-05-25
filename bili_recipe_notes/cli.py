@@ -92,6 +92,7 @@ def run(args: argparse.Namespace) -> int:
         if llm_summary:
             normalized_summary = normalize_markdown_image_paths(llm_summary).rstrip() + "\n"
             final_note = append_missing_image_links(normalized_summary, required_image_links)
+            (folder / "llm_final_note.md").write_text(final_note, encoding="utf-8")
         else:
             console.print("[yellow]LLM summary skipped: opencode unavailable or failed[/yellow]")
 
