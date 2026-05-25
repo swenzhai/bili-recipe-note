@@ -8,7 +8,7 @@ from pathlib import Path
 from rich.console import Console
 
 from .downloader import download_audio, download_lowres_video, download_subtitles, fetch_video_info
-from .llm import summarize_note_with_opencode
+from .llm import normalize_markdown_image_paths, summarize_note_with_opencode
 from .markdown_writer import render_markdown
 from .recipe_extractor import TranscriptSegment, extract_recipe_rule_based
 from .screenshot import capture_step_screenshots
@@ -83,12 +83,12 @@ def run(args: argparse.Namespace) -> int:
         json.dumps([seg.model_dump() for seg in transcript], ensure_ascii=False, indent=2), encoding="utf-8"
     )
     (folder / "recipe.json").write_text(recipe.model_dump_json(indent=2), encoding="utf-8")
-    final_note = note_markdown
+    final_note = normalize_markdown_image_paths(note_markdown)
 
     if not args.no_llm_summary:
         llm_summary = summarize_note_with_opencode(note_markdown)
         if llm_summary:
-            final_note = llm_summary.rstrip() + "\n"
+            final_note = normalize_markdown_image_paths(llm_summary).rstrip() + "\n"
         else:
             console.print("[yellow]LLM summary skipped: opencode unavailable or failed[/yellow]")
 
