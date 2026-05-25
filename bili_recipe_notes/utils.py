@@ -21,6 +21,16 @@ def sanitize_filename(name: str, max_length: int = 120) -> str:
     return safe[:max_length]
 
 
+def build_output_folder_name(title: str, uploader: str | None, max_length: int = 120) -> str:
+    """Build clean output folder name with only title and uploader."""
+    raw = f"{title} - {uploader or 'unknown'}"
+    safe = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff\- _]", "", raw)
+    safe = re.sub(r"\s+", " ", safe).strip(" ._-")
+    if not safe:
+        safe = "untitled - unknown"
+    return safe[:max_length]
+
+
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path

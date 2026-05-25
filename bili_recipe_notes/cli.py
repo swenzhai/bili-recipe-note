@@ -14,7 +14,7 @@ from .recipe_extractor import TranscriptSegment, extract_recipe_rule_based
 from .screenshot import capture_step_screenshots
 from .subtitle import parse_subtitle_file
 from .transcriber import transcribe_audio
-from .utils import ensure_dir, sanitize_filename
+from .utils import build_output_folder_name, ensure_dir
 
 console = Console()
 
@@ -35,7 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> int:
     info = fetch_video_info(args.url, cookies=args.cookies)
     title = info.get("title") or "untitled"
-    folder = ensure_dir(Path(args.out) / sanitize_filename(title))
+    folder_name = build_output_folder_name(title=title, uploader=info.get("uploader"))
+    folder = ensure_dir(Path(args.out) / folder_name)
     media_dir = ensure_dir(folder / "media")
 
     metadata = {
@@ -82,14 +83,16 @@ def run(args: argparse.Namespace) -> int:
         json.dumps([seg.model_dump() for seg in transcript], ensure_ascii=False, indent=2), encoding="utf-8"
     )
     (folder / "recipe.json").write_text(recipe.model_dump_json(indent=2), encoding="utf-8")
-    (folder / "note.md").write_text(note_markdown, encoding="utf-8")
+    final_note = note_markdown
 
     if not args.no_llm_summary:
         llm_summary = summarize_note_with_opencode(note_markdown)
         if llm_summary:
-            (folder / "llm_summary.md").write_text(llm_summary + "\n", encoding="utf-8")
+            final_note = llm_summary.rstrip() + "\n"
         else:
             console.print("[yellow]LLM summary skipped: opencode unavailable or failed[/yellow]")
+
+    (folder / "note.md").write_text(final_note, encoding="utf-8")
 
     if not args.keep_media:
         shutil.rmtree(media_dir, ignore_errors=True)
