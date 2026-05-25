@@ -1,6 +1,29 @@
 from __future__ import annotations
 
+import re
 import subprocess
+from pathlib import PurePosixPath
+
+
+IMAGE_LINK_RE = re.compile(r"(!\[[^\]]*\]\()([^)]+)(\))")
+
+
+def normalize_markdown_image_paths(markdown: str) -> str:
+    """Normalize image links to `images/<name>` to keep note.md portable."""
+
+    def _replace(match: re.Match[str]) -> str:
+        prefix, raw_path, suffix = match.groups()
+        path = raw_path.strip()
+        if not path:
+            return match.group(0)
+        if "://" in path:
+            return match.group(0)
+        image_name = PurePosixPath(path).name
+        if not image_name:
+            return match.group(0)
+        return f"{prefix}images/{image_name}{suffix}"
+
+    return IMAGE_LINK_RE.sub(_replace, markdown)
 
 
 def summarize_note_with_opencode(markdown_note: str) -> str | None:
@@ -31,5 +54,5 @@ def summarize_note_with_opencode(markdown_note: str) -> str | None:
     except Exception:
         return None
 
-    summary = (result.stdout or "").strip()
+    summary = normalize_markdown_image_paths((result.stdout or "").strip())
     return summary or None
