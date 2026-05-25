@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import subprocess
 
-from bili_recipe_notes.llm import normalize_markdown_image_paths, summarize_note_with_opencode
+from bili_recipe_notes.llm import (
+    append_missing_image_links,
+    extract_markdown_image_links,
+    markdown_has_image_links,
+    normalize_markdown_image_paths,
+    summarize_note_with_opencode,
+)
 
 
 def test_summarize_note_with_opencode_success(monkeypatch) -> None:
@@ -33,3 +39,16 @@ def test_normalize_markdown_image_paths() -> None:
     assert "![](images/step_01.jpg)" in normalized
     assert "![](images/step_02.png)" in normalized
     assert "![x](https://example.com/a.jpg)" in normalized
+
+
+def test_markdown_has_image_links() -> None:
+    assert markdown_has_image_links("![](images/step_01.jpg)")
+    assert not markdown_has_image_links("no image")
+
+
+def test_append_missing_image_links() -> None:
+    source_links = extract_markdown_image_links("![](images/step_01.jpg)\n![](images/step_02.jpg)")
+    merged = append_missing_image_links("## 烹饪\n\n步骤文字", source_links)
+    assert "## 步骤配图补全" in merged
+    assert "![](images/step_01.jpg)" in merged
+    assert "![](images/step_02.jpg)" in merged

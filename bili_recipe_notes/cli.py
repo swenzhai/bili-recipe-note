@@ -8,7 +8,7 @@ from pathlib import Path
 from rich.console import Console
 
 from .downloader import download_audio, download_lowres_video, download_subtitles, fetch_video_info
-from .llm import normalize_markdown_image_paths, summarize_note_with_opencode
+from .llm import append_missing_image_links, extract_markdown_image_links, normalize_markdown_image_paths, summarize_note_with_opencode
 from .markdown_writer import render_markdown
 from .recipe_extractor import TranscriptSegment, extract_recipe_rule_based
 from .screenshot import capture_step_screenshots
@@ -79,16 +79,19 @@ def run(args: argparse.Namespace) -> int:
             console.print(f"[yellow]Video download/screenshot skipped: {exc}[/yellow]")
 
     note_markdown = render_markdown(recipe)
+    normalized_note = normalize_markdown_image_paths(note_markdown)
+    required_image_links = extract_markdown_image_links(normalized_note)
     (folder / "transcript.json").write_text(
         json.dumps([seg.model_dump() for seg in transcript], ensure_ascii=False, indent=2), encoding="utf-8"
     )
     (folder / "recipe.json").write_text(recipe.model_dump_json(indent=2), encoding="utf-8")
-    final_note = normalize_markdown_image_paths(note_markdown)
+    final_note = normalized_note
 
     if not args.no_llm_summary:
         llm_summary = summarize_note_with_opencode(note_markdown)
         if llm_summary:
-            final_note = normalize_markdown_image_paths(llm_summary).rstrip() + "\n"
+            normalized_summary = normalize_markdown_image_paths(llm_summary).rstrip() + "\n"
+            final_note = append_missing_image_links(normalized_summary, required_image_links)
         else:
             console.print("[yellow]LLM summary skipped: opencode unavailable or failed[/yellow]")
 

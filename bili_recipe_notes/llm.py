@@ -26,6 +26,30 @@ def normalize_markdown_image_paths(markdown: str) -> str:
     return IMAGE_LINK_RE.sub(_replace, markdown)
 
 
+def markdown_has_image_links(markdown: str) -> bool:
+    return bool(IMAGE_LINK_RE.search(markdown))
+
+
+def extract_markdown_image_links(markdown: str) -> list[str]:
+    links: list[str] = []
+    for match in IMAGE_LINK_RE.finditer(markdown):
+        links.append(match.group(0))
+    return links
+
+
+def append_missing_image_links(markdown: str, required_links: list[str]) -> str:
+    if not required_links:
+        return markdown
+    existing = set(extract_markdown_image_links(markdown))
+    missing = [link for link in required_links if link not in existing]
+    if not missing:
+        return markdown
+
+    merged = markdown.rstrip() + "\n\n## 步骤配图补全\n\n"
+    merged += "\n".join(missing)
+    return merged.rstrip() + "\n"
+
+
 def summarize_note_with_opencode(markdown_note: str) -> str | None:
     """Rewrite note into one final markdown recipe with fixed sections.
 
