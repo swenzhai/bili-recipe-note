@@ -68,8 +68,8 @@ def test_run_falls_back_when_subtitle_download_fails(monkeypatch, tmp_path) -> N
     code = cli.run(args)
 
     assert code == 0
-    note_path = tmp_path / "out" / "demo" / "note.md"
-    transcript_path = tmp_path / "out" / "demo" / "transcript.json"
+    note_path = tmp_path / "out" / "demo - up" / "note.md"
+    transcript_path = tmp_path / "out" / "demo - up" / "transcript.json"
     assert note_path.exists()
     assert transcript_path.exists()
     assert "先准备鸡蛋" in transcript_path.read_text(encoding="utf-8")

@@ -59,6 +59,8 @@ outputs/视频标题/
     └── ...
 ```
 
+`note.md` 为最终单一文档：会优先通过 opencode 重写为固定结构（配料信息 → 备菜 → 烹饪），并保留步骤配图。
+
 ## 后续计划
 
 - 接入 `extract_recipe_with_llm(transcript, metadata)`。
