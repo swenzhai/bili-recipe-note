@@ -13,6 +13,49 @@ def fetch_video_info(url: str, cookies: str | None = None) -> dict:
         return ydl.extract_info(url, download=False)
 
 
+def extract_creator_video_links(home_url: str, cookies: str | None = None) -> list[str]:
+    """Extract all video URLs from a Bilibili creator page.
+
+    This relies on yt-dlp playlist extraction against creator spaces.
+    """
+    opts = {
+        "quiet": True,
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        "playlistend": None,
+    }
+    if cookies:
+        opts["cookiefile"] = cookies
+
+    from yt_dlp import YoutubeDL
+
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(home_url, download=False)
+
+    entries = info.get("entries") or []
+    links: list[str] = []
+    for entry in entries:
+        if not entry:
+            continue
+        webpage_url = entry.get("webpage_url")
+        if webpage_url:
+            links.append(webpage_url)
+            continue
+        bvid = entry.get("id")
+        if bvid:
+            links.append(f"https://www.bilibili.com/video/{bvid}")
+
+    # de-dup while preserving order
+    seen: set[str] = set()
+    unique_links: list[str] = []
+    for link in links:
+        if link in seen:
+            continue
+        seen.add(link)
+        unique_links.append(link)
+    return unique_links
+
+
 def download_subtitles(url: str, output_dir: Path, language: str = "zh", cookies: str | None = None) -> list[Path]:
     opts = {
         "skip_download": True,

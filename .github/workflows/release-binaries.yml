@@ -1,0 +1,67 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: bili-recipe-notes-linux
+            binary_name: bili-recipe-notes
+          - os: macos-latest
+            artifact_name: bili-recipe-notes-macos
+            binary_name: bili-recipe-notes
+          - os: windows-latest
+            artifact_name: bili-recipe-notes-windows
+            binary_name: bili-recipe-notes.exe
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build executable
+        run: |
+          pyinstaller --onefile --name bili-recipe-notes -m bili_recipe_notes
+
+      - name: Rename artifact folder
+        shell: bash
+        run: |
+          mkdir -p release
+          cp "dist/${{ matrix.binary_name }}" "release/${{ matrix.binary_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: release/*
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
