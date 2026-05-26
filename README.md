@@ -19,6 +19,14 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+Windows (PowerShell):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
 Python 3.10+。
 
 ### ffmpeg 安装提示
@@ -27,6 +35,7 @@ Python 3.10+。
 
 - macOS: `brew install ffmpeg`
 - Ubuntu/Debian: `sudo apt install ffmpeg`
+- Windows: `winget install ffmpeg`
 
 ## 使用方式
 
@@ -42,6 +51,17 @@ python -m bili_recipe_notes "https://www.bilibili.com/video/BVxxxx"
 - `--whisper-model small`
 - `--language zh`
 - `--keep-media`
+- `--no-llm-summary`
+- `--creator-home`（输入博主主页链接，提取全部视频链接）
+- `--creator-links-file all_links.txt`（提取结果文件名，默认 `creator_video_links.txt`）
+
+提取博主全部视频链接示例：
+
+```bash
+python -m bili_recipe_notes "https://space.bilibili.com/123456/video" --creator-home --out outputs
+```
+
+执行后会在 `outputs/creator_video_links.txt` 生成该主页下全部视频 URL，便于后续批量整理菜谱。
 
 ### cookies.txt 说明
 
@@ -60,6 +80,14 @@ outputs/视频标题/
 ```
 
 `note.md` 为最终单一文档：会优先通过 opencode 重写为固定结构（配料信息 → 备菜 → 烹饪），并保留步骤配图。
+
+## 二进制版本发布（含 Windows）
+
+仓库已提供 GitHub Actions 工作流 `.github/workflows/release-binaries.yml`：
+
+- 打 `v*` tag（如 `v0.2.0`）会自动构建 Linux / macOS / Windows 可执行文件。
+- 构建后会自动附加到 GitHub Release。
+- 本地也可手动构建：`pyinstaller --onefile --name bili-recipe-notes -m bili_recipe_notes`。
 
 ## 后续计划
 

@@ -58,6 +58,8 @@ def test_run_falls_back_when_subtitle_download_fails(monkeypatch, tmp_path) -> N
         url="https://example.com/video",
         cookies=None,
         out=str(tmp_path / "out"),
+        creator_home=False,
+        creator_links_file="creator_video_links.txt",
         no_screenshot=True,
         whisper_model="small",
         language="zh",
@@ -73,3 +75,37 @@ def test_run_falls_back_when_subtitle_download_fails(monkeypatch, tmp_path) -> N
     assert note_path.exists()
     assert transcript_path.exists()
     assert "先准备鸡蛋" in transcript_path.read_text(encoding="utf-8")
+
+
+def test_run_creator_home_extracts_all_video_links(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        cli,
+        "extract_creator_video_links",
+        lambda url, cookies=None: [
+            "https://www.bilibili.com/video/BV1xx411c7mD",
+            "https://www.bilibili.com/video/BV1ab411c7mE",
+        ],
+    )
+
+    args = argparse.Namespace(
+        url="https://space.bilibili.com/123456/video",
+        cookies=None,
+        out=str(tmp_path / "out"),
+        creator_home=True,
+        creator_links_file="all_links.txt",
+        no_screenshot=True,
+        whisper_model="small",
+        language="zh",
+        keep_media=False,
+        no_llm_summary=True,
+    )
+
+    code = cli.run(args)
+
+    assert code == 0
+    links_path = tmp_path / "out" / "all_links.txt"
+    assert links_path.exists()
+    assert links_path.read_text(encoding="utf-8").splitlines() == [
+        "https://www.bilibili.com/video/BV1xx411c7mD",
+        "https://www.bilibili.com/video/BV1ab411c7mE",
+    ]

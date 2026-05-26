@@ -7,7 +7,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from .downloader import download_audio, download_lowres_video, download_subtitles, fetch_video_info
+from .downloader import download_audio, download_lowres_video, download_subtitles, extract_creator_video_links, fetch_video_info
 from .llm import append_missing_image_links, extract_markdown_image_links, normalize_markdown_image_paths, summarize_note_with_opencode
 from .markdown_writer import render_markdown
 from .recipe_extractor import TranscriptSegment, extract_recipe_rule_based
@@ -29,10 +29,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--language", default="zh")
     parser.add_argument("--keep-media", action="store_true")
     parser.add_argument("--no-llm-summary", action="store_true")
+    parser.add_argument("--creator-home", action="store_true", help="Treat URL as creator homepage and extract all video links")
+    parser.add_argument("--creator-links-file", default="creator_video_links.txt")
     return parser
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.creator_home:
+        links = extract_creator_video_links(args.url, cookies=args.cookies)
+        out_dir = ensure_dir(Path(args.out))
+        links_path = out_dir / args.creator_links_file
+        links_path.write_text("\n".join(links) + ("\n" if links else ""), encoding="utf-8")
+        console.print(f"[green]Extracted {len(links)} video links to {links_path}[/green]")
+        return 0
+
     info = fetch_video_info(args.url, cookies=args.cookies)
     title = info.get("title") or "untitled"
     folder_name = build_output_folder_name(title=title, uploader=info.get("uploader"))
