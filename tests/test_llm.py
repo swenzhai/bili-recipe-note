@@ -27,6 +27,25 @@ def test_summarize_note_with_opencode_failure(monkeypatch) -> None:
     assert summarize_note_with_opencode("# note") is None
 
 
+def test_summarize_note_with_opencode_windows_winerror_206_fallback_to_stdin(monkeypatch) -> None:
+    calls = []
+
+    def _run(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            err = OSError(22, "bad", "opencode")
+            err.winerror = 206
+            raise err
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="stdin总结\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    monkeypatch.setattr("bili_recipe_notes.llm.os.name", "nt")
+
+    assert summarize_note_with_opencode("# note") == "stdin总结"
+    assert calls[1][0][0] == ["opencode", "run"]
+    assert "input" in calls[1][1]
+
+
 def test_normalize_markdown_image_paths() -> None:
     md = "\n".join(
         [

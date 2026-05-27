@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import PurePosixPath
@@ -75,6 +76,20 @@ def summarize_note_with_opencode(markdown_note: str) -> str | None:
             capture_output=True,
             text=True,
         )
+    except OSError as exc:
+        # Windows can fail with [WinError 206] when command-line args are too long.
+        if os.name != "nt" or getattr(exc, "winerror", None) != 206:
+            return None
+        try:
+            result = subprocess.run(
+                ["opencode", "run"],
+                check=True,
+                capture_output=True,
+                text=True,
+                input=prompt,
+            )
+        except Exception:
+            return None
     except Exception:
         return None
 
