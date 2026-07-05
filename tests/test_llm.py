@@ -4,6 +4,8 @@ import subprocess
 
 from bili_recipe_notes.llm import (
     append_missing_image_links,
+    build_summary_prompt,
+    ensure_recipe_summary_section,
     extract_markdown_image_links,
     markdown_has_image_links,
     normalize_markdown_image_paths,
@@ -71,3 +73,38 @@ def test_append_missing_image_links() -> None:
     assert "## 步骤配图补全" in merged
     assert "![](images/step_01.jpg)" in merged
     assert "![](images/step_02.jpg)" in merged
+
+
+def test_build_summary_prompt_requires_recipe_summary() -> None:
+    prompt = build_summary_prompt("# note")
+
+    assert "## 菜谱总结" in prompt
+    assert "不要省略" in prompt
+
+
+def test_ensure_recipe_summary_section_appends_missing_summary() -> None:
+    source = "\n".join(
+        [
+            "# 番茄炒蛋",
+            "",
+            "## 总结要点",
+            "",
+            "- 火不要太大",
+            "",
+            "## 不确定信息",
+            "",
+            "- 盐量需要确认",
+        ]
+    )
+
+    merged = ensure_recipe_summary_section("## 烹饪\n\n炒熟出锅", source)
+
+    assert "## 菜谱总结" in merged
+    assert "火不要太大" in merged
+    assert "盐量需要确认" in merged
+
+
+def test_ensure_recipe_summary_section_keeps_existing_summary() -> None:
+    markdown = "## 菜谱总结\n\n- 已有总结\n"
+
+    assert ensure_recipe_summary_section(markdown, "# source") == markdown

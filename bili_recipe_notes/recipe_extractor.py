@@ -47,9 +47,14 @@ class Recipe(BaseModel):
     source_url: str
     video_title: str | None = None
     uploader: str | None = None
+    servings: str | None = None
+    total_time: str | None = None
+    difficulty: str | None = None
     ingredients: list[RecipeIngredient]
     seasonings: list[RecipeIngredient]
     tools: list[str]
+    prep_items: list[str] = []
+    shopping_list: list[str] = []
     steps: list[RecipeStep]
     summary_tips: list[str]
     uncertain_points: list[str]

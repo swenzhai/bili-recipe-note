@@ -19,3 +19,5 @@ def test_render_markdown_basic() -> None:
     assert "# 番茄炒蛋" in md
     assert "![](images/step_01.jpg)" in md
     assert "时间：00:00:01" in md
+    assert "## 菜谱总结" in md
+    assert "火不要太大" in md

@@ -1,5 +1,9 @@
-yt-dlp
+yt-dlp[default] @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
 faster-whisper
 pydantic
 rich
+streamlit
+reportlab
+python-docx
+pyinstaller
 pytest

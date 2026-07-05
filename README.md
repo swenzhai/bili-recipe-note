@@ -39,6 +39,8 @@ Python 3.10+。
 
 ## 使用方式
 
+### 命令行
+
 ```bash
 python -m bili_recipe_notes "https://www.bilibili.com/video/BVxxxx"
 ```
@@ -63,9 +65,68 @@ python -m bili_recipe_notes "https://space.bilibili.com/123456/video" --creator-
 
 执行后会在 `outputs/creator_video_links.txt` 生成该主页下全部视频 URL，便于后续批量整理菜谱。
 
+### 本地 UI
+
+安装依赖后可启动本地 Web UI：
+
+```powershell
+python -m streamlit run bili_recipe_notes/ui.py
+```
+
+也可以直接双击项目根目录下的快捷启动文件：
+
+- Windows: `start-ui-windows.bat`
+- macOS: `start-ui-mac.command`
+
+macOS 如果提示没有执行权限，首次运行前执行一次：
+
+```bash
+chmod +x start-ui-mac.command
+```
+
+UI 会在浏览器中打开，支持：
+
+- 输入 Bilibili 视频链接并生成菜谱笔记
+- 查看运行日志和 `note.md` 预览
+- 设置 cookies 文件路径、输出目录、语言、Whisper 模型
+- 开关步骤截图、opencode 重写、临时媒体保留
+- 提取 UP 主主页下的视频链接
+- 扫描历史记录、搜索并预览已生成的菜谱
+- 批量读取多行 URL 或链接文件，失败不中断，已生成内容可跳过
+- 检查本地环境：依赖包、ffmpeg、yt-dlp Bilibili 支持、opencode、Whisper
+- 编辑 `recipe.json` / `transcript.json` 后重新生成笔记
+- 单步截图重截
+- 导出 Obsidian Markdown、PDF、Word
+
+UI 仅面向本机个人使用，不做账号登录管理。输出仍写入 `outputs/` 或界面中指定的目录。
+
+UI 默认配置会保存到：
+
+```text
+.bili-recipe-notes/config.json
+```
+
+支持保存的默认项包括输出目录、cookies 路径、语言、Whisper 模型、截图/LLM/保留媒体开关、LLM provider。
+
+### LLM provider
+
+默认 provider 是 `opencode`。UI 也提供：
+
+- `none`：不重写，直接使用规则版 Markdown
+- `openai`：使用 OpenAI Responses API，需要设置环境变量 `OPENAI_API_KEY`
+- `local`：把提示词通过 stdin 传给本地命令
+
+OpenAI 模式的模型名可在 UI 里修改，默认值保存在本地配置中。
+
 ### cookies.txt 说明
 
 部分视频需登录态。可将浏览器导出的 Netscape 格式 cookies 保存为 `cookies.txt`，通过 `--cookies` 传入。
+
+如果遇到 Bilibili `HTTP Error 412: Precondition Failed`：
+
+- 先关闭 UI 重新双击启动文件，启动脚本会自动检查并更新 `yt-dlp` 的 Bilibili 支持。
+- 也可以手动更新依赖：`python -m pip install -U -r requirements.txt`。
+- 如果视频需要登录态，重新从浏览器导出最新 `cookies.txt`，并在 CLI/UI 中传入。
 
 ## 输出示例
 
@@ -89,10 +150,22 @@ outputs/视频标题/
 - 构建后会自动附加到 GitHub Release。
 - 本地也可手动构建：`pyinstaller --onefile --name bili-recipe-notes -m bili_recipe_notes`。
 
+本地 UI 打包脚本：
+
+- Windows: `package-ui-windows.bat`，输出 `dist/BiliRecipeNotesUI.exe`
+- macOS: `package-ui-mac.command`，输出 `dist/Bili Recipe Notes.app`
+
+macOS 首次运行打包脚本前可能需要：
+
+```bash
+chmod +x package-ui-mac.command
+```
+
 ## 后续计划
 
-- 接入 `extract_recipe_with_llm(transcript, metadata)`。
-- 后续可支持 OpenAI API 或本地大模型做更高质量结构化抽取。
+- 更细的阶段级重试。
+- 更高质量的 LLM 结构化抽取。
+- 更完整的桌面安装包。
 
 ## 示例数据
 
