@@ -8,5 +8,7 @@
   "keep_media": false,
   "llm_provider": "opencode",
   "openai_model": "gpt-5.5",
-  "local_llm_command": null
+  "local_llm_command": null,
+  "codex_model": null,
+  "codex_profile": null
 }

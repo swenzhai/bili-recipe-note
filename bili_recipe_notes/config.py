@@ -21,6 +21,8 @@ class UIConfig:
     llm_provider: str = "opencode"
     openai_model: str = "gpt-5.5"
     local_llm_command: str | None = None
+    codex_model: str | None = None
+    codex_profile: str | None = None
 
 
 def config_path(project_root: Path | None = None) -> Path:

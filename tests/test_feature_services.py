@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from bili_recipe_notes import pipeline
+from bili_recipe_notes import content_analysis, pipeline
 from bili_recipe_notes.config import UIConfig, load_config, save_config
+from bili_recipe_notes.content_analysis import ContentAnalysisOptions, analyze_video_content
 from bili_recipe_notes.exports import export_note
 from bili_recipe_notes.history import scan_history
 from bili_recipe_notes.pipeline import (
@@ -50,14 +51,22 @@ def _write_recipe_folder(folder: Path) -> None:
 
 
 def test_config_read_write_and_corrupt_fallback(tmp_path) -> None:
-    config = UIConfig(out_dir="my_outputs", cookies="cookies.txt", llm_provider="none")
+    config = UIConfig(
+        out_dir="my_outputs",
+        cookies="cookies.txt",
+        llm_provider="codex",
+        codex_model="gpt-test",
+        codex_profile="work",
+    )
 
     path = save_config(config, tmp_path)
     assert path.exists()
     loaded = load_config(tmp_path)
     assert loaded.out_dir == "my_outputs"
     assert loaded.cookies == "cookies.txt"
-    assert loaded.llm_provider == "none"
+    assert loaded.llm_provider == "codex"
+    assert loaded.codex_model == "gpt-test"
+    assert loaded.codex_profile == "work"
 
     path.write_text("{bad json", encoding="utf-8")
     assert load_config(tmp_path) == UIConfig()
@@ -89,7 +98,10 @@ def test_run_batch_skips_existing_and_continues_after_failure(monkeypatch, tmp_p
         lambda out, url: scan_history(tmp_path / "outputs")[0] if url.endswith("skip") else None,
     )
 
+    generated_options = []
+
     def _generate(options, log=None):
+        generated_options.append(options)
         if options.url.endswith("fail"):
             raise RuntimeError("boom")
         folder = tmp_path / "outputs" / "new"
@@ -104,9 +116,19 @@ def test_run_batch_skips_existing_and_continues_after_failure(monkeypatch, tmp_p
 
     monkeypatch.setattr(pipeline, "generate_recipe_note", _generate)
 
-    result = run_batch(BatchJobOptions(urls=["https://x/skip", "https://x/fail", "https://x/new"], out=str(tmp_path / "outputs")))
+    result = run_batch(
+        BatchJobOptions(
+            urls=["https://x/skip", "https://x/fail", "https://x/new"],
+            out=str(tmp_path / "outputs"),
+            llm_provider="codex",
+            codex_model="gpt-test",
+            codex_profile="work",
+        )
+    )
 
     assert [item.status for item in result.items] == ["skipped", "failed", "done"]
+    assert [options.codex_model for options in generated_options] == ["gpt-test", "gpt-test"]
+    assert [options.codex_profile for options in generated_options] == ["work", "work"]
 
 
 def test_regenerate_note_and_recipe_from_edited_files(tmp_path) -> None:
@@ -120,6 +142,31 @@ def test_regenerate_note_and_recipe_from_edited_files(tmp_path) -> None:
     recipe_result = regenerate_recipe_from_transcript(folder)
     assert recipe_result.recipe_path.exists()
     assert "先准备鸡蛋" in recipe_result.note_path.read_text(encoding="utf-8")
+
+
+def test_regenerate_note_passes_codex_options(monkeypatch, tmp_path) -> None:
+    folder = tmp_path / "outputs" / "demo"
+    _write_recipe_folder(folder)
+    captured = {}
+
+    def _summarize_note(*args, **kwargs):
+        captured.update(kwargs)
+        return "## 配料信息\n\n- egg\n\n## 备菜\n\nbeat eggs\n\n## 烹饪\n\ncook eggs\n"
+
+    monkeypatch.setattr(pipeline, "summarize_note", _summarize_note)
+
+    result = regenerate_note_from_recipe(
+        folder,
+        no_llm_summary=False,
+        llm_provider="codex",
+        codex_model="gpt-test",
+        codex_profile="work",
+    )
+
+    assert "## 菜谱总结" in result.note_path.read_text(encoding="utf-8")
+    assert captured["provider"] == "codex"
+    assert captured["codex_model"] == "gpt-test"
+    assert captured["codex_profile"] == "work"
 
 
 def test_recapture_step_screenshot_updates_recipe(monkeypatch, tmp_path) -> None:
@@ -142,6 +189,47 @@ def test_recapture_step_screenshot_updates_recipe(monkeypatch, tmp_path) -> None
     recipe = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
     assert recipe["steps"][0]["start_time"] == 12.5
     assert recipe["steps"][0]["screenshot_path"] == "images/step_01.jpg"
+
+
+def test_analyze_video_content_writes_markdown_and_metadata(monkeypatch, tmp_path) -> None:
+    folder = tmp_path / "outputs" / "demo"
+    _write_recipe_folder(folder)
+    captured = {}
+
+    def _complete(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured.update(kwargs)
+        return "# 通用烹饪技巧\n\n- 热锅再下蛋。"
+
+    monkeypatch.setattr(content_analysis, "complete_markdown_prompt", _complete)
+
+    result = analyze_video_content(
+        folder,
+        request="总结通用技巧",
+        options=ContentAnalysisOptions(llm_provider="codex", codex_model="gpt-test", output_filename="tips.md"),
+    )
+
+    assert result.analysis_path == folder / "tips.md"
+    assert result.analysis_path.read_text(encoding="utf-8").startswith("# 通用烹饪技巧")
+    assert json.loads((folder / "tips.json").read_text(encoding="utf-8"))["request"] == "总结通用技巧"
+    assert "先准备鸡蛋" in captured["prompt"]
+    assert "总结通用技巧" in captured["prompt"]
+    assert captured["provider"] == "codex"
+    assert captured["codex_model"] == "gpt-test"
+
+
+def test_analyze_video_content_reports_llm_failure_detail(monkeypatch, tmp_path) -> None:
+    folder = tmp_path / "outputs" / "demo"
+    _write_recipe_folder(folder)
+    monkeypatch.setattr(content_analysis, "complete_markdown_prompt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(content_analysis, "get_last_llm_error", lambda: "opencode: quota exceeded")
+
+    try:
+        analyze_video_content(folder, options=ContentAnalysisOptions(llm_provider="opencode"))
+    except RuntimeError as exc:
+        assert "quota exceeded" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
 
 
 def test_export_note_creates_all_formats(tmp_path) -> None:

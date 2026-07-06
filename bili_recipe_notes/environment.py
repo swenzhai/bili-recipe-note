@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import os
 import shutil
+import subprocess
 from dataclasses import dataclass
 
 
@@ -27,6 +29,42 @@ def _yt_dlp_bilibili_ready() -> tuple[bool, str]:
         return "_dm_params" in source, yt_dlp.version.__version__
     except Exception as exc:  # noqa: BLE001
         return False, str(exc)
+
+
+def _windows_launcher_command(command: str) -> str | None:
+    if os.name == "nt":
+        for name in (f"{command}.cmd", f"{command}.exe", f"{command}.bat", command):
+            path = shutil.which(name)
+            if path:
+                return path
+    return shutil.which(command)
+
+
+def _cli_help_ready(command: str, args: list[str]) -> tuple[bool, str]:
+    command_path = _windows_launcher_command(command)
+    if not command_path:
+        return False, "not found in PATH"
+    try:
+        subprocess.run(
+            [command_path, *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    return True, command_path
+
+
+def _codex_cli_ready() -> tuple[bool, str]:
+    return _cli_help_ready("codex", ["exec", "--help"])
+
+
+def _opencode_cli_ready() -> tuple[bool, str]:
+    return _cli_help_ready("opencode", ["run", "--help"])
 
 
 def run_environment_checks() -> list[EnvironmentCheck]:
@@ -62,13 +100,23 @@ def run_environment_checks() -> list[EnvironmentCheck]:
         )
     )
 
-    opencode_path = shutil.which("opencode")
+    opencode_ready, opencode_detail = _opencode_cli_ready()
     checks.append(
         EnvironmentCheck(
             name="opencode",
-            ok=bool(opencode_path),
-            detail=opencode_path or "not found in PATH",
+            ok=opencode_ready,
+            detail=opencode_detail,
             suggestion="Install opencode or disable LLM rewrite.",
+        )
+    )
+
+    codex_ready, codex_detail = _codex_cli_ready()
+    checks.append(
+        EnvironmentCheck(
+            name="codex CLI",
+            ok=codex_ready,
+            detail=codex_detail,
+            suggestion="Install and log in to Codex CLI, or choose another LLM provider.",
         )
     )
 

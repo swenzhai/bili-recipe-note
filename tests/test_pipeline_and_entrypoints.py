@@ -57,6 +57,7 @@ def test_generate_recipe_note_falls_back_when_subtitle_download_fails(monkeypatc
     assert result.note_path.exists()
     assert result.recipe_path.exists()
     assert result.transcript_path.exists()
+    assert (result.output_folder / "quality.json").exists()
     assert (result.output_folder / "media" / "audio.m4a").exists()
     assert "先准备鸡蛋" in result.transcript_path.read_text(encoding="utf-8")
 
@@ -101,11 +102,13 @@ def test_generate_recipe_note_adds_recipe_summary_when_llm_omits_it(monkeypatch,
         "parse_subtitle_file",
         lambda path: [TranscriptSegment(start=0.0, end=1.0, text="先准备鸡蛋，然后下锅翻炒")],
     )
-    monkeypatch.setattr(
-        pipeline,
-        "summarize_note",
-        lambda *args, **kwargs: "## 配料信息\n\n- 鸡蛋\n\n## 备菜\n\n打蛋\n\n## 烹饪\n\n炒熟\n",
-    )
+    captured = {}
+
+    def _summarize_note(*args, **kwargs):
+        captured.update(kwargs)
+        return "## 配料信息\n\n- 鸡蛋\n\n## 备菜\n\n打蛋\n\n## 烹饪\n\n炒熟\n"
+
+    monkeypatch.setattr(pipeline, "summarize_note", _summarize_note)
 
     result = pipeline.generate_recipe_note(
         RecipeJobOptions(
@@ -114,12 +117,45 @@ def test_generate_recipe_note_adds_recipe_summary_when_llm_omits_it(monkeypatch,
             no_screenshot=True,
             keep_media=False,
             no_llm_summary=False,
+            llm_provider="codex",
+            codex_model="gpt-test",
+            codex_profile="work",
         )
     )
 
     note = result.note_path.read_text(encoding="utf-8")
     assert "## 菜谱总结" in note
     assert "用量可能未在视频中明确说明" in note
+    assert captured["provider"] == "codex"
+    assert captured["codex_model"] == "gpt-test"
+    assert captured["codex_profile"] == "work"
+
+
+def test_generate_recipe_note_reports_llm_failure_detail(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(pipeline, "fetch_video_info", lambda url, cookies=None: {"title": "demo", "uploader": "up"})
+    monkeypatch.setattr(pipeline, "download_subtitles", lambda url, output_dir, **kwargs: [output_dir / "subtitle.vtt"])
+    monkeypatch.setattr(
+        pipeline,
+        "parse_subtitle_file",
+        lambda path: [TranscriptSegment(start=0.0, end=1.0, text="先准备鸡蛋，然后下锅翻炒")],
+    )
+    monkeypatch.setattr(pipeline, "summarize_note", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "get_last_llm_error", lambda: "opencode: auth failed")
+
+    result = pipeline.generate_recipe_note(
+        RecipeJobOptions(
+            url="https://example.com/video",
+            out=str(tmp_path / "out"),
+            no_screenshot=True,
+            keep_media=False,
+            no_llm_summary=False,
+            llm_provider="opencode",
+        )
+    )
+
+    assert result.stage_errors
+    assert "opencode: auth failed" in result.stage_errors[0]
+    assert "opencode: auth failed" in (result.job_path.read_text(encoding="utf-8"))  # type: ignore[union-attr]
 
 
 def test_extract_creator_links_writes_file(monkeypatch, tmp_path) -> None:
@@ -194,6 +230,7 @@ def test_ui_module_imports() -> None:
     import bili_recipe_notes.ui as ui
 
     assert callable(ui.main)
+    assert "codex" in ui.LLM_PROVIDERS
 
 
 def test_ui_cleans_ansi_error_text() -> None:

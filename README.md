@@ -92,10 +92,13 @@ UI 会在浏览器中打开，支持：
 - 开关步骤截图、opencode 重写、临时媒体保留
 - 提取 UP 主主页下的视频链接
 - 扫描历史记录、搜索并预览已生成的菜谱
-- 批量读取多行 URL 或链接文件，失败不中断，已生成内容可跳过
-- 检查本地环境：依赖包、ffmpeg、yt-dlp Bilibili 支持、opencode、Whisper
+- 批量读取多行 URL 或链接文件，失败不中断，已生成内容可跳过，并支持断点续跑
+- 检查本地环境：依赖包、ffmpeg、yt-dlp Bilibili 支持、opencode、Codex CLI、Whisper
 - 编辑 `recipe.json` / `transcript.json` 后重新生成笔记
 - 单步截图重截
+- 显示菜谱质量评分、问题和改进建议
+- 对已有笔记一键优化，优化前会备份为 `note.before-optimize.md`
+- 对已有视频做 LLM 二次分析，例如提取通用烹饪技巧、食材替换建议、常见失败点
 - 导出 Obsidian Markdown、PDF、Word
 
 UI 仅面向本机个人使用，不做账号登录管理。输出仍写入 `outputs/` 或界面中指定的目录。
@@ -108,15 +111,28 @@ UI 默认配置会保存到：
 
 支持保存的默认项包括输出目录、cookies 路径、语言、Whisper 模型、截图/LLM/保留媒体开关、LLM provider。
 
+批量任务状态会保存到：
+
+```text
+.bili-recipe-notes/batches/
+```
+
+生成和修复后的质量报告会保存到每个菜谱输出目录：
+
+```text
+outputs/视频标题/quality.json
+```
+
 ### LLM provider
 
 默认 provider 是 `opencode`。UI 也提供：
 
 - `none`：不重写，直接使用规则版 Markdown
+- `codex`：使用本机 Codex CLI 的 `codex exec` 非交互模式，需要本机已安装并登录 Codex CLI
 - `openai`：使用 OpenAI Responses API，需要设置环境变量 `OPENAI_API_KEY`
 - `local`：把提示词通过 stdin 传给本地命令
 
-OpenAI 模式的模型名可在 UI 里修改，默认值保存在本地配置中。
+Codex 模式可在 UI 里填写模型名和 profile；两者都可留空，留空时使用 Codex CLI 默认配置。OpenAI 模式的模型名可在 UI 里修改，默认值保存在本地配置中。
 
 ### cookies.txt 说明
 
@@ -134,6 +150,7 @@ OpenAI 模式的模型名可在 UI 里修改，默认值保存在本地配置中
 outputs/视频标题/
 ├── recipe.json
 ├── note.md
+├── extra_analysis.md
 ├── transcript.json
 └── images/
     ├── step_01.jpg

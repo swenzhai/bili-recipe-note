@@ -2,21 +2,24 @@ from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from .batch_queue import create_batch_state, load_batch_state, save_batch_state, selectable_items
 from .history import find_history_by_url
 from .downloader import download_audio, download_lowres_video, download_subtitles, extract_creator_video_links, fetch_video_info
 from .llm import (
     append_missing_image_links,
     ensure_recipe_summary_section,
     extract_markdown_image_links,
+    get_last_llm_error,
     normalize_markdown_image_paths,
     summarize_note,
 )
 from .markdown_writer import render_markdown
+from .quality import write_quality_report
 from .recipe_extractor import Recipe, TranscriptSegment, extract_recipe_rule_based
 from .screenshot import capture_screenshot_at, capture_step_screenshots
 from .subtitle import parse_subtitle_file
@@ -39,6 +42,8 @@ class RecipeJobOptions:
     llm_provider: str = "opencode"
     openai_model: str = "gpt-5.5"
     local_llm_command: str | None = None
+    codex_model: str | None = None
+    codex_profile: str | None = None
 
 
 @dataclass
@@ -65,7 +70,11 @@ class BatchJobOptions:
     llm_provider: str = "opencode"
     openai_model: str = "gpt-5.5"
     local_llm_command: str | None = None
+    codex_model: str | None = None
+    codex_profile: str | None = None
     skip_existing: bool = True
+    batch_id: str | None = None
+    resume_mode: str = "new"
 
 
 @dataclass
@@ -243,6 +252,8 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
                 provider=options.llm_provider,
                 openai_model=options.openai_model,
                 local_llm_command=options.local_llm_command,
+                codex_model=options.codex_model,
+                codex_profile=options.codex_profile,
             )
             if llm_summary:
                 normalized_summary = ensure_recipe_summary_section(
@@ -253,6 +264,9 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
                 note_path.write_text(final_note, encoding="utf-8")
             else:
                 message = f"llm: {options.llm_provider} unavailable or failed"
+                detail = get_last_llm_error()
+                if detail:
+                    message = f"{message}: {detail}"
                 stage_errors.append(message)
                 _emit(log, f"LLM summary skipped: {message}.")
 
@@ -271,6 +285,7 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
                 "stage_errors": stage_errors,
             }
         )
+        write_quality_report(folder)
         job_path = _write_job(folder, job)
 
         return RecipeJobResult(
@@ -305,7 +320,73 @@ def extract_creator_links(
     return links_path
 
 
+def _process_batch_url(options: BatchJobOptions, url: str, log: LogCallback | None = None) -> BatchJobItemResult:
+    if options.skip_existing:
+        existing = find_history_by_url(options.out, url)
+        if existing:
+            _emit(log, f"Skipped existing output: {existing.output_folder}")
+            return BatchJobItemResult(
+                url=url,
+                status="skipped",
+                output_folder=existing.output_folder,
+                note_path=existing.note_path,
+            )
+    try:
+        result = generate_recipe_note(
+            RecipeJobOptions(
+                url=url,
+                cookies=options.cookies,
+                out=options.out,
+                no_screenshot=options.no_screenshot,
+                whisper_model=options.whisper_model,
+                language=options.language,
+                keep_media=options.keep_media,
+                no_llm_summary=options.no_llm_summary,
+                llm_provider=options.llm_provider,
+                openai_model=options.openai_model,
+                local_llm_command=options.local_llm_command,
+                codex_model=options.codex_model,
+                codex_profile=options.codex_profile,
+            ),
+            log=log,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _emit(log, f"Failed: {exc}")
+        return BatchJobItemResult(url=url, status="failed", error=str(exc))
+    return BatchJobItemResult(url=url, status="done", output_folder=result.output_folder, note_path=result.note_path)
+
+
+def _run_persistent_batch(options: BatchJobOptions, log: LogCallback | None = None) -> BatchJobResult:
+    if options.batch_id and options.resume_mode != "new":
+        state = load_batch_state(options.batch_id)
+    else:
+        state = create_batch_state(options.urls, asdict(options), batch_id=options.batch_id)
+
+    items_to_process = selectable_items(state, options.resume_mode)
+    results: list[BatchJobItemResult] = []
+    for idx, item in enumerate(items_to_process, start=1):
+        _emit(log, f"[{idx}/{len(items_to_process)}] {item.url}")
+        item.status = "running"
+        item.error = None
+        item.started_at = _now()
+        item.finished_at = None
+        save_batch_state(state)
+
+        result = _process_batch_url(options, item.url, log=log)
+        item.status = result.status
+        item.output_folder = str(result.output_folder) if result.output_folder else None
+        item.note_path = str(result.note_path) if result.note_path else None
+        item.error = result.error
+        item.finished_at = _now()
+        save_batch_state(state)
+        results.append(result)
+    return BatchJobResult(items=results)
+
+
 def run_batch(options: BatchJobOptions, log: LogCallback | None = None) -> BatchJobResult:
+    if options.batch_id:
+        return _run_persistent_batch(options, log=log)
+
     seen: set[str] = set()
     urls = []
     for url in options.urls:
@@ -317,48 +398,7 @@ def run_batch(options: BatchJobOptions, log: LogCallback | None = None) -> Batch
     items: list[BatchJobItemResult] = []
     for idx, url in enumerate(urls, start=1):
         _emit(log, f"[{idx}/{len(urls)}] {url}")
-        if options.skip_existing:
-            existing = find_history_by_url(options.out, url)
-            if existing:
-                _emit(log, f"Skipped existing output: {existing.output_folder}")
-                items.append(
-                    BatchJobItemResult(
-                        url=url,
-                        status="skipped",
-                        output_folder=existing.output_folder,
-                        note_path=existing.note_path,
-                    )
-                )
-                continue
-        try:
-            result = generate_recipe_note(
-                RecipeJobOptions(
-                    url=url,
-                    cookies=options.cookies,
-                    out=options.out,
-                    no_screenshot=options.no_screenshot,
-                    whisper_model=options.whisper_model,
-                    language=options.language,
-                    keep_media=options.keep_media,
-                    no_llm_summary=options.no_llm_summary,
-                    llm_provider=options.llm_provider,
-                    openai_model=options.openai_model,
-                    local_llm_command=options.local_llm_command,
-                ),
-                log=log,
-            )
-        except Exception as exc:  # noqa: BLE001
-            _emit(log, f"Failed: {exc}")
-            items.append(BatchJobItemResult(url=url, status="failed", error=str(exc)))
-            continue
-        items.append(
-            BatchJobItemResult(
-                url=url,
-                status="done",
-                output_folder=result.output_folder,
-                note_path=result.note_path,
-            )
-        )
+        items.append(_process_batch_url(options, url, log=log))
     return BatchJobResult(items=items)
 
 
@@ -368,6 +408,8 @@ def regenerate_note_from_recipe(
     llm_provider: str = "opencode",
     openai_model: str = "gpt-5.5",
     local_llm_command: str | None = None,
+    codex_model: str | None = None,
+    codex_profile: str | None = None,
 ) -> RecipeJobResult:
     folder = Path(output_folder)
     recipe_path = folder / "recipe.json"
@@ -383,11 +425,14 @@ def regenerate_note_from_recipe(
             provider=llm_provider,
             openai_model=openai_model,
             local_llm_command=local_llm_command,
+            codex_model=codex_model,
+            codex_profile=codex_profile,
         )
         if summary:
             normalized_summary = ensure_recipe_summary_section(normalize_markdown_image_paths(summary), note_markdown)
             final_note = append_missing_image_links(normalized_summary, required_image_links)
     note_path.write_text(final_note, encoding="utf-8")
+    write_quality_report(folder)
     return RecipeJobResult(folder, note_path, recipe_path, transcript_path, final_note)
 
 
@@ -408,6 +453,7 @@ def regenerate_recipe_from_transcript(output_folder: str | Path) -> RecipeJobRes
     recipe_path.write_text(recipe.model_dump_json(indent=2), encoding="utf-8")
     final_note = normalize_markdown_image_paths(render_markdown(recipe))
     note_path.write_text(final_note, encoding="utf-8")
+    write_quality_report(folder)
     return RecipeJobResult(folder, note_path, recipe_path, transcript_path, final_note)
 
 

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .quality import analyze_recipe_quality, load_quality_report, write_quality_report
+
 
 @dataclass
 class HistoryItem:
@@ -21,6 +23,8 @@ class HistoryItem:
     started_at: str | None = None
     finished_at: str | None = None
     error: str | None = None
+    quality_score: int | None = None
+    quality_summary: str | None = None
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -44,6 +48,13 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
         job_path = folder / "job.json"
         recipe = _read_json(recipe_path) if recipe_path.exists() else {}
         job = _read_json(job_path) if job_path.exists() else {}
+        quality = load_quality_report(folder)
+        if not quality and (recipe_path.exists() or note_path.exists()):
+            quality = analyze_recipe_quality(folder)
+            try:
+                write_quality_report(folder, quality)
+            except Exception:
+                pass
 
         if not recipe and not note_path.exists() and not transcript_path.exists() and not job:
             continue
@@ -65,6 +76,8 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
                 started_at=job.get("started_at"),
                 finished_at=job.get("finished_at"),
                 error=job.get("error"),
+                quality_score=quality.score if quality else None,
+                quality_summary=quality.summary if quality else None,
             )
         )
     return items
