@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+from .storage import CorruptDataError, atomic_write_json, file_lock, read_json
 
 CONFIG_DIR_NAME = ".bili-recipe-notes"
 CONFIG_FILE_NAME = "config.json"
@@ -23,6 +24,10 @@ class UIConfig:
     local_llm_command: str | None = None
     codex_model: str | None = None
     codex_profile: str | None = None
+    llm_cli_extra_instructions: str | None = None
+    max_recipe_steps: int = 10
+    max_step_images: int = 4
+    enable_recipe_review: bool = False
 
 
 def config_path(project_root: Path | None = None) -> Path:
@@ -34,20 +39,26 @@ def load_config(project_root: Path | None = None) -> UIConfig:
     path = config_path(project_root)
     if not path.exists():
         return UIConfig()
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return UIConfig()
-    if not isinstance(raw, dict):
-        return UIConfig()
+    raw = read_json(path, expected_type=dict)
 
     defaults = asdict(UIConfig())
-    cleaned: dict[str, Any] = {key: raw.get(key, value) for key, value in defaults.items()}
+    cleaned: dict[str, Any] = {}
+    for key, default in defaults.items():
+        value = raw.get(key, default)
+        valid = isinstance(value, type(default)) if default is not None else value is None or isinstance(value, str)
+        if not valid:
+            raise CorruptDataError(
+                f"Invalid value for {key!r} in {path}: expected {type(default).__name__}, "
+                f"got {type(value).__name__}."
+            )
+        cleaned[key] = value
     return UIConfig(**cleaned)
 
 
 def save_config(config: UIConfig, project_root: Path | None = None) -> Path:
     path = config_path(project_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(config), ensure_ascii=False, indent=2), encoding="utf-8")
+    with file_lock(path):
+        if path.exists():
+            load_config(project_root)
+        atomic_write_json(path, asdict(config))
     return path

@@ -18,6 +18,7 @@ class ContentAnalysisOptions:
     local_llm_command: str | None = None
     codex_model: str | None = None
     codex_profile: str | None = None
+    llm_cli_extra_instructions: str | None = None
     output_filename: str = "extra_analysis.md"
 
 
@@ -128,6 +129,7 @@ def analyze_video_content(
         local_llm_command=opts.local_llm_command,
         codex_model=opts.codex_model,
         codex_profile=opts.codex_profile,
+        cli_extra_instructions=opts.llm_cli_extra_instructions,
     )
     if not markdown:
         detail = get_last_llm_error()

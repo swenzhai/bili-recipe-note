@@ -9,18 +9,18 @@ else
 fi
 
 echo "Installing packaging requirements..."
-if ! "$PYTHON_EXE" -m pip install -r requirements.txt; then
+if ! "$PYTHON_EXE" -m pip install -r requirements-dev.txt; then
     echo "Failed to install requirements."
     read -r -p "Press Enter to close this window..."
     exit 1
 fi
 
 echo "Building macOS app..."
-if ! "$PYTHON_EXE" -m PyInstaller --noconfirm --windowed --name "Bili Recipe Notes" bili_recipe_notes/ui_launcher.py; then
+if ! "$PYTHON_EXE" -m PyInstaller --clean --noconfirm bili-recipe-notes-ui.spec; then
     echo "Build failed."
     read -r -p "Press Enter to close this window..."
     exit 1
 fi
 
-echo "Build complete: dist/Bili Recipe Notes.app"
+echo "Build complete: dist/BiliRecipeNotesUI"
 read -r -p "Press Enter to close this window..."

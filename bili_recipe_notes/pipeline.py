@@ -1,27 +1,29 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.parse import parse_qs, urlparse
 
 from .batch_queue import create_batch_state, load_batch_state, save_batch_state, selectable_items
 from .history import find_history_by_url
 from .downloader import download_audio, download_lowres_video, download_subtitles, extract_creator_video_links, fetch_video_info
 from .llm import (
-    append_missing_image_links,
-    ensure_recipe_summary_section,
-    extract_markdown_image_links,
+    finalize_rewritten_note,
     get_last_llm_error,
     normalize_markdown_image_paths,
     summarize_note,
 )
 from .markdown_writer import render_markdown
 from .quality import write_quality_report
-from .recipe_extractor import Recipe, TranscriptSegment, extract_recipe_rule_based
+from .recipe_extractor import Recipe, TranscriptSegment, extract_recipe_rule_based, extract_recipe_with_llm
+from .recipe_review import create_recipe_review
 from .screenshot import capture_screenshot_at, capture_step_screenshots
+from .storage import atomic_write_json, atomic_write_text
 from .subtitle import parse_subtitle_file
 from .transcriber import transcribe_audio
 from .utils import build_output_folder_name, ensure_dir
@@ -44,6 +46,10 @@ class RecipeJobOptions:
     local_llm_command: str | None = None
     codex_model: str | None = None
     codex_profile: str | None = None
+    llm_cli_extra_instructions: str | None = None
+    max_recipe_steps: int = 10
+    max_step_images: int = 4
+    enable_recipe_review: bool = False
 
 
 @dataclass
@@ -72,6 +78,10 @@ class BatchJobOptions:
     local_llm_command: str | None = None
     codex_model: str | None = None
     codex_profile: str | None = None
+    llm_cli_extra_instructions: str | None = None
+    max_recipe_steps: int = 10
+    max_step_images: int = 4
+    enable_recipe_review: bool = False
     skip_existing: bool = True
     batch_id: str | None = None
     resume_mode: str = "new"
@@ -127,7 +137,7 @@ def _model_validate_segment(data: dict) -> TranscriptSegment:
 
 def _write_job(folder: Path, job: dict) -> Path:
     job_path = folder / "job.json"
-    job_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(job_path, job)
     return job_path
 
 
@@ -140,9 +150,107 @@ def _load_transcript(transcript_path: Path) -> list[TranscriptSegment]:
     return [_model_validate_segment(item) for item in raw]
 
 
+def _usable_transcript(segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+    return [segment for segment in segments if str(segment.text or "").strip()]
+
+
+def _stable_video_identity(info: dict, source_url: str) -> tuple[str | int | None, str | int | None, str | int | None, str]:
+    bvid = info.get("bvid") or info.get("id")
+    if not bvid:
+        match = re.search(r"/(BV[0-9A-Za-z]+)(?:[/?#]|$)", source_url, flags=re.IGNORECASE)
+        if match:
+            bvid = match.group(1)
+
+    cid = info.get("cid")
+    if cid is None:
+        cid = info.get("page_id")
+    if cid is not None and str(cid).strip():
+        return bvid, cid, cid, "cid"
+
+    # Some yt-dlp metadata versions do not expose CID.  The Bilibili `p`
+    # parameter still gives multipart videos a stable, non-colliding identity.
+    candidate_urls = [info.get("webpage_url"), info.get("original_url"), source_url]
+    for candidate in candidate_urls:
+        if not isinstance(candidate, str):
+            continue
+        page = (parse_qs(urlparse(candidate).query).get("p") or [None])[0]
+        if page is not None and str(page).strip():
+            return bvid, None, page, "p"
+    return bvid, None, None, "cid"
+
+
+def _llm_extraction_enabled(options: RecipeJobOptions) -> bool:
+    return not options.no_llm_summary and options.llm_provider.strip().lower() not in {"", "none", "off", "disabled"}
+
+
+def _validate_generated_artifacts(
+    transcript: list[TranscriptSegment],
+    recipe: Recipe,
+    final_note: str,
+    transcript_path: Path,
+    recipe_path: Path,
+    note_path: Path,
+) -> None:
+    if not _usable_transcript(transcript):
+        raise PipelineStageError("validate_output", "transcript contains no usable text")
+    if not recipe.steps:
+        raise PipelineStageError("validate_output", "recipe contains no cooking steps")
+    if not final_note.strip():
+        raise PipelineStageError("validate_output", "note is empty")
+    for path in (transcript_path, recipe_path, note_path):
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise PipelineStageError("validate_output", f"missing or empty artifact: {path.name}")
+
+
+def _has_step_images(recipe: Recipe) -> bool:
+    return any(bool(step.screenshot_path) for step in recipe.steps)
+
+
+def _key_screenshot_timestamps(recipe: Recipe, duration: float | int | None) -> list[float]:
+    candidates: list[float] = []
+    for step in recipe.steps:
+        candidates.append(max(0.0, step.start_time + 1.5))
+    if isinstance(duration, (int, float)) and duration > 0:
+        candidates.extend([max(0.0, duration * 0.3), max(0.0, duration * 0.5)])
+    candidates.append(1.5)
+
+    seen: set[float] = set()
+    unique: list[float] = []
+    for timestamp in candidates:
+        rounded = round(timestamp, 1)
+        if rounded in seen:
+            continue
+        seen.add(rounded)
+        unique.append(timestamp)
+    return unique
+
+
+def _capture_fallback_key_screenshot(
+    video_path: Path,
+    recipe: Recipe,
+    images_dir: Path,
+    duration: float | int | None,
+) -> Path:
+    if not recipe.steps:
+        raise ValueError("recipe has no steps")
+
+    images_dir.mkdir(parents=True, exist_ok=True)
+    output_path = images_dir / "key_01.jpg"
+    last_error: Exception | None = None
+    for timestamp in _key_screenshot_timestamps(recipe, duration):
+        try:
+            capture_screenshot_at(video_path, timestamp, output_path)
+            recipe.steps[0].screenshot_path = f"images/{output_path.name}"
+            return output_path
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+    raise RuntimeError(f"fallback key screenshot failed: {last_error}")
+
+
 def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = None) -> RecipeJobResult:
     started_at = _now()
     folder: Path | None = None
+    media_dir: Path | None = None
     job: dict = {
         "source_url": options.url,
         "status": "running",
@@ -159,7 +267,15 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
             raise PipelineStageError("fetch_info", str(exc)) from exc
 
         title = info.get("title") or "untitled"
-        folder_name = build_output_folder_name(title=title, uploader=info.get("uploader"))
+        bvid, cid, part_id, part_label = _stable_video_identity(info, options.url)
+        folder_name = build_output_folder_name(
+            title=title,
+            uploader=info.get("uploader"),
+            video_id=bvid,
+            part_id=part_id,
+            part_label=part_label,
+            source_url=options.url,
+        )
         folder = ensure_dir(Path(options.out) / folder_name)
         media_dir = ensure_dir(folder / "media")
         job.update(
@@ -167,7 +283,8 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
                 "title": title,
                 "video_title": title,
                 "uploader": info.get("uploader"),
-                "bvid": info.get("id"),
+                "bvid": bvid,
+                "cid": cid,
                 "duration": info.get("duration"),
                 "output_folder": str(folder),
             }
@@ -178,7 +295,8 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
             "source_url": options.url,
             "video_title": title,
             "uploader": info.get("uploader"),
-            "bvid": info.get("id"),
+            "bvid": bvid,
+            "cid": cid,
             "duration": info.get("duration"),
         }
 
@@ -196,7 +314,7 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
             _emit(log, "Using subtitle path.")
             for sf in subtitle_files:
                 try:
-                    transcript = parse_subtitle_file(sf)
+                    transcript = _usable_transcript(parse_subtitle_file(sf))
                     if transcript:
                         break
                 except Exception as exc:  # noqa: BLE001
@@ -208,21 +326,53 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
             _emit(log, "No subtitles found, fallback to whisper transcription.")
             try:
                 audio = download_audio(options.url, media_dir, cookies=options.cookies)
-                transcript = transcribe_audio(audio, model_size=options.whisper_model, language=options.language)
+                transcript = _usable_transcript(
+                    transcribe_audio(audio, model_size=options.whisper_model, language=options.language)
+                )
             except Exception as exc:  # noqa: BLE001
                 raise PipelineStageError("transcribe_audio", str(exc)) from exc
+            if not transcript:
+                raise PipelineStageError("transcribe_audio", "transcription produced no usable text")
 
         _emit(log, "Extracting recipe structure...")
-        try:
-            recipe = extract_recipe_rule_based(transcript, metadata)
-        except Exception as exc:  # noqa: BLE001
-            raise PipelineStageError("extract_recipe", str(exc)) from exc
+        recipe: Recipe | None = None
+        if _llm_extraction_enabled(options):
+            try:
+                recipe = extract_recipe_with_llm(
+                    transcript,
+                    metadata,
+                    provider=options.llm_provider,
+                    openai_model=options.openai_model,
+                    local_llm_command=options.local_llm_command,
+                    codex_model=options.codex_model,
+                    codex_profile=options.codex_profile,
+                    cli_extra_instructions=options.llm_cli_extra_instructions,
+                    max_steps=options.max_recipe_steps,
+                )
+                _emit(log, "Structured recipe extraction completed.")
+            except Exception as exc:  # noqa: BLE001
+                message = f"extract_recipe_llm: {exc}"
+                stage_errors.append(message)
+                _emit(log, f"Structured extraction failed, using rule-based fallback: {exc}")
+        if recipe is None:
+            try:
+                recipe = extract_recipe_rule_based(transcript, metadata, max_steps=options.max_recipe_steps)
+            except Exception as exc:  # noqa: BLE001
+                raise PipelineStageError("extract_recipe", str(exc)) from exc
 
         if not options.no_screenshot and recipe.steps:
             try:
                 _emit(log, "Capturing step screenshots...")
                 video = download_lowres_video(options.url, media_dir, cookies=options.cookies)
-                capture_step_screenshots(video, recipe.steps, folder / "images")
+                capture_step_screenshots(
+                    video,
+                    recipe.steps,
+                    folder / "images",
+                    max_images=options.max_step_images,
+                )
+                if not _has_step_images(recipe):
+                    _emit(log, "No step screenshots captured, trying one fallback key screenshot...")
+                    _capture_fallback_key_screenshot(video, recipe, folder / "images", info.get("duration"))
             except Exception as exc:  # noqa: BLE001
                 message = f"screenshot: {exc}"
                 stage_errors.append(message)
@@ -234,41 +384,28 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
 
         note_markdown = render_markdown(recipe)
         normalized_note = normalize_markdown_image_paths(note_markdown)
-        required_image_links = extract_markdown_image_links(normalized_note)
 
         _emit(log, "Writing output files...")
-        transcript_path.write_text(
-            json.dumps([_model_dump(seg) for seg in transcript], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        recipe_path.write_text(recipe.model_dump_json(indent=2), encoding="utf-8")
-        note_path.write_text(normalized_note, encoding="utf-8")
+        atomic_write_json(transcript_path, [_model_dump(seg) for seg in transcript])
+        atomic_write_json(recipe_path, _model_dump(recipe))
+        if options.enable_recipe_review:
+            create_recipe_review(recipe, folder)
+        atomic_write_text(note_path, normalized_note)
         final_note = normalized_note
 
-        if not options.no_llm_summary:
-            _emit(log, f"Rewriting note with {options.llm_provider}...")
-            llm_summary = summarize_note(
-                note_markdown,
-                provider=options.llm_provider,
-                openai_model=options.openai_model,
-                local_llm_command=options.local_llm_command,
-                codex_model=options.codex_model,
-                codex_profile=options.codex_profile,
-            )
-            if llm_summary:
-                normalized_summary = ensure_recipe_summary_section(
-                    normalize_markdown_image_paths(llm_summary),
-                    normalized_note,
-                )
-                final_note = append_missing_image_links(normalized_summary, required_image_links)
-                note_path.write_text(final_note, encoding="utf-8")
-            else:
-                message = f"llm: {options.llm_provider} unavailable or failed"
-                detail = get_last_llm_error()
-                if detail:
-                    message = f"{message}: {detail}"
-                stage_errors.append(message)
-                _emit(log, f"LLM summary skipped: {message}.")
+        if recipe.extraction_method == "llm":
+            _emit(log, "Using deterministic Markdown rendered from the structured recipe.")
+        elif _llm_extraction_enabled(options):
+            _emit(log, "Using deterministic Markdown from the rule-based fallback; review is required.")
+
+        _validate_generated_artifacts(
+            transcript,
+            recipe,
+            final_note,
+            transcript_path,
+            recipe_path,
+            note_path,
+        )
 
         if not options.keep_media:
             _emit(log, "Cleaning temporary media files...")
@@ -285,7 +422,12 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
                 "stage_errors": stage_errors,
             }
         )
-        write_quality_report(folder)
+        try:
+            write_quality_report(folder)
+        except Exception as exc:  # noqa: BLE001
+            message = f"quality: {exc}"
+            stage_errors.append(message)
+            _emit(log, f"Quality report skipped: {exc}")
         job_path = _write_job(folder, job)
 
         return RecipeJobResult(
@@ -298,6 +440,8 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
             stage_errors=stage_errors,
         )
     except Exception as exc:
+        if media_dir is not None and not options.keep_media:
+            shutil.rmtree(media_dir, ignore_errors=True)
         if folder:
             job.update({"status": "failed", "finished_at": _now(), "error": str(exc), "stage_errors": stage_errors})
             _write_job(folder, job)
@@ -314,8 +458,15 @@ def extract_creator_links(
     _emit(log, "Extracting creator video links...")
     links = extract_creator_video_links(url, cookies=cookies)
     out_dir = ensure_dir(Path(out))
-    links_path = out_dir / filename
-    links_path.write_text("\n".join(links) + ("\n" if links else ""), encoding="utf-8")
+    requested_name = Path(filename.strip() or "creator_video_links.txt")
+    if requested_name.is_absolute() or requested_name.name != str(requested_name):
+        raise ValueError("creator links filename must be a plain filename inside the output directory")
+    links_path = (out_dir / requested_name.name).resolve()
+    try:
+        links_path.relative_to(out_dir.resolve())
+    except ValueError:
+        raise ValueError("creator links filename escapes the output directory") from None
+    atomic_write_text(links_path, "\n".join(links) + ("\n" if links else ""))
     _emit(log, f"Extracted {len(links)} video links to {links_path}")
     return links_path
 
@@ -347,6 +498,10 @@ def _process_batch_url(options: BatchJobOptions, url: str, log: LogCallback | No
                 local_llm_command=options.local_llm_command,
                 codex_model=options.codex_model,
                 codex_profile=options.codex_profile,
+                llm_cli_extra_instructions=options.llm_cli_extra_instructions,
+                max_recipe_steps=options.max_recipe_steps,
+                max_step_images=options.max_step_images,
+                enable_recipe_review=options.enable_recipe_review,
             ),
             log=log,
         )
@@ -410,6 +565,7 @@ def regenerate_note_from_recipe(
     local_llm_command: str | None = None,
     codex_model: str | None = None,
     codex_profile: str | None = None,
+    llm_cli_extra_instructions: str | None = None,
 ) -> RecipeJobResult:
     folder = Path(output_folder)
     recipe_path = folder / "recipe.json"
@@ -418,8 +574,8 @@ def regenerate_note_from_recipe(
     recipe = _load_recipe(recipe_path)
     note_markdown = normalize_markdown_image_paths(render_markdown(recipe))
     final_note = note_markdown
+    stage_errors: list[str] = []
     if not no_llm_summary:
-        required_image_links = extract_markdown_image_links(note_markdown)
         summary = summarize_note(
             note_markdown,
             provider=llm_provider,
@@ -427,13 +583,19 @@ def regenerate_note_from_recipe(
             local_llm_command=local_llm_command,
             codex_model=codex_model,
             codex_profile=codex_profile,
+            cli_extra_instructions=llm_cli_extra_instructions,
         )
         if summary:
-            normalized_summary = ensure_recipe_summary_section(normalize_markdown_image_paths(summary), note_markdown)
-            final_note = append_missing_image_links(normalized_summary, required_image_links)
-    note_path.write_text(final_note, encoding="utf-8")
+            final_note = finalize_rewritten_note(summary, note_markdown)
+        else:
+            message = f"llm: {llm_provider} unavailable or failed"
+            detail = get_last_llm_error()
+            if detail:
+                message = f"{message}: {detail}"
+            stage_errors.append(message)
+    atomic_write_text(note_path, final_note)
     write_quality_report(folder)
-    return RecipeJobResult(folder, note_path, recipe_path, transcript_path, final_note)
+    return RecipeJobResult(folder, note_path, recipe_path, transcript_path, final_note, stage_errors=stage_errors)
 
 
 def regenerate_recipe_from_transcript(output_folder: str | Path) -> RecipeJobResult:
@@ -450,9 +612,9 @@ def regenerate_recipe_from_transcript(output_folder: str | Path) -> RecipeJobRes
         "recipe_title": old_recipe.title if old_recipe else folder.name,
     }
     recipe = extract_recipe_rule_based(transcript, metadata)
-    recipe_path.write_text(recipe.model_dump_json(indent=2), encoding="utf-8")
+    atomic_write_json(recipe_path, _model_dump(recipe))
     final_note = normalize_markdown_image_paths(render_markdown(recipe))
-    note_path.write_text(final_note, encoding="utf-8")
+    atomic_write_text(note_path, final_note)
     write_quality_report(folder)
     return RecipeJobResult(folder, note_path, recipe_path, transcript_path, final_note)
 
@@ -487,6 +649,6 @@ def recapture_step_screenshot(
     step = recipe.steps[step_index - 1]
     step.start_time = timestamp
     step.screenshot_path = f"images/{image_path.name}"
-    recipe_path.write_text(recipe.model_dump_json(indent=2), encoding="utf-8")
+    atomic_write_json(recipe_path, _model_dump(recipe))
     regenerate_note_from_recipe(folder)
     return image_path

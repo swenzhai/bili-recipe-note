@@ -26,11 +26,11 @@ if errorlevel 1 (
 
 "%PYTHON_EXE%" -c "import inspect; from yt_dlp.extractor.bilibili import BiliBiliIE; raise SystemExit(0 if '_dm_params' in inspect.getsource(BiliBiliIE._download_playinfo) else 1)" >nul 2>nul
 if errorlevel 1 (
-    echo Updating yt-dlp for recent Bilibili changes...
-    "%PYTHON_EXE%" -m pip install --force-reinstall "yt-dlp[default] @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz"
+    echo Reinstalling the pinned yt-dlp release for Bilibili support...
+    "%PYTHON_EXE%" -m pip install --force-reinstall -r requirements.txt
     if errorlevel 1 (
         echo.
-        echo Failed to update yt-dlp.
+        echo Failed to reinstall the pinned dependencies.
         pause
         exit /b 1
     )
@@ -41,7 +41,7 @@ echo Browser URL: http://localhost:8501
 echo Press Ctrl+C in this window to stop the server.
 echo.
 
-"%PYTHON_EXE%" -m streamlit run bili_recipe_notes/ui.py
+"%PYTHON_EXE%" -m streamlit run bili_recipe_notes/ui.py --server.address=127.0.0.1 --browser.serverAddress=127.0.0.1
 
 echo.
 echo UI server stopped.

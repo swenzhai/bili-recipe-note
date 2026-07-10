@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .quality import analyze_recipe_quality, load_quality_report, write_quality_report
+from .recipe_extractor import Recipe
 
 
 @dataclass
@@ -35,6 +36,46 @@ def _read_json(path: Path) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _has_nonempty_text(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0 and bool(path.read_text(encoding="utf-8").strip())
+    except OSError:
+        return False
+
+
+def _has_usable_transcript(path: Path) -> bool:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return isinstance(raw, list) and any(
+        isinstance(segment, dict) and bool(str(segment.get("text") or "").strip()) for segment in raw
+    )
+
+
+def _has_usable_recipe(path: Path) -> bool:
+    raw = _read_json(path)
+    if not raw:
+        return False
+    try:
+        recipe = Recipe.model_validate(raw) if hasattr(Recipe, "model_validate") else Recipe(**raw)
+    except Exception:
+        return False
+    return bool(recipe.steps)
+
+
+def is_complete_output(folder: str | Path) -> bool:
+    """Return whether a folder is safe to treat as a completed batch item."""
+    output_folder = Path(folder)
+    job = _read_json(output_folder / "job.json")
+    return bool(
+        job.get("status") == "done"
+        and _has_usable_recipe(output_folder / "recipe.json")
+        and _has_nonempty_text(output_folder / "note.md")
+        and _has_usable_transcript(output_folder / "transcript.json")
+    )
+
+
 def scan_history(out_dir: str | Path) -> list[HistoryItem]:
     root = Path(out_dir)
     if not root.exists():
@@ -61,6 +102,9 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
 
         title = str(recipe.get("title") or job.get("title") or folder.name)
         source_url = str(recipe.get("source_url") or job.get("source_url") or "")
+        status = str(job.get("status") or ("legacy" if note_path.exists() else "unknown"))
+        if status == "done" and not is_complete_output(folder):
+            status = "incomplete"
         items.append(
             HistoryItem(
                 output_folder=folder,
@@ -72,7 +116,7 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
                 recipe_path=recipe_path if recipe_path.exists() else None,
                 transcript_path=transcript_path if transcript_path.exists() else None,
                 job_path=job_path if job_path.exists() else None,
-                status=str(job.get("status") or ("done" if note_path.exists() else "unknown")),
+                status=status,
                 started_at=job.get("started_at"),
                 finished_at=job.get("finished_at"),
                 error=job.get("error"),
@@ -88,6 +132,6 @@ def find_history_by_url(out_dir: str | Path, url: str) -> HistoryItem | None:
     if not target:
         return None
     for item in scan_history(out_dir):
-        if item.source_url.strip() == target and item.note_path:
+        if item.source_url.strip() == target and item.status == "done" and is_complete_output(item.output_folder):
             return item
     return None

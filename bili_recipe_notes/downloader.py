@@ -88,6 +88,63 @@ def _raise_friendly_error(exc: Exception) -> None:
         ) from exc
     raise exc
 
+
+def _completed_downloads(
+    staging_dir: Path,
+    stem: str,
+    allowed_suffixes: set[str] | None = None,
+) -> list[Path]:
+    completed: list[Path] = []
+    for path in sorted(staging_dir.glob(f"{stem}.*")):
+        if not path.is_file() or path.stat().st_size <= 0:
+            continue
+        if path.suffix.lower() in {".part", ".temp", ".tmp", ".ytdl"}:
+            continue
+        if allowed_suffixes is not None and path.suffix.lower() not in allowed_suffixes:
+            continue
+        completed.append(path)
+    return completed
+
+
+def _promote_downloads(staging_files: list[Path], output_dir: Path, stem: str) -> list[Path]:
+    """Replace prior artifacts only after a fresh download was validated."""
+    for old_path in output_dir.glob(f"{stem}.*"):
+        if old_path.is_file() or old_path.is_symlink():
+            old_path.unlink(missing_ok=True)
+
+    promoted: list[Path] = []
+    for staging_file in staging_files:
+        destination = output_dir / staging_file.name
+        staging_file.replace(destination)
+        promoted.append(destination)
+    return promoted
+
+
+def _download_to_staging(
+    url: str,
+    output_dir: Path,
+    stem: str,
+    opts: dict,
+    *,
+    allowed_suffixes: set[str] | None = None,
+) -> list[Path]:
+    """Download in an isolated directory so stale media cannot look successful."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    from yt_dlp import YoutubeDL
+
+    with tempfile.TemporaryDirectory(prefix=f".{stem}-download-", dir=output_dir) as temp_dir:
+        staging_dir = Path(temp_dir)
+        staged_opts = dict(opts)
+        staged_opts["outtmpl"] = str(staging_dir / f"{stem}.%(ext)s")
+        with YoutubeDL(_yt_dlp_opts(staged_opts)) as ydl:
+            ydl.download([url])
+
+        staging_files = _completed_downloads(staging_dir, stem, allowed_suffixes)
+        if not staging_files:
+            raise FileNotFoundError(f"{stem.capitalize()} download produced no usable file")
+        return _promote_downloads(staging_files, output_dir, stem)
+
+
 def fetch_video_info(url: str, cookies: str | None = None) -> dict:
     opts = _base_ydl_opts(cookies)
     opts["skip_download"] = True
@@ -156,58 +213,49 @@ def download_subtitles(url: str, output_dir: Path, language: str = "zh", cookies
         "writeautomaticsub": True,
         "subtitleslangs": [language, f"{language}-CN", "zh-Hans", "zh"],
         "subtitlesformat": "vtt/srt/json3",
-        "outtmpl": str(output_dir / "subtitle.%(ext)s"),
         "quiet": True,
     })
-    from yt_dlp import YoutubeDL
     try:
-        with YoutubeDL(_yt_dlp_opts(opts)) as ydl:
-            ydl.download([url])
+        return _download_to_staging(
+            url,
+            output_dir,
+            "subtitle",
+            opts,
+            allowed_suffixes={".vtt", ".srt", ".json3"},
+        )
     except Exception as exc:
         _raise_friendly_error(exc)
     finally:
         _cleanup_ydl_opts(opts)
-    return sorted(output_dir.glob("subtitle.*"))
 
 
 def download_audio(url: str, output_dir: Path, cookies: str | None = None) -> Path:
     opts = _base_ydl_opts(cookies)
     opts.update({
         "format": "bestaudio/best",
-        "outtmpl": str(output_dir / "audio.%(ext)s"),
         "quiet": True,
     })
-    from yt_dlp import YoutubeDL
     try:
-        with YoutubeDL(_yt_dlp_opts(opts)) as ydl:
-            ydl.download([url])
+        files = _download_to_staging(url, output_dir, "audio", opts)
+        return files[0]
     except Exception as exc:
         _raise_friendly_error(exc)
     finally:
         _cleanup_ydl_opts(opts)
-    files = list(output_dir.glob("audio.*"))
-    if not files:
-        raise FileNotFoundError("Audio download failed")
-    return files[0]
 
 
 def download_lowres_video(url: str, output_dir: Path, cookies: str | None = None) -> Path:
     opts = _base_ydl_opts(cookies)
     opts.update({
-        "format": "worstvideo+bestaudio/best",
-        "merge_output_format": "mp4",
-        "outtmpl": str(output_dir / "video.%(ext)s"),
+        # Screenshots do not need an audio stream.  Prefer a video-only stream,
+        # while retaining a combined-stream fallback for sites without DASH.
+        "format": "worstvideo/bestvideo/worst",
         "quiet": True,
     })
-    from yt_dlp import YoutubeDL
     try:
-        with YoutubeDL(_yt_dlp_opts(opts)) as ydl:
-            ydl.download([url])
+        files = _download_to_staging(url, output_dir, "video", opts)
+        return files[0]
     except Exception as exc:
         _raise_friendly_error(exc)
     finally:
         _cleanup_ydl_opts(opts)
-    files = list(output_dir.glob("video.*"))
-    if not files:
-        raise FileNotFoundError("Video download failed")
-    return files[0]

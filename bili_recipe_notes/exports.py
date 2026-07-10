@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 import zipfile
 from pathlib import Path
+
+
+IMAGE_LINE_RE = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 
 
 def _plain_lines(markdown: str) -> list[str]:
@@ -22,7 +27,7 @@ def export_obsidian(note_path: Path, output_path: Path | None = None) -> Path:
     output = output_path or note_path.with_name("note.obsidian.md")
     markdown = note_path.read_text(encoding="utf-8")
     title = _plain_lines(markdown)[0] if _plain_lines(markdown) else note_path.parent.name
-    content = f"---\ntitle: {title}\nsource: bili-recipe-notes\n---\n\n{markdown}"
+    content = f"---\ntitle: {json.dumps(title, ensure_ascii=False)}\nsource: bili-recipe-notes\n---\n\n{markdown}"
     output.write_text(content, encoding="utf-8")
     return output
 
@@ -30,26 +35,80 @@ def export_obsidian(note_path: Path, output_path: Path | None = None) -> Path:
 def export_pdf(note_path: Path, output_path: Path | None = None) -> Path:
     output = output_path or note_path.with_suffix(".pdf")
     markdown = note_path.read_text(encoding="utf-8")
-    lines = _plain_lines(markdown)[:45]
+    lines = _plain_lines(markdown)
     try:
+        from reportlab.lib.enums import TA_LEFT
         from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import mm
         from reportlab.pdfbase import pdfmetrics
         from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-        from reportlab.pdfgen import canvas
+        from reportlab.platypus import Image, ListFlowable, ListItem, Paragraph, SimpleDocTemplate, Spacer
 
         pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
-        c = canvas.Canvas(str(output), pagesize=A4)
-        width, height = A4
-        y = height - 48
-        c.setFont("STSong-Light", 12)
-        for line in lines:
-            c.drawString(48, y, line[:90])
-            y -= 18
-            if y < 48:
-                c.showPage()
-                c.setFont("STSong-Light", 12)
-                y = height - 48
-        c.save()
+        styles = getSampleStyleSheet()
+        body = ParagraphStyle(
+            "RecipeBody",
+            parent=styles["BodyText"],
+            fontName="STSong-Light",
+            fontSize=10.5,
+            leading=16,
+            alignment=TA_LEFT,
+            spaceAfter=4,
+        )
+        heading_styles = {
+            level: ParagraphStyle(
+                f"RecipeHeading{level}",
+                parent=body,
+                fontSize=max(11, 20 - level * 2),
+                leading=max(16, 24 - level * 2),
+                spaceBefore=10,
+                spaceAfter=6,
+            )
+            for level in range(1, 7)
+        }
+        document = SimpleDocTemplate(
+            str(output),
+            pagesize=A4,
+            rightMargin=18 * mm,
+            leftMargin=18 * mm,
+            topMargin=16 * mm,
+            bottomMargin=16 * mm,
+            title=note_path.stem,
+        )
+        story = []
+        for raw in markdown.splitlines():
+            line = raw.strip()
+            if not line:
+                story.append(Spacer(1, 3 * mm))
+                continue
+            image_match = IMAGE_LINE_RE.match(line)
+            if image_match:
+                image_path = _resolve_local_image(note_path, image_match.group(2))
+                if image_path:
+                    picture = Image(str(image_path))
+                    max_width, max_height = 170 * mm, 105 * mm
+                    scale = min(max_width / picture.imageWidth, max_height / picture.imageHeight, 1.0)
+                    picture.drawWidth = picture.imageWidth * scale
+                    picture.drawHeight = picture.imageHeight * scale
+                    story.extend([picture, Spacer(1, 3 * mm)])
+                continue
+            heading_match = HEADING_RE.match(line)
+            if heading_match:
+                level = len(heading_match.group(1))
+                story.append(Paragraph(html.escape(_inline_plain(heading_match.group(2))), heading_styles[level]))
+                continue
+            if line.startswith("- "):
+                story.append(
+                    ListFlowable(
+                        [ListItem(Paragraph(html.escape(_inline_plain(line[2:])), body))],
+                        bulletType="bullet",
+                        leftIndent=14,
+                    )
+                )
+                continue
+            story.append(Paragraph(html.escape(_inline_plain(line)), body))
+        document.build(story)
         return output
     except Exception:
         _write_basic_pdf(output, lines)
@@ -63,11 +122,28 @@ def export_docx(note_path: Path, output_path: Path | None = None) -> Path:
     try:
         from docx import Document
 
+        from docx.shared import Inches
+
         doc = Document()
-        if lines:
-            doc.add_heading(lines[0], level=1)
-            for line in lines[1:]:
-                doc.add_paragraph(line)
+        for raw in markdown.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            image_match = IMAGE_LINE_RE.match(line)
+            if image_match:
+                image_path = _resolve_local_image(note_path, image_match.group(2))
+                if image_path:
+                    doc.add_picture(str(image_path), width=Inches(5.8))
+                    if image_match.group(1):
+                        doc.add_paragraph(image_match.group(1), style="Caption")
+                continue
+            heading_match = HEADING_RE.match(line)
+            if heading_match:
+                doc.add_heading(_inline_plain(heading_match.group(2)), level=min(len(heading_match.group(1)), 9))
+            elif line.startswith("- "):
+                doc.add_paragraph(_inline_plain(line[2:]), style="List Bullet")
+            else:
+                doc.add_paragraph(_inline_plain(line))
         doc.save(output)
         return output
     except Exception:
@@ -82,7 +158,50 @@ def export_note(note_path: Path, kind: str) -> Path:
         return export_docx(note_path)
     if kind == "obsidian":
         return export_obsidian(note_path)
+    if kind == "zip":
+        return export_recipe_bundle(note_path)
     raise ValueError(f"Unsupported export kind: {kind}")
+
+
+def _inline_plain(markdown: str) -> str:
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", markdown)
+    text = re.sub(r"[*_`~]+", "", text)
+    return text
+
+
+def _resolve_local_image(note_path: Path, raw_path: str) -> Path | None:
+    cleaned = raw_path.strip()
+    if not cleaned or "://" in cleaned:
+        return None
+    folder = note_path.parent.resolve()
+    candidate = (folder / cleaned).resolve()
+    try:
+        candidate.relative_to(folder)
+    except ValueError:
+        return None
+    return candidate if candidate.is_file() else None
+
+
+def export_recipe_bundle(note_path: Path, output_path: Path | None = None) -> Path:
+    folder = note_path.parent
+    output = output_path or folder / f"{folder.name}.recipe.zip"
+    allowed_names = {
+        "note.md",
+        "recipe.json",
+        "transcript.json",
+        "quality.json",
+        "job.json",
+        "extra_analysis.md",
+        "extra_analysis.json",
+    }
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(folder.rglob("*")):
+            if not path.is_file() or path == output:
+                continue
+            relative = path.relative_to(folder)
+            if relative.parts[0] == "images" or path.name in allowed_names:
+                archive.write(path, relative.as_posix())
+    return output
 
 
 def _pdf_hex(text: str) -> str:
@@ -90,20 +209,37 @@ def _pdf_hex(text: str) -> str:
 
 
 def _write_basic_pdf(output: Path, lines: list[str]) -> None:
-    text_ops = ["BT", "/F1 12 Tf", "50 780 Td"]
-    for idx, line in enumerate(lines[:35]):
-        if idx:
-            text_ops.append("0 -18 Td")
-        text_ops.append(f"{_pdf_hex(line[:80])} Tj")
-    text_ops.append("ET")
-    stream = "\n".join(text_ops).encode("ascii")
+    wrapped_lines: list[str] = []
+    for line in lines:
+        wrapped_lines.extend(line[index : index + 42] for index in range(0, max(1, len(line)), 42))
+    pages = [wrapped_lines[index : index + 38] for index in range(0, max(1, len(wrapped_lines)), 38)] or [[]]
+    font_number = 3 + len(pages) * 2
+    descendant_number = font_number + 1
+    page_numbers = [3 + index * 2 for index in range(len(pages))]
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 595 842] /Contents 5 0 R >>",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream",
+        f"<< /Type /Pages /Kids [{' '.join(f'{number} 0 R' for number in page_numbers)}] /Count {len(pages)} >>".encode("ascii"),
     ]
+    for index, page_lines in enumerate(pages):
+        content_number = page_numbers[index] + 1
+        text_ops = ["BT", "/F1 11 Tf", "48 790 Td"]
+        for line_index, line in enumerate(page_lines):
+            if line_index:
+                text_ops.append("0 -19 Td")
+            text_ops.append(f"{_pdf_hex(line)} Tj")
+        text_ops.append("ET")
+        stream = "\n".join(text_ops).encode("ascii")
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 {font_number} 0 R >> >> "
+            f"/MediaBox [0 0 595 842] /Contents {content_number} 0 R >>".encode("ascii")
+        )
+        objects.append(b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n" + stream + b"\nendstream")
+    objects.extend(
+        [
+            f"<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H /DescendantFonts [{descendant_number} 0 R] >>".encode("ascii"),
+            b"<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (GB1) /Supplement 4 >> >>",
+        ]
+    )
     body = b"%PDF-1.4\n"
     offsets = [0]
     for idx, obj in enumerate(objects, start=1):

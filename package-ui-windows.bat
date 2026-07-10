@@ -9,7 +9,7 @@ if not exist "%PYTHON_EXE%" (
 )
 
 echo Installing packaging requirements...
-"%PYTHON_EXE%" -m pip install -r requirements.txt
+"%PYTHON_EXE%" -m pip install -r requirements-dev.txt
 if errorlevel 1 (
     echo Failed to install requirements.
     pause
@@ -17,7 +17,7 @@ if errorlevel 1 (
 )
 
 echo Building Windows executable...
-"%PYTHON_EXE%" -m PyInstaller --noconfirm --onefile --name BiliRecipeNotesUI bili_recipe_notes\ui_launcher.py
+"%PYTHON_EXE%" -m PyInstaller --clean --noconfirm bili-recipe-notes-ui.spec
 if errorlevel 1 (
     echo Build failed.
     pause

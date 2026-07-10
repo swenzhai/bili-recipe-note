@@ -10,5 +10,9 @@
   "openai_model": "gpt-5.5",
   "local_llm_command": null,
   "codex_model": null,
-  "codex_profile": null
+  "codex_profile": null,
+  "llm_cli_extra_instructions": null,
+  "max_recipe_steps": 10,
+  "max_step_images": 4,
+  "enable_recipe_review": false
 }

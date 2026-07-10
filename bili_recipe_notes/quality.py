@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .recipe_extractor import Recipe
+from .storage import atomic_write_json
 
 QUALITY_FILE_NAME = "quality.json"
 
@@ -84,14 +85,45 @@ def analyze_recipe_quality(output_folder: str | Path) -> QualityReport:
     if not _meaningful_items(recipe.ingredients):
         score -= 18
         _add_issue(issues, "error", "missing_ingredients", "未识别到有效食材。", "补充食材名称和用量。")
+    else:
+        missing_amounts = [item.name for item in recipe.ingredients if not item.amount]
+        if missing_amounts:
+            score -= min(12, len(missing_amounts) * 3)
+            _add_issue(
+                issues,
+                "warning",
+                "missing_ingredient_amounts",
+                f"{len(missing_amounts)} 项主料缺少用量。",
+                "对照原视频确认用量；无法确认时明确标注为估计值。",
+            )
 
     if not _meaningful_items(recipe.seasonings):
         score -= 10
         _add_issue(issues, "warning", "missing_seasonings", "未识别到有效调料。", "补充调料和大致用量。")
+    else:
+        missing_seasoning_amounts = [item.name for item in recipe.seasonings if not item.amount]
+        if missing_seasoning_amounts:
+            score -= min(8, len(missing_seasoning_amounts) * 2)
+            _add_issue(
+                issues,
+                "info",
+                "missing_seasoning_amounts",
+                f"{len(missing_seasoning_amounts)} 项调料缺少用量。",
+                "补充大致范围，避免只写“适量”却没有判断标准。",
+            )
 
     if len(recipe.steps) < 2:
         score -= 15
         _add_issue(issues, "warning", "too_few_steps", "步骤数量偏少。", "检查 transcript，必要时手动拆分步骤。")
+    elif len(recipe.steps) > 12:
+        score -= 12
+        _add_issue(
+            issues,
+            "warning",
+            "too_many_steps",
+            f"识别出 {len(recipe.steps)} 个步骤，可能把字幕片段误当成独立操作。",
+            "合并连续动作，并删除寒暄、广告、试吃和闲聊片段。",
+        )
 
     short_steps = [idx for idx, step in enumerate(recipe.steps, start=1) if len((step.action or "").strip()) < 8]
     if short_steps:
@@ -102,6 +134,41 @@ def analyze_recipe_quality(output_folder: str | Path) -> QualityReport:
             "short_steps",
             f"步骤 {', '.join(map(str, short_steps[:5]))} 操作描述偏短。",
             "在编辑修复页补充关键动作和判断标准。",
+        )
+
+    long_steps = [idx for idx, step in enumerate(recipe.steps, start=1) if len((step.action or "").strip()) > 500]
+    if long_steps:
+        score -= min(12, 4 * len(long_steps))
+        _add_issue(
+            issues,
+            "warning",
+            "overlong_steps",
+            f"步骤 {', '.join(map(str, long_steps[:5]))} 包含过多字幕，可能混入非烹饪内容。",
+            "按实际动作重新拆分，并对照对应时间段确认。",
+        )
+
+    unordered_steps = [
+        idx
+        for idx in range(1, len(recipe.steps))
+        if recipe.steps[idx].start_time < recipe.steps[idx - 1].start_time
+    ]
+    if unordered_steps:
+        score -= 10
+        _add_issue(issues, "error", "unordered_steps", "步骤时间顺序不一致。", "按视频时间重新排序步骤。")
+
+    low_confidence = [
+        idx
+        for idx, step in enumerate(recipe.steps, start=1)
+        if step.confidence is not None and step.confidence < 0.6
+    ]
+    if low_confidence:
+        score -= min(12, 3 * len(low_confidence))
+        _add_issue(
+            issues,
+            "warning",
+            "low_confidence_steps",
+            f"步骤 {', '.join(map(str, low_confidence[:5]))} 置信度较低。",
+            "点击时间戳对照原视频后再确认。",
         )
 
     missing_heat = [idx for idx, step in enumerate(recipe.steps, start=1) if not step.heat]
@@ -115,20 +182,33 @@ def analyze_recipe_quality(output_folder: str | Path) -> QualityReport:
         _add_issue(issues, "info", "missing_duration", "部分步骤缺少时长信息。", "补充大致烹饪或等待时间。")
 
     if recipe.steps:
-        screenshot_count = sum(1 for step in recipe.steps if step.screenshot_path)
-        if screenshot_count < len(recipe.steps):
-            score -= min(10, 2 * (len(recipe.steps) - screenshot_count))
+        screenshot_count = sum(
+            1
+            for step in recipe.steps
+            if step.screenshot_path and (folder / step.screenshot_path).is_file()
+        )
+        expected_screenshots = min(4, len(recipe.steps))
+        if screenshot_count < expected_screenshots:
+            score -= min(8, 2 * (expected_screenshots - screenshot_count))
             _add_issue(
                 issues,
                 "info",
                 "missing_screenshots",
-                "部分步骤缺少截图。",
-                "开启截图或在编辑修复页对关键步骤重新截图。",
+                f"关键步骤图片不足（{screenshot_count}/{expected_screenshots}）。",
+                "开启截图或在编辑修复页为关键阶段重新截图。",
             )
 
-    if "## 菜谱总结" not in note:
+    summary_heading = "## 关键点速查"
+    if summary_heading not in note:
         score -= 12
-        _add_issue(issues, "warning", "missing_summary", "note.md 缺少菜谱总结。", "重新生成或一键优化笔记。")
+        _add_issue(issues, "warning", "missing_summary", "note.md 缺少关键点速查。", "重新生成或一键优化笔记。")
+    elif note.count(summary_heading) > 1:
+        score -= 8
+        _add_issue(issues, "warning", "duplicate_summary", "note.md 存在重复的关键点速查。", "只保留一份经过确认的速查摘要。")
+
+    if recipe.source_url and recipe.source_url not in note:
+        score -= 8
+        _add_issue(issues, "warning", "missing_source_attribution", "note.md 未保留原视频链接。", "恢复来源 URL、视频标题和 UP 主。")
 
     meaningful_uncertain = [item for item in recipe.uncertain_points if item and item not in {"无", "未说明"}]
     if meaningful_uncertain:
@@ -137,11 +217,11 @@ def analyze_recipe_quality(output_folder: str | Path) -> QualityReport:
 
     score = max(0, min(100, score))
     if score >= 85:
-        summary = "质量较好，可以直接使用。"
+        summary = "结构完整度较高；关键用量、火候和食品安全仍需对照原视频确认。"
     elif score >= 65:
-        summary = "质量可用，但建议补充关键信息。"
+        summary = "结构基本完整，但建议先补充并核对关键信息。"
     else:
-        summary = "质量偏低，建议先编辑修复或一键优化。"
+        summary = "结构完整度偏低，建议先审校再用于实际烹饪。"
     return QualityReport(score=score, issues=issues, summary=summary)
 
 
@@ -153,7 +233,7 @@ def write_quality_report(output_folder: str | Path, report: QualityReport | None
     folder = Path(output_folder)
     result = report or analyze_recipe_quality(folder)
     path = quality_path(folder)
-    path.write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(path, asdict(result))
     return path
 
 

@@ -49,7 +49,16 @@ def _write_recipe(folder: Path, *, complete: bool = True, note_summary: bool = T
         uncertain_points=[] if complete else ["未能稳定识别食材，请手动补充"],
     )
     (folder / "recipe.json").write_text(recipe.model_dump_json(indent=2), encoding="utf-8")
-    note = "# Demo\n\n## 菜谱总结\n\n- 火不要太大\n" if note_summary else "# Demo\n\n## 步骤\n\n炒\n"
+    if complete:
+        images = folder / "images"
+        images.mkdir(exist_ok=True)
+        (images / "step_01.jpg").write_bytes(b"image")
+        (images / "step_02.jpg").write_bytes(b"image")
+    note = (
+        "# Demo\n\n原视频：https://example.com/video\n\n## 关键点速查\n\n- 火不要太大\n"
+        if note_summary
+        else "# Demo\n\n## 步骤\n\n炒\n"
+    )
     (folder / "note.md").write_text(note, encoding="utf-8")
 
 
@@ -98,7 +107,7 @@ def test_optimize_existing_note_success_backs_up_and_updates_quality(monkeypatch
     result = optimize_existing_note(folder, OptimizeOptions(llm_provider="codex"))
 
     assert result.backup_path.read_text(encoding="utf-8") == old_note
-    assert "## 菜谱总结" in result.note_path.read_text(encoding="utf-8")
+    assert "## 关键点速查" in result.note_path.read_text(encoding="utf-8")
     assert (folder / "quality.json").exists()
 
 

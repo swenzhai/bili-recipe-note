@@ -3,11 +3,14 @@ from __future__ import annotations
 import subprocess
 
 from bili_recipe_notes.llm import (
+    apply_cli_extra_instructions,
     append_missing_image_links,
     build_summary_prompt,
     clean_llm_markdown_output,
     ensure_recipe_summary_section,
+    ensure_source_attribution,
     extract_markdown_image_links,
+    finalize_rewritten_note,
     get_last_llm_error,
     markdown_has_image_links,
     normalize_markdown_image_paths,
@@ -79,6 +82,7 @@ def test_normalize_markdown_image_paths() -> None:
     assert "![](images/step_01.jpg)" in normalized
     assert "![](images/step_02.png)" in normalized
     assert "![x](https://example.com/a.jpg)" in normalized
+    assert normalize_markdown_image_paths(r"![](images\step_03.jpg)") == "![](images/step_03.jpg)"
 
 
 def test_clean_llm_markdown_output_unwraps_full_markdown_fence() -> None:
@@ -103,8 +107,8 @@ def test_append_missing_image_links() -> None:
 def test_build_summary_prompt_requires_recipe_summary() -> None:
     prompt = build_summary_prompt("# note")
 
-    assert "## 菜谱总结" in prompt
-    assert "不要省略" in prompt
+    assert "## 关键点速查" in prompt
+    assert "不要输出证据、置信度" in prompt
 
 
 def test_ensure_recipe_summary_section_appends_missing_summary() -> None:
@@ -124,15 +128,15 @@ def test_ensure_recipe_summary_section_appends_missing_summary() -> None:
 
     merged = ensure_recipe_summary_section("## 烹饪\n\n炒熟出锅", source)
 
-    assert "## 菜谱总结" in merged
+    assert "## 关键点速查" in merged
     assert "火不要太大" in merged
-    assert "盐量需要确认" in merged
+    assert "盐量需要确认" not in merged
 
 
 def test_ensure_recipe_summary_section_keeps_existing_summary() -> None:
     markdown = "## 菜谱总结\n\n- 已有总结\n"
 
-    assert ensure_recipe_summary_section(markdown, "# source") == markdown
+    assert ensure_recipe_summary_section(markdown, "# source") == "## 关键点速查\n\n- 已有总结\n"
 
 
 def test_summarize_note_with_codex_cli_success(monkeypatch) -> None:
@@ -153,14 +157,76 @@ def test_summarize_note_with_codex_cli_success(monkeypatch) -> None:
     cmd, kwargs = calls[0]
     assert cmd[0].lower().endswith(("codex.cmd", "codex.exe", "codex"))
     assert cmd[1] == "exec"
-    assert ["-c", 'service_tier="flex"'] == cmd[cmd.index("-c") : cmd.index("-c") + 2]
+    assert "service_tier" not in " ".join(cmd)
     assert "--skip-git-repo-check" in cmd
+    assert "--ephemeral" in cmd
+    assert "--ignore-rules" in cmd
+    assert "--cd" in cmd
     assert ["--sandbox", "read-only"] == cmd[cmd.index("--sandbox") : cmd.index("--sandbox") + 2]
     assert ["--model", "gpt-test"] == cmd[cmd.index("--model") : cmd.index("--model") + 2]
     assert ["--profile", "work"] == cmd[cmd.index("--profile") : cmd.index("--profile") + 2]
     assert cmd[-1] == "-"
     assert "菜谱笔记" in kwargs["input"]
     assert kwargs["timeout"] == 300
+    assert kwargs["cwd"]
+
+
+def test_finalize_rewritten_note_normalizes_summary_and_preserves_source() -> None:
+    source = "# 番茄炒蛋\n\n原视频：https://www.bilibili.com/video/BV1TEST\n视频标题：家常番茄炒蛋\nUP主：测试UP\n\n![](images/step_01.jpg)\n\n## 菜谱总结\n\n- 原总结\n"
+    rewritten = "# 番茄炒蛋\n\n## 菜谱总结（注意事项）\n\n- 新总结\n"
+
+    result = finalize_rewritten_note(rewritten, source)
+
+    assert result.count("## 关键点速查") == 1
+    assert "https://www.bilibili.com/video/BV1TEST" in result
+    assert "## 来源" in result
+    assert "![](images/step_01.jpg)" in result
+
+
+def test_ensure_source_attribution_does_not_duplicate_existing_url() -> None:
+    source = "原视频：https://example.com/video\n视频标题：Demo\nUP主：UP\n"
+    markdown = "# Demo\n\n来源：https://example.com/video\n"
+
+    assert ensure_source_attribution(markdown, source).count("https://example.com/video") == 1
+
+
+def test_unknown_provider_is_rejected() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="Unsupported LLM provider"):
+        summarize_note("# note", provider="typo")
+
+
+def test_cli_advanced_instructions_are_delimited_and_keep_contract() -> None:
+    prompt = apply_cli_extra_instructions("BASE CONTRACT", "重点提取温度和成熟判断。")
+
+    assert prompt.startswith("BASE CONTRACT")
+    assert "<user_advanced_instructions>" in prompt
+    assert "重点提取温度和成熟判断" in prompt
+    assert "不得覆盖既定 JSON/Markdown 输出格式" in prompt
+
+
+def test_complete_prompt_applies_advanced_instructions_only_to_cli(monkeypatch) -> None:
+    captured = {}
+
+    def _opencode(prompt: str):
+        captured["cli"] = prompt
+        return "ok"
+
+    def _openai(prompt: str, model: str):
+        captured["api"] = prompt
+        return "ok"
+
+    monkeypatch.setattr("bili_recipe_notes.llm._complete_prompt_with_opencode", _opencode)
+    monkeypatch.setattr("bili_recipe_notes.llm._complete_prompt_with_openai", _openai)
+
+    from bili_recipe_notes.llm import complete_markdown_prompt
+
+    complete_markdown_prompt("base", provider="opencode", cli_extra_instructions="自定义")
+    complete_markdown_prompt("base", provider="openai", cli_extra_instructions="自定义")
+
+    assert "自定义" in captured["cli"]
+    assert captured["api"] == "base"
 
 
 def test_summarize_note_with_codex_cli_failure(monkeypatch) -> None:

@@ -20,6 +20,7 @@ class _FakeSegment:
 
 
 def test_build_whisper_model_prefers_cuda(monkeypatch) -> None:
+    transcriber._load_whisper_model.cache_clear()
     monkeypatch.setattr(transcriber, "_has_cuda_gpu", lambda: True)
     monkeypatch.setitem(__import__("sys").modules, "faster_whisper", types.SimpleNamespace(WhisperModel=_FakeModel))
 
@@ -30,6 +31,7 @@ def test_build_whisper_model_prefers_cuda(monkeypatch) -> None:
 
 
 def test_build_whisper_model_falls_back_to_cpu(monkeypatch) -> None:
+    transcriber._load_whisper_model.cache_clear()
     monkeypatch.setattr(transcriber, "_has_cuda_gpu", lambda: False)
     monkeypatch.setitem(__import__("sys").modules, "faster_whisper", types.SimpleNamespace(WhisperModel=_FakeModel))
 
@@ -52,3 +54,39 @@ def test_transcribe_audio(monkeypatch, tmp_path) -> None:
 
     assert len(result) == 1
     assert result[0].text == "文本"
+
+
+def test_build_whisper_model_is_cached(monkeypatch) -> None:
+    transcriber._load_whisper_model.cache_clear()
+    created = []
+
+    class _CountingModel(_FakeModel):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created.append(self)
+
+    monkeypatch.setattr(transcriber, "_has_cuda_gpu", lambda: False)
+    monkeypatch.setitem(__import__("sys").modules, "faster_whisper", types.SimpleNamespace(WhisperModel=_CountingModel))
+
+    first = transcriber._build_whisper_model("base")
+    second = transcriber._build_whisper_model("base")
+
+    assert first is second
+    assert len(created) == 1
+
+
+def test_transcribe_audio_filters_blank_segments(monkeypatch, tmp_path) -> None:
+    class _TranscribeModel:
+        def transcribe(self, *_args, **_kwargs):
+            return [
+                _FakeSegment(0.0, 1.0, "   "),
+                _FakeSegment(1.0, 2.0, " 有效文本 "),
+            ], None
+
+    monkeypatch.setattr(transcriber, "_build_whisper_model", lambda _size: _TranscribeModel())
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"audio")
+
+    result = transcriber.transcribe_audio(audio)
+
+    assert [segment.text for segment in result] == ["有效文本"]

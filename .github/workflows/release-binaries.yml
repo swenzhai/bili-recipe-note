@@ -1,13 +1,17 @@
 name: Release Binaries
 
-on:
+"on":
   push:
     tags:
       - "v*"
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -17,45 +21,65 @@ jobs:
           - os: ubuntu-latest
             artifact_name: bili-recipe-notes-linux
             binary_name: bili-recipe-notes
+            ui_binary_name: BiliRecipeNotesUI
           - os: macos-latest
             artifact_name: bili-recipe-notes-macos
             binary_name: bili-recipe-notes
+            ui_binary_name: BiliRecipeNotesUI
           - os: windows-latest
             artifact_name: bili-recipe-notes-windows
             binary_name: bili-recipe-notes.exe
+            ui_binary_name: BiliRecipeNotesUI.exe
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller
+          python -m pip install -r requirements-dev.txt
 
-      - name: Build executable
+      - name: Build executables
         run: |
-          pyinstaller --onefile --name bili-recipe-notes -m bili_recipe_notes
+          python -m PyInstaller --clean --noconfirm bili-recipe-notes.spec
+          python -m PyInstaller --clean --noconfirm bili-recipe-notes-ui.spec
+
+      - name: Smoke test CLI executable
+        shell: bash
+        run: |
+          "dist/${{ matrix.binary_name }}" --help
 
       - name: Rename artifact folder
         shell: bash
         run: |
           mkdir -p release
           cp "dist/${{ matrix.binary_name }}" "release/${{ matrix.binary_name }}"
+          cp "dist/${{ matrix.ui_binary_name }}" "release/${{ matrix.ui_binary_name }}"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: release/*
+          if-no-files-found: error
 
   publish:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:

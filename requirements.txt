@@ -1,9 +1,7 @@
-yt-dlp[default] @ https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
-faster-whisper
-pydantic
-rich
-streamlit
-reportlab
-python-docx
-pyinstaller
-pytest
+yt-dlp[default]==2026.7.4
+faster-whisper==1.2.1
+pydantic==2.13.4
+rich==15.0.0
+streamlit==1.58.0
+reportlab==4.5.1
+python-docx==1.2.0

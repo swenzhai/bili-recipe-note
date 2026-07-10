@@ -5,3 +5,12 @@ outputs/
 *.mp4
 *.m4a
 *.webm
+*.bak
+*.lock
+build/
+dist/
+*.spec.bak
+/.bili-recipe-notes/batches/
+/.bili-recipe-notes/config.json
+/.bili-recipe-notes/knowledge_base.json
+/.bili-recipe-notes/knowledge_base_*

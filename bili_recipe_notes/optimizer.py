@@ -3,12 +3,11 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .llm import (
-    append_missing_image_links,
-    ensure_recipe_summary_section,
-    extract_markdown_image_links,
+    finalize_rewritten_note,
     get_last_llm_error,
     normalize_markdown_image_paths,
     summarize_note,
@@ -16,6 +15,7 @@ from .llm import (
 from .markdown_writer import render_markdown
 from .quality import QualityReport, analyze_recipe_quality, write_quality_report
 from .recipe_extractor import Recipe
+from .storage import atomic_write_text
 
 
 @dataclass
@@ -25,6 +25,7 @@ class OptimizeOptions:
     local_llm_command: str | None = None
     codex_model: str | None = None
     codex_profile: str | None = None
+    llm_cli_extra_instructions: str | None = None
     no_llm_summary: bool = False
 
 
@@ -56,10 +57,16 @@ def optimize_existing_note(output_folder: str | Path, options: OptimizeOptions) 
         raise FileNotFoundError(f"Missing note.md: {note_path}")
 
     quality_before = analyze_recipe_quality(folder)
+    current_note = note_path.read_text(encoding="utf-8")
     shutil.copy2(note_path, backup_path)
+    versions_dir = folder / ".versions"
+    versions_dir.mkdir(parents=True, exist_ok=True)
+    version_path = versions_dir / f"note-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.md"
+    shutil.copy2(note_path, version_path)
 
     recipe = _load_recipe(recipe_path)
-    base_note = normalize_markdown_image_paths(render_markdown(recipe))
+    rendered_recipe = normalize_markdown_image_paths(render_markdown(recipe))
+    base_note = normalize_markdown_image_paths(current_note) or rendered_recipe
     final_note = base_note
     if not options.no_llm_summary and options.llm_provider != "none":
         llm_note = summarize_note(
@@ -69,6 +76,7 @@ def optimize_existing_note(output_folder: str | Path, options: OptimizeOptions) 
             local_llm_command=options.local_llm_command,
             codex_model=options.codex_model,
             codex_profile=options.codex_profile,
+            cli_extra_instructions=options.llm_cli_extra_instructions,
         )
         if not llm_note:
             detail = get_last_llm_error()
@@ -76,18 +84,15 @@ def optimize_existing_note(output_folder: str | Path, options: OptimizeOptions) 
             if detail:
                 message = f"{message}: {detail}"
             raise RuntimeError(message)
-        final_note = append_missing_image_links(
-            ensure_recipe_summary_section(normalize_markdown_image_paths(llm_note), base_note),
-            extract_markdown_image_links(base_note),
-        )
+        final_note = finalize_rewritten_note(llm_note, base_note)
 
-    note_path.write_text(final_note, encoding="utf-8")
+    atomic_write_text(note_path, final_note)
     quality_after = analyze_recipe_quality(folder)
     write_quality_report(folder, quality_after)
     return OptimizeResult(
         output_folder=folder,
         note_path=note_path,
-        backup_path=backup_path,
+        backup_path=version_path,
         quality_before=quality_before,
         quality_after=quality_after,
     )
