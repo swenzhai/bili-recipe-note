@@ -7,6 +7,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from bili_recipe_notes import ui
+from bili_recipe_notes.batch_queue import BatchQueueItem, BatchQueueState
 
 
 def _recipe(title: str, *, ingredients: list[dict] | None = None, seasonings: list[dict] | None = None) -> dict:
@@ -31,7 +32,7 @@ def _recipe(title: str, *, ingredients: list[dict] | None = None, seasonings: li
 
 def _write_record(root: Path, folder_name: str, recipe: dict | str) -> Path:
     folder = root / folder_name
-    folder.mkdir()
+    folder.mkdir(parents=True)
     payload = recipe if isinstance(recipe, str) else json.dumps(recipe, ensure_ascii=False)
     (folder / "recipe.json").write_text(payload, encoding="utf-8")
     (folder / "note.md").write_text(f"# {folder_name}\n", encoding="utf-8")
@@ -60,6 +61,11 @@ def test_empty_recipe_tables_have_fixed_distinct_schemas() -> None:
         {"name": ["鸡蛋", ""], "amount": ["2 个", ""], "note": [None, None]},
         ui.INGREDIENT_COLUMNS,
     ) == [{"name": "鸡蛋", "amount": "2 个", "note": None}]
+    assert ui._merge_editor_rows(
+        {"name": ["鸡蛋"], "amount": ["3 个"], "note": [None]},
+        ui.INGREDIENT_COLUMNS,
+        [{"name": "鸡蛋", "amount": "2 个", "confidence": 0.8, "evidence": "两个鸡蛋"}],
+    ) == [{"name": "鸡蛋", "amount": "3 个", "note": None, "confidence": 0.8, "evidence": "两个鸡蛋"}]
 
 
 def test_empty_ingredient_and_seasoning_editors_do_not_duplicate(tmp_path: Path) -> None:
@@ -157,7 +163,7 @@ def test_history_zip_export_stays_available_for_download(tmp_path: Path) -> None
     folder = _write_record(tmp_path, "bundle", _recipe("打包菜谱"))
     at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
-    at.selectbox(key="main_page").set_value("历史记录")
+    at.selectbox(key="main_page").set_value("草稿与归档")
     at.run()
 
     export_selector = next(widget for widget in at.selectbox if widget.label == "导出格式")
@@ -236,3 +242,60 @@ def test_review_page_can_create_item_by_item_review(tmp_path: Path) -> None:
     assert (folder / "recipe.review.json").is_file()
     assert any(button.label == "采用并下一项" for button in at.button)
     assert any("置信度" in caption.value for caption in at.caption)
+
+
+def test_draft_can_be_archived_directly_to_obsidian(tmp_path: Path) -> None:
+    folder = _write_record(tmp_path / "outputs", "archive", _recipe("直接归档菜谱"))
+    vault = tmp_path / "vault"
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path / "outputs"))
+    next(widget for widget in at.text_input if widget.label == "笔记本目录").set_value(str(vault))
+    at.selectbox(key="main_page").set_value("草稿与归档")
+    at.run()
+    next(button for button in at.button if button.label == "无需修改，直接归档").click()
+    at.run()
+
+    assert not at.exception
+    assert (folder / "archive.json").is_file()
+    assert list((vault / "菜谱").rglob("*.md"))
+
+
+def test_edit_page_exposes_taxonomy_and_final_markdown_archive(tmp_path: Path) -> None:
+    folder = _write_record(tmp_path, "editable", _recipe("完整编辑菜谱"))
+    at = _open_edit_page(tmp_path)
+    record_key = ui._record_key(folder)
+
+    assert at.selectbox(key=f"edit_{record_key}_category") is not None
+    assert at.selectbox(key=f"edit_{record_key}_cuisine") is not None
+    assert at.text_input(key=f"edit_{record_key}_tags") is not None
+    assert at.text_area(key=f"edit_{record_key}_final_markdown") is not None
+    assert at.button(key=f"edit_{record_key}_save_and_archive") is not None
+
+
+def test_batch_results_keep_per_item_edit_review_and_archive_actions(monkeypatch, tmp_path: Path) -> None:
+    folder = _write_record(tmp_path, "batch-item", _recipe("批量菜谱"))
+    state = BatchQueueState(
+        batch_id="ui-batch",
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+        options={},
+        items=[
+            BatchQueueItem(
+                url="https://example.com/batch",
+                status="done",
+                output_folder=str(folder),
+                note_path=str(folder / "note.md"),
+            )
+        ],
+    )
+    monkeypatch.setattr("bili_recipe_notes.batch_queue.list_batch_states", lambda: [state])
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at.selectbox(key="main_page").set_value("批量处理")
+    at.run()
+    next(widget for widget in at.selectbox if widget.label == "已有批次").set_value(
+        "ui-batch | 2026-01-01T00:00:00+00:00 | 1 条"
+    )
+    at.run()
+
+    labels = {button.label for button in at.button}
+    assert {"编辑这条", "审核这条", "直接归档这条", "归档本批次全部已完成草稿"} <= labels

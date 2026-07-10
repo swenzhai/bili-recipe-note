@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .quality import analyze_recipe_quality, load_quality_report, write_quality_report
+from .obsidian_archive import recipe_archive_status
 from .recipe_extractor import Recipe
 
 
@@ -26,6 +27,12 @@ class HistoryItem:
     error: str | None = None
     quality_score: int | None = None
     quality_summary: str | None = None
+    workflow_status: str = "draft"
+    archive_note_path: Path | None = None
+    archived_at: str | None = None
+    category: str = "未分类"
+    cuisine: str = "未分类"
+    tags: list[str] | None = None
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -89,6 +96,8 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
         job_path = folder / "job.json"
         recipe = _read_json(recipe_path) if recipe_path.exists() else {}
         job = _read_json(job_path) if job_path.exists() else {}
+        archive = _read_json(folder / "archive.json")
+        workflow_status = recipe_archive_status(folder)
         quality = load_quality_report(folder)
         if not quality and (recipe_path.exists() or note_path.exists()):
             quality = analyze_recipe_quality(folder)
@@ -122,6 +131,14 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
                 error=job.get("error"),
                 quality_score=quality.score if quality else None,
                 quality_summary=quality.summary if quality else None,
+                workflow_status=workflow_status,
+                archive_note_path=Path(str(archive["note_path"])) if archive.get("note_path") else None,
+                archived_at=str(archive.get("archived_at")) if archive.get("archived_at") else None,
+                category=str(recipe.get("category") or "未分类"),
+                cuisine=str(recipe.get("cuisine") or "未分类"),
+                tags=[str(tag) for tag in recipe.get("tags", []) if str(tag).strip()]
+                if isinstance(recipe.get("tags"), list)
+                else [],
             )
         )
     return items

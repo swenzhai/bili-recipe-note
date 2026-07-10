@@ -14,5 +14,8 @@
   "llm_cli_extra_instructions": null,
   "max_recipe_steps": 10,
   "max_step_images": 4,
-  "enable_recipe_review": false
+  "enable_recipe_review": false,
+  "obsidian_vault_dir": "obsidian-vault",
+  "auto_archive_after_generation": false,
+  "archive_knowledge_with_recipe": true
 }

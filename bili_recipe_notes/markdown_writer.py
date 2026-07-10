@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .recipe_extractor import Recipe
+from .recipe_extractor import Recipe, normalize_recipe_taxonomy
 from .utils import sec_to_timestamp
 
 
@@ -20,6 +20,7 @@ def _ingredient_line(item) -> str:
 
 
 def render_markdown(recipe: Recipe) -> str:
+    recipe = normalize_recipe_taxonomy(recipe)
     lines: list[str] = [f"# {recipe.title}", "", "## 来源", ""]
     if recipe.source_url:
         lines.append(f"- 原视频：[{recipe.source_url}]({recipe.source_url})")
@@ -36,6 +37,12 @@ def render_markdown(recipe: Recipe) -> str:
         meta_lines.append(f"- 总耗时：{recipe.total_time}")
     if recipe.difficulty:
         meta_lines.append(f"- 难度：{recipe.difficulty}")
+    if recipe.category and recipe.category != "未分类":
+        meta_lines.append(f"- 分类：{recipe.category}")
+    if recipe.cuisine and recipe.cuisine != "未分类":
+        meta_lines.append(f"- 菜系：{recipe.cuisine}")
+    if recipe.tags:
+        meta_lines.append(f"- 标签：{'、'.join(recipe.tags)}")
     if meta_lines:
         lines.extend(["## 基本信息", "", *meta_lines, ""])
 

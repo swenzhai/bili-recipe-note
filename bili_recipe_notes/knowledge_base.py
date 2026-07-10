@@ -12,7 +12,7 @@ from typing import Any
 from .config import CONFIG_DIR_NAME
 from .content_analysis import _recipe_to_context, _read_json, _read_text, _transcript_to_text
 from .llm import clean_llm_markdown_output, complete_markdown_prompt, get_last_llm_error
-from .storage import CorruptDataError, atomic_write_json, file_lock, read_json
+from .storage import CorruptDataError, atomic_write_json, atomic_write_text, file_lock, read_json
 
 
 KNOWLEDGE_BASE_FILE_NAME = "knowledge_base.json"
@@ -34,6 +34,7 @@ class CookingKnowledgeEntry:
     source_url: str = ""
     source_output_folder: str = ""
     source_refs: list[dict[str, str]] = field(default_factory=list)
+    review_status: str = "draft"
     mastery: str = "new"
     review_count: int = 0
     last_reviewed_at: str = ""
@@ -177,6 +178,11 @@ def _entry_from_dict(data: dict[str, Any]) -> CookingKnowledgeEntry:
         source_url=source_url,
         source_output_folder=str(data.get("source_output_folder") or "").strip(),
         source_refs=_clean_source_refs(data.get("source_refs")),
+        review_status=(
+            str(data.get("review_status") or "draft").strip()
+            if str(data.get("review_status") or "draft").strip() in {"draft", "approved"}
+            else "draft"
+        ),
         mastery=str(data.get("mastery") or "new").strip() or "new",
         review_count=int(data.get("review_count") or 0),
         last_reviewed_at=str(data.get("last_reviewed_at") or "").strip(),
@@ -294,6 +300,8 @@ def _merge_entry(primary: CookingKnowledgeEntry, incoming: CookingKnowledgeEntry
     if not primary.source_output_folder:
         primary.source_output_folder = incoming.source_output_folder
     primary.source_refs = _merge_source_refs([primary, incoming])
+    if incoming.review_status == "approved":
+        primary.review_status = "approved"
     if primary.confidence is None:
         primary.confidence = incoming.confidence
     elif incoming.confidence is not None:
@@ -821,5 +829,5 @@ def write_related_knowledge_to_note(
         for entry in entries:
             lines.append(f"- **{entry.title}**（{entry.category}）：{entry.content}")
         note = note + "\n" + "\n".join(lines).rstrip() + "\n"
-    note_path.write_text(note, encoding="utf-8")
+    atomic_write_text(note_path, note)
     return note_path

@@ -40,6 +40,12 @@ try:
     )
     from .llm import apply_cli_extra_instructions
     from .optimizer import OptimizeOptions, optimize_existing_note
+    from .obsidian_archive import (
+        ObsidianArchiveConflict,
+        archive_knowledge,
+        archive_recipe,
+        archive_recipe_batch,
+    )
     from .pipeline import (
         BatchJobOptions,
         RecipeJobOptions,
@@ -51,7 +57,7 @@ try:
         run_batch,
     )
     from .quality import analyze_recipe_quality
-    from .recipe_extractor import Recipe, condense_recipe_steps
+    from .recipe_extractor import RECIPE_CATEGORIES, RECIPE_CUISINES, Recipe, condense_recipe_steps
     from .recipe_review import (
         accept_all_pending_review_items,
         create_recipe_review,
@@ -88,6 +94,12 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
     )
     from bili_recipe_notes.llm import apply_cli_extra_instructions
     from bili_recipe_notes.optimizer import OptimizeOptions, optimize_existing_note
+    from bili_recipe_notes.obsidian_archive import (
+        ObsidianArchiveConflict,
+        archive_knowledge,
+        archive_recipe,
+        archive_recipe_batch,
+    )
     from bili_recipe_notes.pipeline import (
         BatchJobOptions,
         RecipeJobOptions,
@@ -99,7 +111,7 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
         run_batch,
     )
     from bili_recipe_notes.quality import analyze_recipe_quality
-    from bili_recipe_notes.recipe_extractor import Recipe, condense_recipe_steps
+    from bili_recipe_notes.recipe_extractor import RECIPE_CATEGORIES, RECIPE_CUISINES, Recipe, condense_recipe_steps
     from bili_recipe_notes.recipe_review import (
         accept_all_pending_review_items,
         create_recipe_review,
@@ -123,7 +135,7 @@ CLI_PROMPT_PRESETS = {
 }
 PAGES = [
     "单视频生成",
-    "历史记录",
+    "草稿与归档",
     "审核确认",
     "批量处理",
     "编辑修复",
@@ -294,6 +306,19 @@ def _editor_rows(value: Any, columns: Iterable[str]) -> list[dict[str, Any]]:
     return rows
 
 
+def _merge_editor_rows(value: Any, columns: Iterable[str], originals: Any) -> list[dict[str, Any]]:
+    """Keep non-visible audit fields when editing the user-facing columns."""
+
+    visible_rows = _editor_rows(value, columns)
+    source_rows = originals if isinstance(originals, list) else []
+    merged: list[dict[str, Any]] = []
+    for index, visible in enumerate(visible_rows):
+        base = dict(source_rows[index]) if index < len(source_rows) and isinstance(source_rows[index], dict) else {}
+        base.update(visible)
+        merged.append(base)
+    return merged
+
+
 def _load_batch_urls(links_text: str, links_file: str) -> list[str]:
     urls = [line.strip() for line in links_text.splitlines() if line.strip()]
     if links_file.strip():
@@ -388,6 +413,25 @@ def _history_options(items: list[HistoryItem]) -> dict[str, HistoryItem]:
     return {f"{item.title} | {item.output_folder.name}": item for item in items}
 
 
+def _select_history_item(st, label: str, options: dict[str, HistoryItem], key: str) -> HistoryItem:
+    focus = st.session_state.get("_focus_output_folder")
+    if focus:
+        focused_label = next(
+            (name for name, item in options.items() if str(item.output_folder.resolve()) == str(Path(focus).resolve())),
+            None,
+        )
+        if focused_label:
+            st.session_state[key] = focused_label
+            st.session_state.pop("_focus_output_folder", None)
+    return options[st.selectbox(label, list(options), key=key)]
+
+
+def _navigate_to_record(st, page: str, output_folder: Path) -> None:
+    st.session_state["_next_page"] = page
+    st.session_state["_focus_output_folder"] = str(output_folder.resolve())
+    st.rerun()
+
+
 def _review_item_label(item: dict[str, Any]) -> str:
     value = item.get("value") or item.get("original") or {}
     section_names = {"ingredients": "主料", "seasonings": "调料", "steps": "步骤"}
@@ -422,6 +466,41 @@ def _job_options(url: str, config: UIConfig) -> RecipeJobOptions:
         max_step_images=config.max_step_images,
         enable_recipe_review=config.enable_recipe_review,
     )
+
+
+def _vault_path(config: UIConfig) -> Path:
+    path = Path(config.obsidian_vault_dir).expanduser()
+    return path.resolve() if path.is_absolute() else (Path.cwd() / path).resolve()
+
+
+def _archive_output(output_folder: Path, config: UIConfig, *, overwrite: bool = False):
+    result = archive_recipe(
+        output_folder,
+        _vault_path(config),
+        conflict="overwrite" if overwrite else "update",
+    )
+    knowledge_results = ()
+    knowledge_error: Exception | None = None
+    if config.archive_knowledge_with_recipe:
+        knowledge_results, knowledge_error = _archive_approved_knowledge(config, overwrite=overwrite)
+    return result, knowledge_results, knowledge_error
+
+
+def _archive_approved_knowledge(config: UIConfig, *, overwrite: bool = False):
+    approved = [entry for entry in load_knowledge_entries() if entry.review_status == "approved"]
+    if not approved:
+        return (), None
+    try:
+        return (
+            archive_knowledge(
+                approved,
+                _vault_path(config),
+                conflict="overwrite" if overwrite else "update",
+            ),
+            None,
+        )
+    except Exception as exc:  # recipe archive remains successful
+        return (), exc
 
 
 def _optimize_options(config: UIConfig) -> OptimizeOptions:
@@ -524,6 +603,22 @@ def _render_sidebar(st, config: UIConfig) -> UIConfig:
             value=config.enable_recipe_review,
             help="保存证据和置信度，之后可在“审核确认”中逐项采用、修改或跳过。",
         )
+    with st.sidebar.expander("Obsidian 归档", expanded=False):
+        config.obsidian_vault_dir = st.text_input(
+            "笔记本目录",
+            value=config.obsidian_vault_dir,
+            help="可以是现有 Obsidian vault，也可以是将要创建的新目录。",
+        )
+        config.auto_archive_after_generation = st.checkbox(
+            "生成后直接归档",
+            value=config.auto_archive_after_generation,
+            help="关闭时先进入草稿箱；开启后仍可继续编辑并再次归档更新。",
+        )
+        config.archive_knowledge_with_recipe = st.checkbox(
+            "归档时同步通用技巧",
+            value=config.archive_knowledge_with_recipe,
+            help="把已经提炼的通用烹饪技巧同步到笔记本的技巧目录。",
+        )
     config.llm_provider = st.sidebar.selectbox(
         "LLM provider",
         LLM_PROVIDERS,
@@ -593,6 +688,9 @@ def main() -> None:
     st.title("Bili Recipe Notes")
     _show_pending_notice(st)
 
+    next_page = st.session_state.pop("_next_page", None)
+    if next_page in PAGES:
+        st.session_state["main_page"] = next_page
     st.sidebar.header("功能导航")
     active_page = st.sidebar.selectbox("当前功能", PAGES, key="main_page")
     config = _render_sidebar(st, load_config())
@@ -612,7 +710,19 @@ def main() -> None:
                 log(error_message)
                 st.error(f"生成失败：{error_message}")
             else:
+                st.session_state["last_generated_output_folder"] = str(result.output_folder.resolve())
                 st.success(f"生成完成：{result.output_folder}")
+                if config.auto_archive_after_generation:
+                    try:
+                        archived, archived_knowledge, knowledge_error = _archive_output(result.output_folder, config)
+                    except Exception as exc:  # generation remains successful
+                        st.warning(f"菜谱已生成，但自动归档失败：{_clean_error(exc)}")
+                    else:
+                        st.success(f"已自动归档：{archived.note_path}")
+                        if archived_knowledge:
+                            st.caption(f"同时同步 {len(archived_knowledge)} 条已确认通用技巧。")
+                        if knowledge_error:
+                            st.warning(f"菜谱归档成功，但技巧同步失败：{_clean_error(knowledge_error)}")
                 if result.stage_errors:
                     st.warning("\n".join(result.stage_errors))
                 st.markdown("#### 笔记预览")
@@ -623,9 +733,24 @@ def main() -> None:
                     language="text",
                 )
                 st.download_button("下载 note.md", data=result.final_note, file_name="note.md", mime="text/markdown")
+        last_generated_value = st.session_state.get("last_generated_output_folder")
+        last_generated = Path(last_generated_value) if isinstance(last_generated_value, str) else None
+        if last_generated and (last_generated / "recipe.json").is_file():
+            st.markdown("#### 下一步")
+            st.caption("当前结果已进入草稿箱；可以先完整编辑、逐项审核，也可以不修改直接归档。")
+            col_edit, col_review, col_drafts = st.columns(3)
+            with col_edit:
+                if st.button("编辑完整菜谱", key="generated_go_edit"):
+                    _navigate_to_record(st, "编辑修复", last_generated)
+            with col_review:
+                if st.button("逐项审核 AI 结果", key="generated_go_review"):
+                    _navigate_to_record(st, "审核确认", last_generated)
+            with col_drafts:
+                if st.button("查看草稿与归档", key="generated_go_drafts"):
+                    _navigate_to_record(st, "草稿与归档", last_generated)
 
-    if active_page == "历史记录":
-        st.subheader("历史记录")
+    if active_page == "草稿与归档":
+        st.subheader("草稿与归档")
         items = scan_history(config.out_dir)
         query = st.text_input("搜索", placeholder="标题、UP 主、URL")
         filtered = [
@@ -635,6 +760,9 @@ def main() -> None:
             or query.lower() in item.title.lower()
             or query.lower() in (item.uploader or "").lower()
             or query.lower() in item.source_url.lower()
+            or query.lower() in item.category.lower()
+            or query.lower() in item.cuisine.lower()
+            or any(query.lower() in tag.lower() for tag in (item.tags or []))
         ]
         st.caption(f"共 {len(filtered)} 条")
         if filtered:
@@ -643,7 +771,14 @@ def main() -> None:
                     {
                         "标题": item.title,
                         "UP主": item.uploader or "",
+                        "分类": item.category,
+                        "标签": ", ".join(item.tags or []),
                         "状态": item.status,
+                        "工作流": {
+                            "archived": "已归档",
+                            "stale": "归档后有修改",
+                            "archive_error": "归档异常",
+                        }.get(item.workflow_status, "待整理"),
                         "结构完整度": item.quality_score if item.quality_score is not None else "",
                         "完成时间": item.finished_at or "",
                         "目录": str(item.output_folder),
@@ -653,8 +788,18 @@ def main() -> None:
                 width="stretch",
             )
             options = _history_options(filtered)
-            selected = options[st.selectbox("选择记录", list(options), key="history_select")]
+            selected = _select_history_item(st, "选择记录", options, "history_select")
             history_key = _record_key(selected.output_folder)
+            if selected.workflow_status == "archived":
+                st.success(f"已归档：{selected.archive_note_path or 'Obsidian 笔记本'}")
+                if selected.archived_at:
+                    st.caption(f"最近归档时间：{selected.archived_at}；再次归档会更新同一篇笔记。")
+            elif selected.workflow_status == "stale":
+                st.warning("当前草稿在上次归档后又有修改，需要重新归档才能同步最新版本。")
+            elif selected.workflow_status == "archive_error":
+                st.error("归档清单或目标笔记异常，请检查路径后重新归档。")
+            else:
+                st.info("当前是待整理草稿：可直接归档，也可以先到“编辑修复”或“审核确认”处理。")
             confirm_overwrite = st.checkbox(
                 "确认允许覆盖这条记录的已有文件",
                 key=f"history_{history_key}_confirm_overwrite",
@@ -734,6 +879,59 @@ def main() -> None:
                             mime=EXPORT_MIME_TYPES.get(last_export.suffix.lower(), "application/octet-stream"),
                             key=f"history_{history_key}_download_export",
                         )
+            st.markdown("#### 草稿后处理")
+            force_vault_overwrite = st.checkbox(
+                "如果 Vault 中这篇笔记被手动改过，确认用当前草稿覆盖",
+                key=f"history_{history_key}_force_archive",
+            )
+            col_edit, col_review, col_archive, col_tips = st.columns(4)
+            with col_edit:
+                if st.button("编辑完整菜谱", key=f"history_{history_key}_go_edit"):
+                    _navigate_to_record(st, "编辑修复", selected.output_folder)
+            with col_review:
+                if st.button("逐项审核", key=f"history_{history_key}_go_review"):
+                    _navigate_to_record(st, "审核确认", selected.output_folder)
+            with col_archive:
+                archive_label = "重新归档当前版本" if selected.workflow_status in {"archived", "stale"} else "无需修改，直接归档"
+                if st.button(archive_label, type="primary", key=f"history_{history_key}_archive"):
+                    try:
+                        archived, archived_knowledge, knowledge_error = _archive_output(
+                            selected.output_folder,
+                            config,
+                            overwrite=force_vault_overwrite,
+                        )
+                    except ObsidianArchiveConflict as exc:
+                        st.error(f"Vault 中的笔记有手动修改，未覆盖：{_clean_error(exc)}")
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"归档失败：{_clean_error(exc)}")
+                    else:
+                        message = f"已归档：{archived.note_path}"
+                        if archived_knowledge:
+                            message += f"；同步 {len(archived_knowledge)} 条已确认技巧"
+                        if knowledge_error:
+                            message += f"；技巧同步失败：{_clean_error(knowledge_error)}"
+                        _rerun_with_notice(st, message)
+            with col_tips:
+                if st.button(
+                    "AI 提炼通用技巧",
+                    disabled=config.llm_provider == "none",
+                    key=f"history_{history_key}_extract_tips",
+                ):
+                    try:
+                        with st.spinner("正在提炼通用技巧候选..."):
+                            extracted = extract_knowledge_from_video(
+                                selected.output_folder,
+                                options=_knowledge_extraction_options(config),
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"技巧提炼失败：{_clean_error(exc)}")
+                    else:
+                        st.session_state["_next_page"] = "知识库"
+                        _rerun_with_notice(
+                            st,
+                            f"已生成技巧候选：新增 {extracted.added_count} 条、更新 {extracted.updated_count} 条；"
+                            "请在知识库确认后再同步到笔记本。",
+                        )
             st.markdown("#### 质量报告")
             _display_quality(st, selected.output_folder)
             if st.button(
@@ -768,7 +966,7 @@ def main() -> None:
             st.info("还没有可以审核的菜谱。")
         else:
             options = _history_options(reviewable)
-            selected = options[st.selectbox("选择菜谱", list(options), key="review_select")]
+            selected = _select_history_item(st, "选择菜谱", options, "review_select")
             record_key = _record_key(selected.output_folder)
             current_review_path = review_path(selected.output_folder)
             if not current_review_path.exists():
@@ -972,6 +1170,23 @@ def main() -> None:
                 st.error(f"批量处理失败：{_clean_error(exc)}")
             else:
                 st.dataframe([item.__dict__ for item in result.items], width="stretch")
+                if config.auto_archive_after_generation:
+                    completed_folders = [item.output_folder for item in result.items if item.output_folder and item.status == "done"]
+                    if completed_folders:
+                        archived_batch = archive_recipe_batch(completed_folders, _vault_path(config))
+                        knowledge_results, knowledge_error = (
+                            _archive_approved_knowledge(config)
+                            if config.archive_knowledge_with_recipe
+                            else ((), None)
+                        )
+                        st.success(
+                            f"自动归档完成：成功 {archived_batch.archived_count}，"
+                            f"跳过 {archived_batch.skipped_count}，失败 {archived_batch.failed_count}。"
+                        )
+                        if knowledge_results:
+                            st.caption(f"同步 {len(knowledge_results)} 条已确认通用技巧。")
+                        if knowledge_error:
+                            st.warning(f"技巧同步失败：{_clean_error(knowledge_error)}")
                 if batch_id:
                     st.success(f"批次状态已保存：{batch_id}")
 
@@ -980,6 +1195,70 @@ def main() -> None:
             if selected_state:
                 st.markdown("#### 批次状态")
                 st.dataframe([item.__dict__ for item in selected_state.items], width="stretch")
+                completed_batch_items = [
+                    item
+                    for item in selected_state.items
+                    if item.status in {"done", "skipped"}
+                    and item.output_folder
+                    and (Path(item.output_folder) / "recipe.json").is_file()
+                ]
+                if completed_batch_items:
+                    st.markdown("#### 批量结果后处理")
+                    st.caption("每条结果都是独立草稿，可以逐条编辑、审核或归档；批量生成不会锁死后续修改。")
+                    batch_item_labels = {
+                        f"{Path(item.output_folder).name} | {item.status}": item for item in completed_batch_items
+                    }
+                    batch_item = batch_item_labels[
+                        st.selectbox("选择一条结果", list(batch_item_labels), key=f"batch_post_{selected_state.batch_id}")
+                    ]
+                    batch_folder = Path(str(batch_item.output_folder))
+                    force_batch_overwrite = st.checkbox(
+                        "确认覆盖 Vault 中这条笔记的手写修改",
+                        key=f"batch_force_archive_{selected_state.batch_id}",
+                    )
+                    col_edit, col_review, col_archive = st.columns(3)
+                    with col_edit:
+                        if st.button("编辑这条", key=f"batch_edit_{selected_state.batch_id}"):
+                            _navigate_to_record(st, "编辑修复", batch_folder)
+                    with col_review:
+                        if st.button("审核这条", key=f"batch_review_{selected_state.batch_id}"):
+                            _navigate_to_record(st, "审核确认", batch_folder)
+                    with col_archive:
+                        if st.button("直接归档这条", type="primary", key=f"batch_archive_{selected_state.batch_id}"):
+                            try:
+                                archived, archived_knowledge, knowledge_error = _archive_output(
+                                    batch_folder,
+                                    config,
+                                    overwrite=force_batch_overwrite,
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                st.error(f"归档失败：{_clean_error(exc)}")
+                            else:
+                                message = f"已归档：{archived.note_path}"
+                                if knowledge_error:
+                                    message += f"；技巧同步失败：{_clean_error(knowledge_error)}"
+                                _rerun_with_notice(st, message)
+                    if st.button("归档本批次全部已完成草稿", key=f"batch_archive_all_{selected_state.batch_id}"):
+                        folders = [Path(str(item.output_folder)) for item in completed_batch_items]
+                        archived_batch = archive_recipe_batch(
+                            folders,
+                            _vault_path(config),
+                            conflict="overwrite" if force_batch_overwrite else "update",
+                        )
+                        knowledge_results, knowledge_error = (
+                            _archive_approved_knowledge(config, overwrite=force_batch_overwrite)
+                            if config.archive_knowledge_with_recipe
+                            else ((), None)
+                        )
+                        knowledge_message = f"；同步 {len(knowledge_results)} 条技巧" if knowledge_results else ""
+                        if knowledge_error:
+                            knowledge_message += f"；技巧同步失败：{_clean_error(knowledge_error)}"
+                        _rerun_with_notice(
+                            st,
+                            f"批量归档完成：成功 {archived_batch.archived_count}，"
+                            f"跳过 {archived_batch.skipped_count}，失败 {archived_batch.failed_count}"
+                            f"{knowledge_message}。",
+                        )
 
     if active_page == "编辑修复":
         st.subheader("编辑与修复")
@@ -989,7 +1268,7 @@ def main() -> None:
             st.info("没有可编辑的菜谱。")
         else:
             edit_options = _history_options(editable)
-            selected = edit_options[st.selectbox("选择菜谱", list(edit_options), key="edit_select")]
+            selected = _select_history_item(st, "选择菜谱", edit_options, "edit_select")
             record_key = _record_key(selected.output_folder)
             state_prefix = f"edit_{record_key}_"
             st.markdown("#### 质量报告")
@@ -1060,22 +1339,50 @@ def main() -> None:
                     value=recipe_data.get("difficulty") or "",
                     key=f"{state_prefix}difficulty",
                 )
+                category_options = list(dict.fromkeys([recipe_data.get("category") or "未分类", *RECIPE_CATEGORIES]))
+                recipe_data["category"] = st.selectbox(
+                    "归档分类",
+                    category_options,
+                    key=f"{state_prefix}category",
+                    help="用于 Obsidian 菜谱目录，例如中餐、汤羹、西餐、糕点。",
+                )
+                cuisine_options = list(dict.fromkeys([recipe_data.get("cuisine") or "未分类", *RECIPE_CUISINES]))
+                recipe_data["cuisine"] = st.selectbox(
+                    "菜系",
+                    cuisine_options,
+                    key=f"{state_prefix}cuisine",
+                )
+                recipe_data["tags"] = [
+                    tag.strip().lstrip("#")
+                    for tag in st.text_input(
+                        "检索标签，用逗号分隔",
+                        value=", ".join(recipe_data.get("tags") or []),
+                        key=f"{state_prefix}tags",
+                    ).split(",")
+                    if tag.strip().lstrip("#")
+                ]
+                original_ingredients = recipe_data.get("ingredients")
                 ingredient_editor = st.data_editor(
-                    _editor_table(recipe_data.get("ingredients"), INGREDIENT_COLUMNS),
+                    _editor_table(original_ingredients, INGREDIENT_COLUMNS),
                     num_rows="dynamic",
                     column_order=list(INGREDIENT_COLUMNS),
                     column_config={"name": "名称", "amount": "用量", "note": "备注"},
                     key=f"{state_prefix}ingredients",
                 )
-                recipe_data["ingredients"] = _editor_rows(ingredient_editor, INGREDIENT_COLUMNS)
+                recipe_data["ingredients"] = _merge_editor_rows(
+                    ingredient_editor, INGREDIENT_COLUMNS, original_ingredients
+                )
+                original_seasonings = recipe_data.get("seasonings")
                 seasoning_editor = st.data_editor(
-                    _editor_table(recipe_data.get("seasonings"), INGREDIENT_COLUMNS),
+                    _editor_table(original_seasonings, INGREDIENT_COLUMNS),
                     num_rows="dynamic",
                     column_order=list(INGREDIENT_COLUMNS),
                     column_config={"name": "名称", "amount": "用量", "note": "备注"},
                     key=f"{state_prefix}seasonings",
                 )
-                recipe_data["seasonings"] = _editor_rows(seasoning_editor, INGREDIENT_COLUMNS)
+                recipe_data["seasonings"] = _merge_editor_rows(
+                    seasoning_editor, INGREDIENT_COLUMNS, original_seasonings
+                )
                 recipe_data["tools"] = [
                     item.strip()
                     for item in st.text_area(
@@ -1103,8 +1410,18 @@ def main() -> None:
                     ).splitlines()
                     if item.strip()
                 ]
+                recipe_data["summary_tips"] = [
+                    item.strip()
+                    for item in st.text_area(
+                        "关键点速查，每行一个",
+                        value="\n".join(recipe_data.get("summary_tips") or []),
+                        key=f"{state_prefix}summary_tips",
+                    ).splitlines()
+                    if item.strip()
+                ]
+                original_steps = recipe_data.get("steps")
                 steps_editor = st.data_editor(
-                    _editor_table(recipe_data.get("steps"), STEP_COLUMNS),
+                    _editor_table(original_steps, STEP_COLUMNS),
                     num_rows="dynamic",
                     column_order=list(STEP_COLUMNS),
                     column_config={
@@ -1119,7 +1436,7 @@ def main() -> None:
                     },
                     key=f"{state_prefix}steps",
                 )
-                recipe_data["steps"] = _editor_rows(steps_editor, STEP_COLUMNS)
+                recipe_data["steps"] = _merge_editor_rows(steps_editor, STEP_COLUMNS, original_steps)
                 if st.button(
                     "保存菜谱并重新生成 note.md",
                     disabled=not confirm_overwrite,
@@ -1141,6 +1458,57 @@ def main() -> None:
                             f"已保存：{result.note_path}{_backup_summary(backups)}",
                             clear_prefix=state_prefix,
                         )
+
+            st.markdown("#### 最终 Markdown 手动编辑")
+            st.caption("这里保存的是归档时使用的最终正文；以后点击“从结构重新生成”会覆盖这些手写修改。")
+            final_markdown = st.text_area(
+                "note.md",
+                value=_read_text(selected.note_path),
+                height=420,
+                key=f"{state_prefix}final_markdown",
+            )
+            force_edit_archive = st.checkbox(
+                "归档时覆盖 Vault 中这篇笔记的手写修改",
+                key=f"{state_prefix}force_archive",
+            )
+            col_save_markdown, col_save_archive = st.columns(2)
+            with col_save_markdown:
+                save_final_markdown = st.button(
+                    "保存最终 Markdown",
+                    disabled=not selected.note_path or not confirm_overwrite or not final_markdown.strip(),
+                    key=f"{state_prefix}save_final_markdown",
+                )
+            with col_save_archive:
+                save_and_archive = st.button(
+                    "保存并归档到 Obsidian",
+                    type="primary",
+                    disabled=not selected.note_path or not confirm_overwrite or not final_markdown.strip(),
+                    key=f"{state_prefix}save_and_archive",
+                )
+            if save_final_markdown or save_and_archive:
+                try:
+                    backups = _backup_files([selected.note_path], "markdown-edit")
+                    atomic_write_text(selected.note_path, final_markdown.strip() + "\n")  # type: ignore[arg-type]
+                    archived = None
+                    knowledge_results = ()
+                    knowledge_error = None
+                    if save_and_archive:
+                        archived, knowledge_results, knowledge_error = _archive_output(
+                            selected.output_folder,
+                            config,
+                            overwrite=force_edit_archive,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"保存或归档失败：{_clean_error(exc)}")
+                else:
+                    message = f"最终 Markdown 已保存{_backup_summary(backups)}"
+                    if archived:
+                        message += f"；已归档：{archived.note_path}"
+                    if knowledge_results:
+                        message += f"；同步 {len(knowledge_results)} 条技巧"
+                    if knowledge_error:
+                        message += f"；技巧同步失败：{_clean_error(knowledge_error)}"
+                    _rerun_with_notice(st, message)
 
             st.markdown("#### transcript 修正")
             transcript_text = _read_text(selected.transcript_path)
@@ -1268,6 +1636,7 @@ def main() -> None:
                     {
                         "标题": entry.title,
                         "分类": entry.category,
+                        "状态": "已确认干货" if entry.review_status == "approved" else "AI 候选",
                         "标签": ", ".join(entry.tags),
                         "来源": entry.source_title,
                         "更新时间": entry.updated_at,
@@ -1310,6 +1679,17 @@ def main() -> None:
                     language="text",
                 )
             with col_review:
+                st.markdown("#### 收录状态")
+                if selected_entry.review_status == "approved":
+                    st.success("已确认，可同步到 Obsidian 笔记本")
+                    if st.button("退回候选", key=f"kb_unapprove_{selected_entry.id}"):
+                        update_knowledge_entry(selected_entry.id, {"review_status": "draft"})
+                        _rerun_with_notice(st, "已退回 AI 候选。")
+                else:
+                    st.warning("AI 候选，确认内容有价值后再收录")
+                    if st.button("确认并收录为干货", type="primary", key=f"kb_approve_{selected_entry.id}"):
+                        update_knowledge_entry(selected_entry.id, {"review_status": "approved"})
+                        _rerun_with_notice(st, "已确认该技巧为干货。")
                 st.markdown("#### 快速复习")
                 for label in ["已掌握", "还模糊", "需要实践"]:
                     if st.button(label, key=f"kb_review_{label}_{selected_entry.id}"):
@@ -1502,6 +1882,29 @@ def main() -> None:
                 st.error(f"导出失败：{_clean_error(exc)}")
             else:
                 st.success(f"已导出：{exported}")
+
+        st.markdown("#### 同步干货到 Obsidian")
+        approved_entries = [entry for entry in all_entries if entry.review_status == "approved"]
+        draft_entries = [entry for entry in all_entries if entry.review_status != "approved"]
+        st.caption(
+            f"已确认干货 {len(approved_entries)} 条，AI 候选 {len(draft_entries)} 条；"
+            "只同步已确认内容，证据和置信度不会写入最终笔记。"
+        )
+        force_knowledge_overwrite = st.checkbox(
+            "确认覆盖 Vault 中技巧笔记的手写修改",
+            key="kb_force_obsidian_overwrite",
+        )
+        if st.button("同步已确认干货", disabled=not approved_entries, key="kb_sync_obsidian"):
+            try:
+                synced = archive_knowledge(
+                    approved_entries,
+                    _vault_path(config),
+                    conflict="overwrite" if force_knowledge_overwrite else "update",
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"同步失败：{_clean_error(exc)}")
+            else:
+                st.success(f"已同步 {len(synced)} 条技巧到 {_vault_path(config) / '烹饪技巧'}")
 
         st.markdown("#### 从历史视频提取")
         items = scan_history(config.out_dir)

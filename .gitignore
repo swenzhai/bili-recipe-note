@@ -9,6 +9,7 @@ outputs/
 *.lock
 build/
 dist/
+obsidian-vault/
 *.spec.bak
 /.bili-recipe-notes/batches/
 /.bili-recipe-notes/config.json

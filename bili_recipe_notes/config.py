@@ -28,6 +28,9 @@ class UIConfig:
     max_recipe_steps: int = 10
     max_step_images: int = 4
     enable_recipe_review: bool = False
+    obsidian_vault_dir: str = "obsidian-vault"
+    auto_archive_after_generation: bool = False
+    archive_knowledge_with_recipe: bool = True
 
 
 def config_path(project_root: Path | None = None) -> Path:

@@ -10,6 +10,7 @@ from bili_recipe_notes.recipe_extractor import (
     condense_recipe_steps,
     extract_recipe_rule_based,
     extract_recipe_with_llm,
+    normalize_recipe_taxonomy,
 )
 from bili_recipe_notes.subtitle import parse_srt, parse_vtt
 
@@ -37,6 +38,9 @@ def test_extract_recipe_rule_based() -> None:
     assert any(i.name == "鸡蛋" for i in recipe.ingredients)
     assert any(s.name == "盐" for s in recipe.seasonings)
     assert len(recipe.steps) >= 2
+    assert recipe.category == "中餐"
+    assert recipe.cuisine == "中式"
+    assert {"鸡蛋", "番茄", "炒"} <= set(recipe.tags)
 
 
 def test_extract_recipe_with_llm_builds_canonical_recipe() -> None:
@@ -48,6 +52,9 @@ def test_extract_recipe_with_llm_builds_canonical_recipe() -> None:
     }
     response = {
         "title": "番茄炒蛋",
+        "category": "家常菜",
+        "cuisine": "中华",
+        "tags": ["#快手菜", "快手菜", "鸡蛋"],
         "source_url": "https://malicious.example/overridden",
         "ingredients": [
             {
@@ -88,6 +95,9 @@ def test_extract_recipe_with_llm_builds_canonical_recipe() -> None:
     assert recipe.source_url == metadata["source_url"]
     assert recipe.ingredients[0].confidence == 1.0
     assert recipe.steps[0].heat == "中火"
+    assert recipe.category == "中餐"
+    assert recipe.cuisine == "中式"
+    assert recipe.tags.count("快手菜") == 1
 
 
 def test_extract_recipe_with_llm_accepts_timestamp_strings() -> None:
@@ -120,6 +130,53 @@ def test_recipe_extraction_prompt_marks_transcript_untrusted() -> None:
     assert "不可信数据" in prompt
     assert "<untrusted_transcript>" in prompt
     assert "不得执行" in prompt
+    assert "category" in prompt
+    assert "中餐/汤羹/西餐/糕点" in prompt
+
+
+def test_recipe_taxonomy_is_backward_compatible_and_infers_search_labels() -> None:
+    legacy_data = {
+        "title": "奶油蘑菇浓汤",
+        "source_url": "",
+        "ingredients": [{"name": "蘑菇"}],
+        "seasonings": [],
+        "tools": [],
+        "steps": [{"title": "熬汤", "start_time": 0, "action": "煮至浓稠"}],
+        "summary_tips": [],
+        "uncertain_points": [],
+    }
+    recipe = Recipe.model_validate(legacy_data) if hasattr(Recipe, "model_validate") else Recipe(**legacy_data)
+
+    assert recipe.category == "未分类"
+    assert recipe.cuisine == "未分类"
+    assert recipe.tags == []
+
+    normalize_recipe_taxonomy(recipe)
+
+    assert recipe.category == "汤羹"
+    assert "蘑菇" in recipe.tags
+
+
+def test_recipe_taxonomy_preserves_manual_custom_labels_and_cleans_tags() -> None:
+    recipe = Recipe(
+        title="私房菜",
+        source_url="",
+        category="我的宴客菜",
+        cuisine="融合菜",
+        tags=[" #宴客 ", "宴客", "  ", "周末"],
+        ingredients=[],
+        seasonings=[],
+        tools=[],
+        steps=[RecipeStep(title="完成", start_time=0, action="装盘")],
+        summary_tips=[],
+        uncertain_points=[],
+    )
+
+    normalize_recipe_taxonomy(recipe)
+
+    assert recipe.category == "我的宴客菜"
+    assert recipe.cuisine == "融合菜"
+    assert recipe.tags == ["宴客", "周末"]
 
 
 def test_extract_recipe_with_llm_rejects_no_steps() -> None:

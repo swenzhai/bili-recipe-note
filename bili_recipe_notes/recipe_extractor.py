@@ -5,8 +5,11 @@ import re
 from typing import Any, Callable, Iterable
 
 try:
-    from pydantic import BaseModel
+    from pydantic import BaseModel, Field
 except Exception:  # pragma: no cover
+    def Field(*, default_factory):  # type: ignore[no-untyped-def]
+        return default_factory()
+
     class BaseModel:  # type: ignore[override]
         def __init__(self, **data: Any):
             for k, v in data.items():
@@ -54,14 +57,17 @@ class Recipe(BaseModel):
     source_url: str
     video_title: str | None = None
     uploader: str | None = None
+    category: str = "未分类"
+    cuisine: str = "未分类"
+    tags: list[str] = Field(default_factory=list)
     servings: str | None = None
     total_time: str | None = None
     difficulty: str | None = None
     ingredients: list[RecipeIngredient]
     seasonings: list[RecipeIngredient]
     tools: list[str]
-    prep_items: list[str] = []
-    shopping_list: list[str] = []
+    prep_items: list[str] = Field(default_factory=list)
+    shopping_list: list[str] = Field(default_factory=list)
     steps: list[RecipeStep]
     summary_tips: list[str]
     uncertain_points: list[str]
@@ -128,6 +134,153 @@ TRANSCRIPT_CHUNK_CHAR_LIMIT = 30_000
 DEFAULT_MAX_RECIPE_STEPS = 10
 MIN_RECIPE_STEPS = 4
 COMPLETION_KEYWORDS = ("出锅", "装盘", "菜做好", "制作完成")
+RECIPE_CATEGORIES = ("中餐", "汤羹", "西餐", "糕点", "主食", "小吃", "饮品", "其他")
+RECIPE_CUISINES = ("中式", "西式", "日式", "韩式", "东南亚", "其他")
+CATEGORY_ALIASES = {
+    "中式": "中餐",
+    "中式菜": "中餐",
+    "家常菜": "中餐",
+    "汤": "汤羹",
+    "汤品": "汤羹",
+    "炖汤": "汤羹",
+    "西式": "西餐",
+    "西式菜": "西餐",
+    "烘焙": "糕点",
+    "甜点": "糕点",
+    "甜品": "糕点",
+    "面点": "糕点",
+    "点心": "小吃",
+    "饮料": "饮品",
+}
+CUISINE_ALIASES = {
+    "中国菜": "中式",
+    "中国": "中式",
+    "中华": "中式",
+    "中餐": "中式",
+    "欧美": "西式",
+    "西餐": "西式",
+    "法式": "西式",
+    "意式": "西式",
+    "美式": "西式",
+    "日本": "日式",
+    "日韩": "日式",
+    "韩国": "韩式",
+    "韩餐": "韩式",
+    "东南亚菜": "东南亚",
+}
+PASTRY_KEYWORDS = ("蛋糕", "糕点", "面包", "吐司", "曲奇", "饼干", "泡芙", "可颂", "马卡龙", "挞", "布丁")
+SOUP_KEYWORDS = ("汤", "羹", "浓汤", "高汤", "煲汤")
+DRINK_KEYWORDS = ("饮品", "饮料", "奶茶", "果汁", "咖啡", "茶饮", "冰沙")
+STAPLE_KEYWORDS = ("炒饭", "焖饭", "盖饭", "拌面", "汤面", "面条", "水饺", "饺子", "馄饨")
+SNACK_KEYWORDS = ("小吃", "煎饼", "肉夹馍", "串串", "炸串", "春卷")
+WESTERN_KEYWORDS = ("西餐", "牛排", "意面", "意大利面", "披萨", "焗饭", "沙拉", "汉堡", "法式", "意式")
+JAPANESE_KEYWORDS = ("日式", "寿司", "味噌", "照烧", "天妇罗", "拉面")
+KOREAN_KEYWORDS = ("韩式", "韩国", "泡菜", "部队锅", "石锅拌饭")
+SOUTHEAST_ASIAN_KEYWORDS = ("泰式", "越南", "冬阴功", "叻沙", "东南亚")
+CHINESE_KEYWORDS = (
+    "中餐",
+    "家常",
+    "炒",
+    "蒸",
+    "炖",
+    "焖",
+    "红烧",
+    "爆炒",
+    "生抽",
+    "老抽",
+    "料酒",
+    "花椒",
+)
+COOKING_METHOD_TAGS = ("红烧", "清蒸", "爆炒", "凉拌", "烘焙", "煎", "炒", "炸", "蒸", "炖", "焖", "烤", "煮", "腌")
+
+
+def _clean_taxonomy_value(value: Any, *, max_length: int = 24) -> str:
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", " ", value.strip().lstrip("#")).strip(" ,，;；")[:max_length]
+
+
+def _clean_tags(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    tags: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        tag = _clean_taxonomy_value(value)
+        key = tag.casefold()
+        if not tag or key in seen:
+            continue
+        seen.add(key)
+        tags.append(tag)
+        if len(tags) >= 12:
+            break
+    return tags
+
+
+def _recipe_taxonomy_text(recipe: Recipe) -> str:
+    parts = [recipe.title, recipe.video_title or ""]
+    parts.extend(item.name for item in recipe.ingredients)
+    parts.extend(item.name for item in recipe.seasonings)
+    for step in recipe.steps:
+        parts.extend((step.title, step.action, step.heat or "", step.tips or ""))
+    return " ".join(parts)
+
+
+def _infer_cuisine(text: str, category: str) -> str:
+    if any(keyword in text for keyword in JAPANESE_KEYWORDS):
+        return "日式"
+    if any(keyword in text for keyword in KOREAN_KEYWORDS):
+        return "韩式"
+    if any(keyword in text for keyword in SOUTHEAST_ASIAN_KEYWORDS):
+        return "东南亚"
+    if category == "西餐" or any(keyword in text for keyword in WESTERN_KEYWORDS):
+        return "西式"
+    if any(keyword in text for keyword in CHINESE_KEYWORDS):
+        return "中式"
+    return "其他"
+
+
+def _infer_category(text: str, cuisine: str) -> str:
+    if any(keyword in text for keyword in PASTRY_KEYWORDS):
+        return "糕点"
+    if any(keyword in text for keyword in SOUP_KEYWORDS):
+        return "汤羹"
+    if any(keyword in text for keyword in DRINK_KEYWORDS):
+        return "饮品"
+    if any(keyword in text for keyword in STAPLE_KEYWORDS):
+        return "主食"
+    if any(keyword in text for keyword in SNACK_KEYWORDS):
+        return "小吃"
+    if cuisine == "西式" or any(keyword in text for keyword in WESTERN_KEYWORDS):
+        return "西餐"
+    if cuisine == "中式" or any(keyword in text for keyword in CHINESE_KEYWORDS):
+        return "中餐"
+    return "其他"
+
+
+def normalize_recipe_taxonomy(recipe: Recipe) -> Recipe:
+    """Normalize user/LLM labels and infer conservative defaults for search and archiving."""
+
+    text = _recipe_taxonomy_text(recipe)
+    raw_category = _clean_taxonomy_value(recipe.category)
+    category = CATEGORY_ALIASES.get(raw_category, raw_category)
+    raw_cuisine = _clean_taxonomy_value(recipe.cuisine)
+    cuisine = CUISINE_ALIASES.get(raw_cuisine, raw_cuisine)
+
+    if not cuisine or cuisine == "未分类":
+        cuisine = _infer_cuisine(text, category)
+    if not category or category == "未分类":
+        category = _infer_category(text, cuisine)
+
+    # Preserve deliberate custom labels while keeping generated aliases stable.
+    recipe.category = category or "其他"
+    recipe.cuisine = cuisine or "其他"
+
+    tags = _clean_tags(recipe.tags)
+    candidates = [item.name for item in recipe.ingredients[:6]]
+    candidates.extend(method for method in COOKING_METHOD_TAGS if method in text)
+    recipe.tags = _clean_tags([*tags, *candidates])
+    return recipe
 
 
 def _contains_keyword(text: str, keywords: Iterable[str]) -> bool:
@@ -216,7 +369,7 @@ def extract_recipe_rule_based(
         ],
         extraction_method="rule",
     )
-    return condense_recipe_steps(recipe, max_steps=max_steps)
+    return condense_recipe_steps(normalize_recipe_taxonomy(recipe), max_steps=max_steps)
 
 
 def build_recipe_extraction_prompt(transcript: list[TranscriptSegment], metadata: dict) -> str:
@@ -233,6 +386,9 @@ def build_recipe_extraction_prompt(transcript: list[TranscriptSegment], metadata
         "只输出一个 JSON 对象，不要 Markdown、解释或代码块。\n\n"
         "JSON 字段要求：\n"
         "- title: 菜名；servings/total_time/difficulty: 无法确认时为 null；\n"
+        "- category: 用于归档的主分类，只能从 中餐/汤羹/西餐/糕点/主食/小吃/饮品/其他 中选择一个；\n"
+        "- cuisine: 菜系，只能从 中式/西式/日式/韩式/东南亚/其他 中选择一个；\n"
+        "- tags: 3–8 个便于检索的短标签数组，优先使用主食材、烹饪技法和菜品特点，不要带 #；\n"
         "- ingredients/seasonings: 数组，每项包含 name、amount、note、evidence、source_time、confidence；\n"
         "- tools/prep_items/shopping_list: 字符串数组；\n"
         "- steps: 面向日后检索和快速回顾，只保留 6–10 个关键烹饪阶段，最多 10 个；"
@@ -362,6 +518,13 @@ def _normalize_recipe_payload(data: dict[str, Any], metadata: dict) -> dict[str,
     payload["video_title"] = metadata.get("video_title")
     payload["uploader"] = metadata.get("uploader")
     payload["extraction_method"] = "llm"
+    raw_category = _clean_taxonomy_value(payload.get("category"))
+    normalized_category = CATEGORY_ALIASES.get(raw_category, raw_category)
+    payload["category"] = normalized_category if normalized_category in RECIPE_CATEGORIES else "未分类"
+    raw_cuisine = _clean_taxonomy_value(payload.get("cuisine"))
+    normalized_cuisine = CUISINE_ALIASES.get(raw_cuisine, raw_cuisine)
+    payload["cuisine"] = normalized_cuisine if normalized_cuisine in RECIPE_CUISINES else "未分类"
+    payload["tags"] = _clean_tags(payload.get("tags"))
     for key in ("ingredients", "seasonings"):
         items = payload.get(key)
         if not isinstance(items, list):
@@ -434,6 +597,14 @@ def _merge_recipe_payloads(payloads: list[dict[str, Any]], metadata: dict) -> di
     merged = _normalize_recipe_payload(payloads[0], metadata)
     for raw in payloads[1:]:
         incoming = _normalize_recipe_payload(raw, metadata)
+        for key in ("category", "cuisine"):
+            if merged.get(key) in {None, "", "未分类", "其他"} and incoming.get(key) not in {
+                None,
+                "",
+                "未分类",
+                "其他",
+            }:
+                merged[key] = incoming[key]
         for key in ("ingredients", "seasonings"):
             existing_by_name = {str(item.get("name") or "").strip(): item for item in merged[key]}
             for item in incoming[key]:
@@ -454,6 +625,7 @@ def _merge_recipe_payloads(payloads: list[dict[str, Any]], metadata: dict) -> di
                     old["confidence"] = new_confidence
         for key in ("tools", "prep_items", "shopping_list", "summary_tips", "uncertain_points"):
             merged[key] = list(dict.fromkeys([*merged[key], *incoming[key]]))
+        merged["tags"] = _clean_tags([*merged["tags"], *incoming["tags"]])
         merged["steps"].extend(incoming["steps"])
 
     seen_steps: set[tuple[int, str]] = set()
@@ -512,4 +684,4 @@ def extract_recipe_with_llm(
     if not payload["steps"]:
         raise ValueError("LLM recipe extraction returned no usable cooking steps")
     recipe = Recipe.model_validate(payload) if hasattr(Recipe, "model_validate") else Recipe(**payload)
-    return condense_recipe_steps(recipe, max_steps=max_steps)
+    return condense_recipe_steps(normalize_recipe_taxonomy(recipe), max_steps=max_steps)

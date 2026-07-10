@@ -20,6 +20,9 @@ def test_render_markdown_basic() -> None:
     assert "![步骤 1：步骤1](images/step_01.jpg)" in md
     assert "时间：[00:00:01](https://example.com?t=1)" in md
     assert "## 来源" in md
+    assert "- 分类：中餐" in md
+    assert "- 菜系：中式" in md
+    assert "- 标签：鸡蛋、炒" in md
     assert "## 配料信息" in md
     assert "## 烹饪" in md
     assert "## 关键点速查" in md

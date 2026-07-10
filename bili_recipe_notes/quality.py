@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from .recipe_extractor import Recipe
+from .recipe_extractor import Recipe, normalize_recipe_taxonomy
 from .storage import atomic_write_json
 
 QUALITY_FILE_NAME = "quality.json"
@@ -81,6 +81,14 @@ def analyze_recipe_quality(output_folder: str | Path) -> QualityReport:
             ],
             summary="缺少菜谱结构，无法评估。",
         )
+
+    recipe = normalize_recipe_taxonomy(recipe)
+    if recipe.category in {"", "未分类", "其他"}:
+        score -= 4
+        _add_issue(issues, "info", "missing_category", "菜谱尚未归入明确分类。", "选择中餐、汤羹、西餐、糕点等分类。")
+    if not recipe.tags:
+        score -= 3
+        _add_issue(issues, "info", "missing_tags", "菜谱缺少检索标签。", "补充主食材、烹饪技法等短标签。")
 
     if not _meaningful_items(recipe.ingredients):
         score -= 18
