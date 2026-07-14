@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from .recipe_extractor import Recipe, normalize_recipe_taxonomy
+import re
+
+from .recipe_extractor import Recipe, normalize_recipe_taxonomy, rating_stars
 from .utils import sec_to_timestamp
 
 
@@ -17,6 +19,43 @@ def _ingredient_line(item) -> str:
     if item.note and item.note != "未说明":
         line += f"（{item.note}）"
     return line
+
+
+RATING_BLOCK_START = "<!-- bili-recipe-notes:ratings:start -->"
+RATING_BLOCK_END = "<!-- bili-recipe-notes:ratings:end -->"
+RATING_BLOCK_RE = re.compile(
+    rf"\n*{re.escape(RATING_BLOCK_START)}.*?{re.escape(RATING_BLOCK_END)}\n*",
+    re.DOTALL,
+)
+
+
+def render_rating_block(recipe: Recipe) -> str:
+    recipe = normalize_recipe_taxonomy(recipe)
+    lines = [RATING_BLOCK_START, "## 评级", ""]
+    if recipe.taste_rating is not None:
+        lines.append(f"- 个人喜爱度：{rating_stars(recipe.taste_rating)}")
+    else:
+        lines.append("- 个人喜爱度：未评分")
+    lines.extend(
+        [
+            f"- 烹饪难度：{rating_stars(recipe.difficulty_rating)}",
+            f"- 时间投入：{rating_stars(recipe.time_rating)}",
+            RATING_BLOCK_END,
+        ]
+    )
+    return "\n".join(lines)
+
+
+def upsert_rating_block(markdown: str, recipe: Recipe) -> str:
+    """Update only the managed ratings block, preserving manual recipe edits."""
+
+    block = render_rating_block(recipe)
+    if RATING_BLOCK_RE.search(markdown):
+        return RATING_BLOCK_RE.sub(f"\n\n{block}\n\n", markdown, count=1).strip() + "\n"
+    marker = "\n## 配料信息"
+    if marker in markdown:
+        return markdown.replace(marker, f"\n\n{block}\n{marker}", 1).strip() + "\n"
+    return f"{markdown.rstrip()}\n\n{block}\n"
 
 
 def render_markdown(recipe: Recipe) -> str:
@@ -45,6 +84,8 @@ def render_markdown(recipe: Recipe) -> str:
         meta_lines.append(f"- 标签：{'、'.join(recipe.tags)}")
     if meta_lines:
         lines.extend(["## 基本信息", "", *meta_lines, ""])
+
+    lines.extend([render_rating_block(recipe), ""])
 
     lines.extend(["## 配料信息", "", "### 主料", ""])
     if recipe.ingredients:

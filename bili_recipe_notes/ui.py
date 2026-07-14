@@ -39,6 +39,7 @@ try:
         write_related_knowledge_to_note,
     )
     from .llm import apply_cli_extra_instructions
+    from .markdown_writer import upsert_rating_block
     from .optimizer import OptimizeOptions, optimize_existing_note
     from .obsidian_archive import (
         ObsidianArchiveConflict,
@@ -57,7 +58,14 @@ try:
         run_batch,
     )
     from .quality import analyze_recipe_quality
-    from .recipe_extractor import RECIPE_CATEGORIES, RECIPE_CUISINES, Recipe, condense_recipe_steps
+    from .recipe_extractor import (
+        RECIPE_CATEGORIES,
+        RECIPE_CUISINES,
+        Recipe,
+        condense_recipe_steps,
+        normalize_recipe_taxonomy,
+        rating_stars,
+    )
     from .recipe_review import (
         accept_all_pending_review_items,
         create_recipe_review,
@@ -93,6 +101,7 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
         write_related_knowledge_to_note,
     )
     from bili_recipe_notes.llm import apply_cli_extra_instructions
+    from bili_recipe_notes.markdown_writer import upsert_rating_block
     from bili_recipe_notes.optimizer import OptimizeOptions, optimize_existing_note
     from bili_recipe_notes.obsidian_archive import (
         ObsidianArchiveConflict,
@@ -111,7 +120,14 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
         run_batch,
     )
     from bili_recipe_notes.quality import analyze_recipe_quality
-    from bili_recipe_notes.recipe_extractor import RECIPE_CATEGORIES, RECIPE_CUISINES, Recipe, condense_recipe_steps
+    from bili_recipe_notes.recipe_extractor import (
+        RECIPE_CATEGORIES,
+        RECIPE_CUISINES,
+        Recipe,
+        condense_recipe_steps,
+        normalize_recipe_taxonomy,
+        rating_stars,
+    )
     from bili_recipe_notes.recipe_review import (
         accept_all_pending_review_items,
         create_recipe_review,
@@ -400,6 +416,80 @@ def _dump_model(model) -> dict:
     return model.__dict__
 
 
+def _rating_option_label(value: int | None) -> str:
+    return "未评分" if value is None else rating_stars(value)
+
+
+def _recipe_with_inferred_ratings(recipe_path: Path) -> Recipe:
+    recipe = _validate_recipe(_recipe_to_data(recipe_path))
+    return normalize_recipe_taxonomy(recipe)
+
+
+def _render_rating_controls(st, recipe_path: Path, *, key_prefix: str) -> dict[str, int | None] | None:
+    try:
+        recipe = _recipe_with_inferred_ratings(recipe_path)
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"评级暂不可用：{_clean_error(exc)}")
+        return None
+
+    st.markdown("##### 归档评级")
+    st.caption("喜爱度由你填写；难度和时间由系统先评估，1 星最低、5 星最高，均可修改。")
+    col_taste, col_difficulty, col_time = st.columns(3)
+    with col_taste:
+        taste = st.selectbox(
+            "个人喜爱度",
+            [None, 1, 2, 3, 4, 5],
+            index=recipe.taste_rating or 0,
+            format_func=_rating_option_label,
+            key=f"{key_prefix}taste_rating",
+            help="按自己的喜欢程度评分；可以暂时不评分。",
+        )
+    with col_difficulty:
+        difficulty = st.selectbox(
+            "烹饪难度评级",
+            [1, 2, 3, 4, 5],
+            index=max(0, int(recipe.difficulty_rating or 1) - 1),
+            format_func=_rating_option_label,
+            key=f"{key_prefix}difficulty_rating",
+            help="1 星很简单，5 星很难。系统根据步骤和技法自动给出初值。",
+        )
+    with col_time:
+        time_rating = st.selectbox(
+            "时间投入评级",
+            [1, 2, 3, 4, 5],
+            index=max(0, int(recipe.time_rating or 1) - 1),
+            format_func=_rating_option_label,
+            key=f"{key_prefix}time_rating",
+            help="1 星约 15 分钟内，5 星通常超过 2 小时。系统根据总耗时自动给出初值。",
+        )
+    return {
+        "taste_rating": taste,
+        "difficulty_rating": int(difficulty),
+        "time_rating": int(time_rating),
+    }
+
+
+def _save_recipe_ratings(output_folder: Path, ratings: dict[str, int | None] | None = None) -> Recipe:
+    recipe_path = output_folder / "recipe.json"
+    note_path = output_folder / "note.md"
+    original_data = _recipe_to_data(recipe_path)
+    recipe = normalize_recipe_taxonomy(_validate_recipe(original_data))
+    if ratings is not None:
+        recipe.taste_rating = ratings.get("taste_rating")
+        recipe.difficulty_rating = ratings.get("difficulty_rating")
+        recipe.time_rating = ratings.get("time_rating")
+        recipe = normalize_recipe_taxonomy(recipe)
+    updated_data = _dump_model(recipe)
+    if updated_data != original_data:
+        atomic_write_json(recipe_path, updated_data)
+    if note_path.is_file():
+        current = note_path.read_text(encoding="utf-8")
+        updated = upsert_rating_block(current, recipe)
+        if updated != current:
+            atomic_write_text(note_path, updated)
+    return recipe
+
+
 def _open_folder(path: Path) -> None:
     if sys.platform.startswith("win"):
         os.startfile(path)  # type: ignore[attr-defined]
@@ -473,7 +563,14 @@ def _vault_path(config: UIConfig) -> Path:
     return path.resolve() if path.is_absolute() else (Path.cwd() / path).resolve()
 
 
-def _archive_output(output_folder: Path, config: UIConfig, *, overwrite: bool = False):
+def _archive_output(
+    output_folder: Path,
+    config: UIConfig,
+    *,
+    overwrite: bool = False,
+    ratings: dict[str, int | None] | None = None,
+):
+    _save_recipe_ratings(output_folder, ratings)
     result = archive_recipe(
         output_folder,
         _vault_path(config),
@@ -773,6 +870,9 @@ def main() -> None:
                         "UP主": item.uploader or "",
                         "分类": item.category,
                         "标签": ", ".join(item.tags or []),
+                        "喜爱度": rating_stars(item.taste_rating) if item.taste_rating else "未评分",
+                        "难度评级": rating_stars(item.difficulty_rating),
+                        "时间评级": rating_stars(item.time_rating),
                         "状态": item.status,
                         "工作流": {
                             "archived": "已归档",
@@ -884,6 +984,11 @@ def main() -> None:
                 "如果 Vault 中这篇笔记被手动改过，确认用当前草稿覆盖",
                 key=f"history_{history_key}_force_archive",
             )
+            archive_ratings = _render_rating_controls(
+                st,
+                selected.recipe_path,
+                key_prefix=f"history_{history_key}_rating_",
+            )
             col_edit, col_review, col_archive, col_tips = st.columns(4)
             with col_edit:
                 if st.button("编辑完整菜谱", key=f"history_{history_key}_go_edit"):
@@ -899,6 +1004,7 @@ def main() -> None:
                             selected.output_folder,
                             config,
                             overwrite=force_vault_overwrite,
+                            ratings=archive_ratings,
                         )
                     except ObsidianArchiveConflict as exc:
                         st.error(f"Vault 中的笔记有手动修改，未覆盖：{_clean_error(exc)}")
@@ -1216,6 +1322,11 @@ def main() -> None:
                         "确认覆盖 Vault 中这条笔记的手写修改",
                         key=f"batch_force_archive_{selected_state.batch_id}",
                     )
+                    batch_ratings = _render_rating_controls(
+                        st,
+                        batch_folder / "recipe.json",
+                        key_prefix=f"batch_{selected_state.batch_id}_{_record_key(batch_folder)}_rating_",
+                    )
                     col_edit, col_review, col_archive = st.columns(3)
                     with col_edit:
                         if st.button("编辑这条", key=f"batch_edit_{selected_state.batch_id}"):
@@ -1230,6 +1341,7 @@ def main() -> None:
                                     batch_folder,
                                     config,
                                     overwrite=force_batch_overwrite,
+                                    ratings=batch_ratings,
                                 )
                             except Exception as exc:  # noqa: BLE001
                                 st.error(f"归档失败：{_clean_error(exc)}")
@@ -1318,6 +1430,7 @@ def main() -> None:
                 with st.expander("查看损坏的 recipe.json"):
                     st.code(_read_text(selected.recipe_path), language="json")
             else:
+                recipe_data = _dump_model(normalize_recipe_taxonomy(_validate_recipe(recipe_data)))
                 st.markdown("#### 菜谱结构")
                 recipe_data["title"] = st.text_input(
                     "标题",
@@ -1339,6 +1452,33 @@ def main() -> None:
                     value=recipe_data.get("difficulty") or "",
                     key=f"{state_prefix}difficulty",
                 )
+                rating_col_taste, rating_col_difficulty, rating_col_time = st.columns(3)
+                with rating_col_taste:
+                    recipe_data["taste_rating"] = st.selectbox(
+                        "个人喜爱度",
+                        [None, 1, 2, 3, 4, 5],
+                        index=int(recipe_data.get("taste_rating") or 0),
+                        format_func=_rating_option_label,
+                        key=f"{state_prefix}taste_rating",
+                    )
+                with rating_col_difficulty:
+                    recipe_data["difficulty_rating"] = st.selectbox(
+                        "烹饪难度评级",
+                        [1, 2, 3, 4, 5],
+                        index=int(recipe_data.get("difficulty_rating") or 1) - 1,
+                        format_func=_rating_option_label,
+                        key=f"{state_prefix}difficulty_rating",
+                        help="系统根据步骤和技法自动给出初值，可手动修改。",
+                    )
+                with rating_col_time:
+                    recipe_data["time_rating"] = st.selectbox(
+                        "时间投入评级",
+                        [1, 2, 3, 4, 5],
+                        index=int(recipe_data.get("time_rating") or 1) - 1,
+                        format_func=_rating_option_label,
+                        key=f"{state_prefix}time_rating",
+                        help="系统根据总耗时自动给出初值，可手动修改。",
+                    )
                 category_options = list(dict.fromkeys([recipe_data.get("category") or "未分类", *RECIPE_CATEGORIES]))
                 recipe_data["category"] = st.selectbox(
                     "归档分类",
@@ -1493,10 +1633,18 @@ def main() -> None:
                     knowledge_results = ()
                     knowledge_error = None
                     if save_and_archive:
+                        edited_ratings = None
+                        if recipe_data is not None:
+                            edited_ratings = {
+                                "taste_rating": recipe_data.get("taste_rating"),
+                                "difficulty_rating": recipe_data.get("difficulty_rating"),
+                                "time_rating": recipe_data.get("time_rating"),
+                            }
                         archived, knowledge_results, knowledge_error = _archive_output(
                             selected.output_folder,
                             config,
                             overwrite=force_edit_archive,
+                            ratings=edited_ratings,
                         )
                 except Exception as exc:  # noqa: BLE001
                     st.error(f"保存或归档失败：{_clean_error(exc)}")

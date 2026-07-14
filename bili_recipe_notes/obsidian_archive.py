@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Sequence
 from urllib.parse import unquote
 
+from .markdown_writer import upsert_rating_block
+from .recipe_extractor import Recipe, normalize_recipe_taxonomy
 from .storage import atomic_write_bytes, atomic_write_json, atomic_write_text, file_lock, read_json
 
 
@@ -117,6 +119,13 @@ def _safe_source_id(value: str) -> str:
 def _read_object(path: Path) -> dict[str, Any]:
     value = read_json(path, expected_type=dict)
     return dict(value)
+
+
+def _normalized_recipe_data(data: Mapping[str, Any]) -> tuple[Recipe, dict[str, Any]]:
+    recipe = Recipe.model_validate(data) if hasattr(Recipe, "model_validate") else Recipe(**dict(data))
+    recipe = normalize_recipe_taxonomy(recipe)
+    normalized = recipe.model_dump() if hasattr(recipe, "model_dump") else dict(recipe.__dict__)
+    return recipe, normalized
 
 
 def _source_id(recipe: Mapping[str, Any], output_folder: Path) -> str:
@@ -299,6 +308,7 @@ def _record_archive_state(
     source_note_fingerprint: str = "",
     vault_note_fingerprint: str = "",
     category: str = "",
+    ratings: Mapping[str, Any] | None = None,
     attachment_paths: Sequence[Path] = (),
     error: str = "",
 ) -> tuple[Path, int]:
@@ -332,6 +342,9 @@ def _record_archive_state(
         "vault_note_fingerprint": vault_note_fingerprint,
         "revision": revision,
         "category": category,
+        "taste_rating": (ratings or {}).get("taste_rating"),
+        "difficulty_rating": (ratings or {}).get("difficulty_rating"),
+        "time_rating": (ratings or {}).get("time_rating"),
         "archived_at": _now(),
         "error": error,
     }
@@ -368,8 +381,8 @@ def archive_recipe_to_obsidian(
     chosen_layout = layout or ObsidianVaultLayout()
     vault, recipes_root, _tips_root, attachments_root, index_path = _vault_paths(vault_path, chosen_layout)
     vault.mkdir(parents=True, exist_ok=True)
-    recipe = _read_object(recipe_source)
-    markdown = note_source.read_text(encoding="utf-8")
+    recipe_model, recipe = _normalized_recipe_data(_read_object(recipe_source))
+    markdown = upsert_rating_block(note_source.read_text(encoding="utf-8"), recipe_model)
     source_id = _source_id(recipe, folder)
     archive_id = f"recipe:{source_id}"
     title = str(recipe.get("title") or recipe.get("video_title") or folder.name).strip() or folder.name
@@ -409,6 +422,11 @@ def archive_recipe_to_obsidian(
         "recipe_id": source_id,
         "archive_id": archive_id,
         "uploader": str(recipe.get("uploader") or ""),
+        "rating": recipe.get("taste_rating"),
+        "taste_rating": recipe.get("taste_rating"),
+        "difficulty_rating": recipe.get("difficulty_rating"),
+        "time_rating": recipe.get("time_rating"),
+        "rating_scale": 5,
         "archived_at": archived_at,
         "bili_recipe_notes_fingerprint": source_fingerprint,
     }
@@ -508,6 +526,7 @@ def archive_recipe_to_obsidian(
             source_note_fingerprint=source_note_fingerprint,
             vault_note_fingerprint=vault_note_fingerprint,
             category=chosen_category,
+            ratings=recipe,
             attachment_paths=attachment_paths,
         )
         return RecipeArchiveResult(
@@ -533,6 +552,7 @@ def archive_recipe_to_obsidian(
                 source_fingerprint=source_fingerprint,
                 source_note_fingerprint=_file_sha256(note_source),
                 category=chosen_category,
+                ratings=recipe,
                 error=str(exc),
             )
         raise

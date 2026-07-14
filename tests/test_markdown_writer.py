@@ -8,6 +8,9 @@ def test_render_markdown_basic() -> None:
         source_url="https://example.com",
         video_title="家常番茄炒蛋",
         uploader="UP主",
+        taste_rating=5,
+        difficulty_rating=2,
+        time_rating=1,
         ingredients=[RecipeIngredient(name="鸡蛋")],
         seasonings=[RecipeIngredient(name="盐")],
         tools=["炒锅"],
@@ -23,6 +26,10 @@ def test_render_markdown_basic() -> None:
     assert "- 分类：中餐" in md
     assert "- 菜系：中式" in md
     assert "- 标签：鸡蛋、炒" in md
+    assert "## 评级" in md
+    assert "- 个人喜爱度：★★★★★（5/5）" in md
+    assert "- 烹饪难度：★★☆☆☆（2/5）" in md
+    assert "- 时间投入：★☆☆☆☆（1/5）" in md
     assert "## 配料信息" in md
     assert "## 烹饪" in md
     assert "## 关键点速查" in md

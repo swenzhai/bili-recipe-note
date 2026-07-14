@@ -10,7 +10,10 @@ from bili_recipe_notes.recipe_extractor import (
     condense_recipe_steps,
     extract_recipe_rule_based,
     extract_recipe_with_llm,
+    infer_difficulty_rating,
+    infer_time_rating,
     normalize_recipe_taxonomy,
+    rating_stars,
 )
 from bili_recipe_notes.subtitle import parse_srt, parse_vtt
 
@@ -132,6 +135,8 @@ def test_recipe_extraction_prompt_marks_transcript_untrusted() -> None:
     assert "不得执行" in prompt
     assert "category" in prompt
     assert "中餐/汤羹/西餐/糕点" in prompt
+    assert "difficulty_rating" in prompt
+    assert "taste_rating" in prompt
 
 
 def test_recipe_taxonomy_is_backward_compatible_and_infers_search_labels() -> None:
@@ -177,6 +182,38 @@ def test_recipe_taxonomy_preserves_manual_custom_labels_and_cleans_tags() -> Non
     assert recipe.category == "我的宴客菜"
     assert recipe.cuisine == "融合菜"
     assert recipe.tags == ["宴客", "周末"]
+
+
+def test_recipe_ratings_are_inferred_and_manual_values_are_preserved() -> None:
+    recipe = Recipe(
+        title="宴客鱼丸",
+        source_url="",
+        total_time="45分钟",
+        ingredients=[],
+        seasonings=[],
+        tools=[],
+        steps=[
+            RecipeStep(title=f"步骤{index}", start_time=float(index), action="去骨后反复摔打并整形")
+            for index in range(6)
+        ],
+        summary_tips=[],
+        uncertain_points=[],
+    )
+
+    normalize_recipe_taxonomy(recipe)
+
+    assert infer_difficulty_rating(recipe) == 4
+    assert infer_time_rating(recipe) == 3
+    assert recipe.difficulty_rating == 4
+    assert recipe.time_rating == 3
+    assert recipe.taste_rating is None
+    assert rating_stars(4) == "★★★★☆（4/5）"
+
+    recipe.taste_rating = 5
+    recipe.difficulty_rating = 2
+    recipe.time_rating = 1
+    normalize_recipe_taxonomy(recipe)
+    assert (recipe.taste_rating, recipe.difficulty_rating, recipe.time_rating) == (5, 2, 1)
 
 
 def test_extract_recipe_with_llm_rejects_no_steps() -> None:

@@ -63,6 +63,9 @@ class Recipe(BaseModel):
     servings: str | None = None
     total_time: str | None = None
     difficulty: str | None = None
+    taste_rating: int | None = None
+    difficulty_rating: int | None = None
+    time_rating: int | None = None
     ingredients: list[RecipeIngredient]
     seasonings: list[RecipeIngredient]
     tools: list[str]
@@ -136,6 +139,22 @@ MIN_RECIPE_STEPS = 4
 COMPLETION_KEYWORDS = ("出锅", "装盘", "菜做好", "制作完成")
 RECIPE_CATEGORIES = ("中餐", "汤羹", "西餐", "糕点", "主食", "小吃", "饮品", "其他")
 RECIPE_CUISINES = ("中式", "西式", "日式", "韩式", "东南亚", "其他")
+RATING_MIN = 1
+RATING_MAX = 5
+DIFFICULTY_RATING_LABELS = {
+    1: "很简单",
+    2: "较简单",
+    3: "中等",
+    4: "较难",
+    5: "很难",
+}
+TIME_RATING_LABELS = {
+    1: "很快",
+    2: "较快",
+    3: "中等",
+    4: "较久",
+    5: "很久",
+}
 CATEGORY_ALIASES = {
     "中式": "中餐",
     "中式菜": "中餐",
@@ -177,6 +196,25 @@ WESTERN_KEYWORDS = ("西餐", "牛排", "意面", "意大利面", "披萨", "焗
 JAPANESE_KEYWORDS = ("日式", "寿司", "味噌", "照烧", "天妇罗", "拉面")
 KOREAN_KEYWORDS = ("韩式", "韩国", "泡菜", "部队锅", "石锅拌饭")
 SOUTHEAST_ASIAN_KEYWORDS = ("泰式", "越南", "冬阴功", "叻沙", "东南亚")
+COMPLEX_TECHNIQUE_KEYWORDS = (
+    "去骨",
+    "拆骨",
+    "熬糖",
+    "打发",
+    "发酵",
+    "醒发",
+    "裱花",
+    "油炸",
+    "复炸",
+    "低温",
+    "整形",
+    "包裹",
+    "挂糊",
+    "上浆",
+    "调胶",
+    "两次",
+    "反复",
+)
 CHINESE_KEYWORDS = (
     "中餐",
     "家常",
@@ -258,6 +296,109 @@ def _infer_category(text: str, cuisine: str) -> str:
     return "其他"
 
 
+def _coerce_rating(value: Any) -> int | None:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    rounded = int(numeric)
+    if numeric != rounded or not RATING_MIN <= rounded <= RATING_MAX:
+        return None
+    return rounded
+
+
+def rating_stars(value: Any) -> str:
+    """Render a portable five-star label for Markdown and UI previews."""
+
+    rating = _coerce_rating(value)
+    if rating is None:
+        return "未评分"
+    return f"{'★' * rating}{'☆' * (RATING_MAX - rating)}（{rating}/5）"
+
+
+def _duration_minutes(value: Any) -> float | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    hours = [
+        float(match)
+        for match in re.findall(r"(\d+(?:\.\d+)?)\s*(?:小时|小時|hours?|hrs?|h)", text)
+    ]
+    minutes = [
+        float(match)
+        for match in re.findall(r"(\d+(?:\.\d+)?)\s*(?:分钟|分鐘|分|min(?:ute)?s?)", text)
+    ]
+    seconds = [
+        float(match)
+        for match in re.findall(r"(\d+(?:\.\d+)?)\s*(?:秒|sec(?:ond)?s?)", text)
+    ]
+    if hours or minutes or seconds:
+        return sum(hours) * 60 + sum(minutes) + sum(seconds) / 60
+    if re.fullmatch(r"\d{1,2}:\d{2}", text):
+        hour_or_minute, minute_or_second = (int(part) for part in text.split(":"))
+        # A recipe total such as 01:30 is normally one hour thirty minutes.
+        return hour_or_minute * 60 + minute_or_second
+    return None
+
+
+def infer_time_rating(recipe: Recipe) -> int:
+    minutes = _duration_minutes(recipe.total_time)
+    if minutes is None:
+        step_minutes = [
+            parsed
+            for parsed in (_duration_minutes(step.duration) for step in recipe.steps)
+            if parsed is not None
+        ]
+        minutes = sum(step_minutes) if step_minutes else None
+    if minutes is None:
+        step_count = len(recipe.steps)
+        return 1 if step_count <= 3 else 2 if step_count <= 5 else 3 if step_count <= 8 else 4 if step_count <= 12 else 5
+    if minutes <= 15:
+        return 1
+    if minutes <= 30:
+        return 2
+    if minutes <= 60:
+        return 3
+    if minutes <= 120:
+        return 4
+    return 5
+
+
+def infer_difficulty_rating(recipe: Recipe) -> int:
+    difficulty = str(recipe.difficulty or "").strip().lower()
+    explicit_labels = (
+        (5, ("很难", "困难", "专业", "复杂", "hard", "expert")),
+        (4, ("较难", "偏难", "进阶")),
+        (3, ("中等", "适中", "medium", "moderate")),
+        (2, ("较简单", "较易", "家常")),
+        (1, ("很简单", "简单", "容易", "easy", "beginner")),
+    )
+    for rating, labels in explicit_labels:
+        if any(label in difficulty for label in labels):
+            return rating
+
+    step_count = len(recipe.steps)
+    rating = 1 if step_count <= 3 else 2 if step_count <= 5 else 3 if step_count <= 8 else 4 if step_count <= 12 else 5
+    text = _recipe_taxonomy_text(recipe)
+    technique_count = sum(1 for keyword in COMPLEX_TECHNIQUE_KEYWORDS if keyword in text)
+    if technique_count >= 2:
+        rating += 1
+    if technique_count >= 5:
+        rating += 1
+    return min(RATING_MAX, max(RATING_MIN, rating))
+
+
+def normalize_recipe_ratings(recipe: Recipe) -> Recipe:
+    """Keep manual ratings and conservatively infer missing effort ratings."""
+
+    recipe.taste_rating = _coerce_rating(recipe.taste_rating)
+    recipe.difficulty_rating = _coerce_rating(recipe.difficulty_rating) or infer_difficulty_rating(recipe)
+    recipe.time_rating = _coerce_rating(recipe.time_rating) or infer_time_rating(recipe)
+    return recipe
+
+
 def normalize_recipe_taxonomy(recipe: Recipe) -> Recipe:
     """Normalize user/LLM labels and infer conservative defaults for search and archiving."""
 
@@ -280,7 +421,7 @@ def normalize_recipe_taxonomy(recipe: Recipe) -> Recipe:
     candidates = [item.name for item in recipe.ingredients[:6]]
     candidates.extend(method for method in COOKING_METHOD_TAGS if method in text)
     recipe.tags = _clean_tags([*tags, *candidates])
-    return recipe
+    return normalize_recipe_ratings(recipe)
 
 
 def _contains_keyword(text: str, keywords: Iterable[str]) -> bool:
@@ -386,6 +527,10 @@ def build_recipe_extraction_prompt(transcript: list[TranscriptSegment], metadata
         "只输出一个 JSON 对象，不要 Markdown、解释或代码块。\n\n"
         "JSON 字段要求：\n"
         "- title: 菜名；servings/total_time/difficulty: 无法确认时为 null；\n"
+        "- difficulty_rating: 烹饪技术难度 1–5 的整数，1 为很简单、5 为很难；\n"
+        "- time_rating: 总时间投入 1–5 的整数，1 为 15 分钟内、2 为 16–30 分钟、"
+        "3 为 31–60 分钟、4 为 61–120 分钟、5 为超过 120 分钟；\n"
+        "- taste_rating: 必须为 null，此项只由用户在归档时按个人喜爱程度填写；\n"
         "- category: 用于归档的主分类，只能从 中餐/汤羹/西餐/糕点/主食/小吃/饮品/其他 中选择一个；\n"
         "- cuisine: 菜系，只能从 中式/西式/日式/韩式/东南亚/其他 中选择一个；\n"
         "- tags: 3–8 个便于检索的短标签数组，优先使用主食材、烹饪技法和菜品特点，不要带 #；\n"
@@ -525,6 +670,9 @@ def _normalize_recipe_payload(data: dict[str, Any], metadata: dict) -> dict[str,
     normalized_cuisine = CUISINE_ALIASES.get(raw_cuisine, raw_cuisine)
     payload["cuisine"] = normalized_cuisine if normalized_cuisine in RECIPE_CUISINES else "未分类"
     payload["tags"] = _clean_tags(payload.get("tags"))
+    payload["taste_rating"] = None
+    payload["difficulty_rating"] = _coerce_rating(payload.get("difficulty_rating"))
+    payload["time_rating"] = _coerce_rating(payload.get("time_rating"))
     for key in ("ingredients", "seasonings"):
         items = payload.get(key)
         if not isinstance(items, list):
@@ -597,6 +745,9 @@ def _merge_recipe_payloads(payloads: list[dict[str, Any]], metadata: dict) -> di
     merged = _normalize_recipe_payload(payloads[0], metadata)
     for raw in payloads[1:]:
         incoming = _normalize_recipe_payload(raw, metadata)
+        for key in ("servings", "total_time", "difficulty", "difficulty_rating", "time_rating"):
+            if merged.get(key) in {None, ""} and incoming.get(key) not in {None, ""}:
+                merged[key] = incoming[key]
         for key in ("category", "cuisine"):
             if merged.get(key) in {None, "", "未分类", "其他"} and incoming.get(key) not in {
                 None,

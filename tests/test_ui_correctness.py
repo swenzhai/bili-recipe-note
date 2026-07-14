@@ -246,18 +246,30 @@ def test_review_page_can_create_item_by_item_review(tmp_path: Path) -> None:
 
 def test_draft_can_be_archived_directly_to_obsidian(tmp_path: Path) -> None:
     folder = _write_record(tmp_path / "outputs", "archive", _recipe("直接归档菜谱"))
+    record_key = ui._record_key(folder)
     vault = tmp_path / "vault"
     at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path / "outputs"))
     next(widget for widget in at.text_input if widget.label == "笔记本目录").set_value(str(vault))
     at.selectbox(key="main_page").set_value("草稿与归档")
     at.run()
+    at.selectbox(key=f"history_{record_key}_rating_taste_rating").set_value(5)
+    at.selectbox(key=f"history_{record_key}_rating_difficulty_rating").set_value(4)
+    at.selectbox(key=f"history_{record_key}_rating_time_rating").set_value(2)
     next(button for button in at.button if button.label == "无需修改，直接归档").click()
     at.run()
 
     assert not at.exception
     assert (folder / "archive.json").is_file()
-    assert list((vault / "菜谱").rglob("*.md"))
+    archived_notes = list((vault / "菜谱").rglob("*.md"))
+    assert archived_notes
+    saved_recipe = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
+    assert saved_recipe["taste_rating"] == 5
+    assert saved_recipe["difficulty_rating"] == 4
+    assert saved_recipe["time_rating"] == 2
+    archived_note = archived_notes[0].read_text(encoding="utf-8")
+    assert 'rating: 5' in archived_note
+    assert "- 个人喜爱度：★★★★★（5/5）" in archived_note
 
 
 def test_edit_page_exposes_taxonomy_and_final_markdown_archive(tmp_path: Path) -> None:
@@ -267,6 +279,9 @@ def test_edit_page_exposes_taxonomy_and_final_markdown_archive(tmp_path: Path) -
 
     assert at.selectbox(key=f"edit_{record_key}_category") is not None
     assert at.selectbox(key=f"edit_{record_key}_cuisine") is not None
+    assert at.selectbox(key=f"edit_{record_key}_taste_rating") is not None
+    assert at.selectbox(key=f"edit_{record_key}_difficulty_rating") is not None
+    assert at.selectbox(key=f"edit_{record_key}_time_rating") is not None
     assert at.text_input(key=f"edit_{record_key}_tags") is not None
     assert at.text_area(key=f"edit_{record_key}_final_markdown") is not None
     assert at.button(key=f"edit_{record_key}_save_and_archive") is not None

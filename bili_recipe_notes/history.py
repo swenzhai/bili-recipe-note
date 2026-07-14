@@ -7,7 +7,7 @@ from typing import Any
 
 from .quality import analyze_recipe_quality, load_quality_report, write_quality_report
 from .obsidian_archive import recipe_archive_status
-from .recipe_extractor import Recipe
+from .recipe_extractor import Recipe, normalize_recipe_taxonomy
 
 
 @dataclass
@@ -33,6 +33,9 @@ class HistoryItem:
     category: str = "未分类"
     cuisine: str = "未分类"
     tags: list[str] | None = None
+    taste_rating: int | None = None
+    difficulty_rating: int | None = None
+    time_rating: int | None = None
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -95,6 +98,13 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
         transcript_path = folder / "transcript.json"
         job_path = folder / "job.json"
         recipe = _read_json(recipe_path) if recipe_path.exists() else {}
+        normalized_recipe: Recipe | None = None
+        if recipe:
+            try:
+                normalized_recipe = Recipe.model_validate(recipe) if hasattr(Recipe, "model_validate") else Recipe(**recipe)
+                normalized_recipe = normalize_recipe_taxonomy(normalized_recipe)
+            except Exception:
+                normalized_recipe = None
         job = _read_json(job_path) if job_path.exists() else {}
         archive = _read_json(folder / "archive.json")
         workflow_status = recipe_archive_status(folder)
@@ -139,6 +149,9 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
                 tags=[str(tag) for tag in recipe.get("tags", []) if str(tag).strip()]
                 if isinstance(recipe.get("tags"), list)
                 else [],
+                taste_rating=normalized_recipe.taste_rating if normalized_recipe else None,
+                difficulty_rating=normalized_recipe.difficulty_rating if normalized_recipe else None,
+                time_rating=normalized_recipe.time_rating if normalized_recipe else None,
             )
         )
     return items

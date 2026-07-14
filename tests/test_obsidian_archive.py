@@ -30,6 +30,9 @@ def _recipe_output(root: Path, name: str = "output", *, bvid: str = "BV1demo123"
         "category": "中餐/江浙",
         "cuisine": "淮扬菜",
         "tags": ["鱼类", "宴客"],
+        "taste_rating": 5,
+        "difficulty_rating": 4,
+        "time_rating": 3,
         "ingredients": [],
         "seasonings": [],
         "tools": [],
@@ -69,6 +72,11 @@ def test_archive_recipe_builds_vault_note_data_images_and_state(tmp_path: Path) 
     assert 'category: "中餐-江浙"' in archived_note
     assert 'cuisine: "淮扬菜"' in archived_note
     assert 'tags: ["菜谱", "中餐-江浙", "淮扬菜", "鱼类", "宴客", "已确认"]' in archived_note
+    assert 'rating: 5' in archived_note
+    assert 'taste_rating: 5' in archived_note
+    assert 'difficulty_rating: 4' in archived_note
+    assert 'time_rating: 3' in archived_note
+    assert "- 个人喜爱度：★★★★★（5/5）" in archived_note
     assert "![去骨](<../../附件/菜谱/BV1demo123/" in archived_note
     assert "https://example.com/picture.jpg" in archived_note
     assert "recipe_data: \"../../附件/菜谱/BV1demo123/recipe.json\"" in archived_note
@@ -84,6 +92,9 @@ def test_archive_recipe_builds_vault_note_data_images_and_state(tmp_path: Path) 
     assert state["note_sha256"] == state["note_fingerprint"]
     assert state["vault_note_fingerprint"]
     assert state["revision"] == result.revision == 1
+    assert state["taste_rating"] == 5
+    assert state["difficulty_rating"] == 4
+    assert state["time_rating"] == 3
     assert recipe_archive_status(output) == "archived"
 
 
