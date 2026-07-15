@@ -17,6 +17,12 @@ try:
     from .batch_queue import create_batch_id, list_batch_states
     from .config import UIConfig, load_config, save_config
     from .content_analysis import ContentAnalysisOptions, analyze_video_content
+    from .cooking_mode import (
+        build_shopping_list,
+        parse_servings,
+        serving_scale,
+        shopping_list_markdown,
+    )
     from .environment import run_environment_checks
     from .exports import export_note
     from .history import HistoryItem, scan_history
@@ -79,6 +85,12 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
     from bili_recipe_notes.batch_queue import create_batch_id, list_batch_states
     from bili_recipe_notes.config import UIConfig, load_config, save_config
     from bili_recipe_notes.content_analysis import ContentAnalysisOptions, analyze_video_content
+    from bili_recipe_notes.cooking_mode import (
+        build_shopping_list,
+        parse_servings,
+        serving_scale,
+        shopping_list_markdown,
+    )
     from bili_recipe_notes.environment import run_environment_checks
     from bili_recipe_notes.exports import export_note
     from bili_recipe_notes.history import HistoryItem, scan_history
@@ -151,6 +163,7 @@ CLI_PROMPT_PRESETS = {
 }
 PAGES = [
     "单视频生成",
+    "烹饪模式",
     "草稿与归档",
     "审核确认",
     "批量处理",
@@ -778,6 +791,179 @@ def _log_box(st, height: int = 220):
     return log
 
 
+def _render_cooking_mode(st, config: UIConfig) -> None:
+    st.subheader("移动烹饪模式")
+    st.caption("按目标份量生成临时用量与购物清单，并逐步显示操作；不会改写 recipe.json。")
+    st.markdown(
+        """
+        <style>
+        @media (max-width: 700px) {
+          [data-testid="stMainBlockContainer"] { padding-left: 1rem; padding-right: 1rem; }
+          div[data-testid="stButton"] > button { min-height: 3rem; font-size: 1.05rem; }
+          div[data-testid="stCheckbox"] label { min-height: 2.5rem; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    available = [item for item in scan_history(config.out_dir) if item.recipe_path]
+    if not available:
+        st.info("还没有可用于烹饪模式的菜谱。请先生成或导入一条菜谱。")
+        return
+
+    options = _history_options(available)
+    selected = _select_history_item(st, "选择菜谱", options, "cook_select")
+    recipe_data, recipe_error = _safe_recipe_to_data(selected.recipe_path)  # type: ignore[arg-type]
+    if recipe_error or recipe_data is None:
+        st.error(f"当前 recipe.json 已损坏：{recipe_error}")
+        return
+    try:
+        recipe = normalize_recipe_taxonomy(_validate_recipe(recipe_data))
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"当前菜谱结构不可用：{_clean_error(exc)}")
+        return
+
+    record_key = _record_key(selected.output_folder)
+    st.markdown(f"## {recipe.title}")
+    info_columns = st.columns(3)
+    info_columns[0].metric("原份量", recipe.servings or "未注明")
+    info_columns[1].metric("总耗时", recipe.total_time or "未注明")
+    info_columns[2].metric("步骤", len(recipe.steps))
+
+    baseline = parse_servings(recipe.servings)
+    scale_col, unit_col = st.columns(2)
+    with scale_col:
+        if baseline is not None:
+            target_servings = st.number_input(
+                "目标份量",
+                min_value=0.25,
+                max_value=100.0,
+                value=float(baseline),
+                step=0.5,
+                key=f"cook_{record_key}_target_servings",
+            )
+            factor = serving_scale(recipe.servings, float(target_servings))
+        else:
+            factor = float(
+                st.number_input(
+                    "用量倍率",
+                    min_value=0.1,
+                    max_value=20.0,
+                    value=1.0,
+                    step=0.25,
+                    key=f"cook_{record_key}_factor",
+                    help="原菜谱未注明可识别的份量，因此直接按倍率缩放。",
+                )
+            )
+    with unit_col:
+        unit_label = st.selectbox(
+            "单位显示",
+            ["保留原单位", "换算为公制"],
+            key=f"cook_{record_key}_unit_system",
+            help="公制模式会把斤、两、杯、汤匙等换算为克或毫升。",
+        )
+    unit_system = "metric" if unit_label == "换算为公制" else "original"
+    st.caption(f"当前用量倍率：{factor:.2f}×")
+
+    shopping_items = build_shopping_list(recipe, factor=factor, unit_system=unit_system)
+    shopping_markdown = shopping_list_markdown(recipe, shopping_items, factor)
+    st.markdown("### 配料与购物清单")
+    scale_signature = hashlib.sha1(f"{factor:.6f}:{unit_system}".encode("utf-8")).hexdigest()[:8]
+    current_category = ""
+    for index, item in enumerate(shopping_items):
+        if item.category != current_category:
+            current_category = item.category
+            st.markdown(f"#### {current_category}")
+        st.checkbox(
+            item.label,
+            key=f"cook_{record_key}_shop_{scale_signature}_{index}",
+        )
+    if not shopping_items:
+        st.info("这条菜谱还没有结构化配料。可先到“编辑修复”页补充。")
+    elif factor != 1 and any(not item.converted for item in shopping_items):
+        st.warning("“适量、少许”或复杂写法无法安全缩放，已保留原文，请烹饪时人工确认。")
+    st.download_button(
+        "下载购物清单",
+        data=shopping_markdown,
+        file_name=f"{recipe.title}-购物清单.md",
+        mime="text/markdown",
+        key=f"cook_{record_key}_download_shopping",
+    )
+
+    if recipe.prep_items:
+        st.markdown("### 开始前备菜")
+        for index, prep_item in enumerate(recipe.prep_items):
+            st.checkbox(str(prep_item), key=f"cook_{record_key}_prep_{index}")
+
+    st.markdown("### 分步烹饪")
+    if not recipe.steps:
+        st.info("这条菜谱还没有烹饪步骤。")
+        return
+
+    step_state_key = f"cook_{record_key}_step_index"
+    raw_step_index = st.session_state.get(step_state_key, 0)
+    step_index = int(raw_step_index) if isinstance(raw_step_index, (int, float)) else 0
+    step_index = min(max(step_index, 0), len(recipe.steps) - 1)
+    st.session_state[step_state_key] = step_index
+    st.progress((step_index + 1) / len(recipe.steps), text=f"第 {step_index + 1} / {len(recipe.steps)} 步")
+
+    nav_previous, nav_restart, nav_next = st.columns(3)
+    if nav_previous.button(
+        "← 上一步",
+        disabled=step_index == 0,
+        key=f"cook_{record_key}_previous",
+        width="stretch",
+    ):
+        st.session_state[step_state_key] = step_index - 1
+        st.session_state.pop(f"cook_{record_key}_completed", None)
+        st.rerun()
+    if nav_restart.button("从头开始", key=f"cook_{record_key}_restart", width="stretch"):
+        st.session_state[step_state_key] = 0
+        st.session_state.pop(f"cook_{record_key}_completed", None)
+        st.rerun()
+    next_label = "完成烹饪" if step_index == len(recipe.steps) - 1 else "下一步 →"
+    if nav_next.button(
+        next_label,
+        type="primary",
+        key=f"cook_{record_key}_next",
+        width="stretch",
+    ):
+        if step_index < len(recipe.steps) - 1:
+            st.session_state[step_state_key] = step_index + 1
+        else:
+            st.session_state[f"cook_{record_key}_completed"] = True
+        st.rerun()
+
+    if st.session_state.get(f"cook_{record_key}_completed"):
+        st.success("全部步骤已完成，可以出锅了。")
+
+    step = recipe.steps[step_index]
+    with st.container(border=True):
+        st.markdown(f"## {step_index + 1}. {step.title}")
+        image_path = _local_markdown_image(selected.output_folder, step.screenshot_path or "")
+        if image_path and image_path.is_file():
+            st.image(str(image_path), caption=step.title, width="stretch")
+        st.markdown(step.action)
+        detail_columns = st.columns(2)
+        detail_columns[0].metric("火候", step.heat or "按步骤判断")
+        detail_columns[1].metric("时长", step.duration or "未注明")
+        if step.tips:
+            st.warning(step.tips)
+        if recipe.source_url:
+            separator = "&" if "?" in recipe.source_url else "?"
+            st.link_button(
+                "从本步骤时间点打开原视频",
+                f"{recipe.source_url}{separator}t={max(0, int(step.start_time))}",
+                width="stretch",
+            )
+
+    with st.expander("查看全部步骤"):
+        for index, candidate in enumerate(recipe.steps, start=1):
+            marker = "→" if index - 1 == step_index else ""
+            st.markdown(f"**{marker} {index}. {candidate.title}**  \n{candidate.action}")
+
+
 def main() -> None:
     import streamlit as st
 
@@ -845,6 +1031,9 @@ def main() -> None:
             with col_drafts:
                 if st.button("查看草稿与归档", key="generated_go_drafts"):
                     _navigate_to_record(st, "草稿与归档", last_generated)
+
+    if active_page == "烹饪模式":
+        _render_cooking_mode(st, config)
 
     if active_page == "草稿与归档":
         st.subheader("草稿与归档")

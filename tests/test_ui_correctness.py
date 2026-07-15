@@ -159,6 +159,43 @@ def test_backups_are_timestamped_and_navigation_is_conditional(tmp_path: Path) -
     assert ui.EXPORT_MIME_TYPES[".zip"] == "application/zip"
 
 
+def test_mobile_cooking_mode_scales_ingredients_and_navigates_steps(tmp_path: Path) -> None:
+    recipe = _recipe(
+        "番茄炒蛋",
+        ingredients=[{"name": "鸡蛋", "amount": "2个"}],
+        seasonings=[{"name": "油", "amount": "1汤匙"}],
+    )
+    recipe["servings"] = "2人份"
+    recipe["prep_items"] = ["鸡蛋打散"]
+    recipe["steps"] = [
+        {"title": "炒鸡蛋", "start_time": 5, "action": "中火炒至凝固", "heat": "中火"},
+        {"title": "混合", "start_time": 20, "action": "加入番茄翻炒", "duration": "2分钟"},
+    ]
+    folder = _write_record(tmp_path, "cook", recipe)
+    record_key = ui._record_key(folder)
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
+    at.selectbox(key="main_page").set_value("烹饪模式")
+    at.run()
+
+    assert not at.exception
+    assert at.number_input(key=f"cook_{record_key}_target_servings").value == 2.0
+    assert any(widget.label == "鸡蛋：2个" for widget in at.checkbox)
+    assert any(widget.label == "鸡蛋打散" for widget in at.checkbox)
+    assert "1. 炒鸡蛋" in "\n".join(markdown.value for markdown in at.markdown)
+
+    at.number_input(key=f"cook_{record_key}_target_servings").set_value(4.0)
+    at.selectbox(key=f"cook_{record_key}_unit_system").set_value("换算为公制")
+    at.run()
+    assert any(widget.label == "鸡蛋：4个" for widget in at.checkbox)
+    assert any(widget.label == "油：30毫升" for widget in at.checkbox)
+
+    at.button(key=f"cook_{record_key}_next").click()
+    at.run()
+    assert not at.exception
+    assert "2. 混合" in "\n".join(markdown.value for markdown in at.markdown)
+
+
 def test_history_zip_export_stays_available_for_download(tmp_path: Path) -> None:
     folder = _write_record(tmp_path, "bundle", _recipe("打包菜谱"))
     at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
