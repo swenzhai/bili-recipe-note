@@ -52,7 +52,7 @@ if [ -f "$STAMP_FILE" ]; then
 fi
 
 if [ "$INSTALLED_REQUIREMENTS" != "$REQUIREMENTS_ID" ] || \
-   ! "$PYTHON_EXE" -c "import streamlit, yt_dlp, faster_whisper, pydantic, rich, reportlab, docx" >/dev/null 2>&1; then
+   ! "$PYTHON_EXE" -c "import streamlit, yt_dlp, faster_whisper, pydantic, rich, reportlab, docx, fastapi, uvicorn, qrcode" >/dev/null 2>&1; then
     echo "Installing or updating app requirements (the first launch may take several minutes)..."
     if ! "$PYTHON_EXE" -m pip install -r requirements.txt; then
         echo
@@ -75,14 +75,52 @@ fi
 
 echo
 echo "Browser URL: http://localhost:8501"
+echo "Mobile API: http://0.0.0.0:8765 (use the pairing page to get the LAN address)"
 echo "Press Ctrl+C in this window to stop the server."
 echo
+
+API_LOG=".venv/mobile-api.log"
+API_PID=""
+cleanup_api() {
+    if [ -n "$API_PID" ] && kill -0 "$API_PID" >/dev/null 2>&1; then
+        kill "$API_PID" >/dev/null 2>&1 || true
+        wait "$API_PID" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup_api EXIT INT TERM
+
+"$PYTHON_EXE" -m uvicorn bili_recipe_notes.mobile_api:app \
+    --host 0.0.0.0 \
+    --port 8765 \
+    --no-access-log >"$API_LOG" 2>&1 &
+API_PID=$!
+
+API_READY=0
+for _ in $(seq 1 40); do
+    if ! kill -0 "$API_PID" >/dev/null 2>&1; then
+        break
+    fi
+    if "$PYTHON_EXE" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/v1/health', timeout=1)" >/dev/null 2>&1; then
+        API_READY=1
+        break
+    fi
+    sleep 0.25
+done
+if [ "$API_READY" -ne 1 ]; then
+    echo "Mobile API failed to start. Recent log output:"
+    tail -n 30 "$API_LOG" 2>/dev/null || true
+    cleanup_api
+    pause_before_exit
+    exit 1
+fi
 
 "$PYTHON_EXE" -m streamlit run bili_recipe_notes/ui.py \
     --server.address=127.0.0.1 \
     --browser.serverAddress=127.0.0.1 \
     --server.headless=false
 
+cleanup_api
+trap - EXIT INT TERM
 echo
 echo "UI server stopped."
 pause_before_exit

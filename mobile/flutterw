@@ -1,0 +1,23 @@
+#!/bin/bash
+
+set -e
+
+FLUTTER_ROOT="${FLUTTER_ROOT:-/Users/swen/Documents/SDK/flutter}"
+FLUTTER_BIN="$FLUTTER_ROOT/bin/flutter"
+export PUB_HOSTED_URL="${PUB_HOSTED_URL:-https://pub.flutter-io.cn}"
+export FLUTTER_STORAGE_BASE_URL="${FLUTTER_STORAGE_BASE_URL:-https://storage.flutter-io.cn}"
+
+if command -v ruby >/dev/null 2>&1; then
+    USER_GEM_BIN="$(ruby -e 'require "rubygems"; print Gem.user_dir' 2>/dev/null)/bin"
+    if [ -d "$USER_GEM_BIN" ]; then
+        export PATH="$USER_GEM_BIN:$PATH"
+    fi
+fi
+
+if [ ! -x "$FLUTTER_BIN" ]; then
+    echo "Flutter SDK not found: $FLUTTER_BIN" >&2
+    echo "Set FLUTTER_ROOT to the Flutter SDK directory." >&2
+    exit 1
+fi
+
+exec "$FLUTTER_BIN" "$@"

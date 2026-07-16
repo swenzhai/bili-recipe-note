@@ -8,6 +8,8 @@ outputs/
 *.webm
 *.bak
 *.lock
+!/mobile/pubspec.lock
+!/mobile/ios/Podfile.lock
 build/
 dist/
 obsidian-vault/
@@ -16,3 +18,5 @@ obsidian-vault/
 /.bili-recipe-notes/config.json
 /.bili-recipe-notes/knowledge_base.json
 /.bili-recipe-notes/knowledge_base_*
+/.bili-recipe-notes/mobile-sync.sqlite3*
+/.bili-recipe-notes/mobile-media/

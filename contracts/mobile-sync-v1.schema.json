@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bili-recipe-notes.local/contracts/mobile-sync-v1.schema.json",
+  "title": "Bili Recipe Notes Mobile Sync v1",
+  "type": "object",
+  "$defs": {
+    "practiceLog": {
+      "type": "object",
+      "required": ["schema_version", "id", "recipe_id", "cooked_on", "notes", "version"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "id": {"type": "string", "format": "uuid"},
+        "recipe_id": {"type": "string", "format": "uuid"},
+        "cooked_on": {"type": "string", "format": "date"},
+        "outcome": {"type": ["string", "null"], "enum": ["success", "partial", "failed", null]},
+        "rating": {"type": ["integer", "null"], "minimum": 1, "maximum": 5},
+        "notes": {"type": "string", "minLength": 1, "maxLength": 5000},
+        "photo_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "version": {"type": "integer", "minimum": 0},
+        "created_at": {"type": ["string", "null"], "format": "date-time"},
+        "updated_at": {"type": ["string", "null"], "format": "date-time"},
+        "deleted_at": {"type": ["string", "null"], "format": "date-time"}
+      },
+      "additionalProperties": true
+    },
+    "operation": {
+      "type": "object",
+      "required": ["op_id", "entity_type", "entity_id", "action", "base_version", "payload"],
+      "properties": {
+        "op_id": {"type": "string", "format": "uuid"},
+        "entity_type": {"const": "practice_log"},
+        "entity_id": {"type": "string", "format": "uuid"},
+        "action": {"enum": ["upsert", "delete", "resolve_conflict"]},
+        "base_version": {"type": "integer", "minimum": 0},
+        "payload": {"type": "object"}
+      }
+    },
+    "change": {
+      "type": "object",
+      "required": ["revision", "entity_type", "entity_id", "action", "payload"],
+      "properties": {
+        "revision": {"type": "integer", "minimum": 1},
+        "entity_type": {"enum": ["recipe", "practice_log"]},
+        "entity_id": {"type": "string", "format": "uuid"},
+        "action": {"enum": ["upsert", "delete"]},
+        "payload": {"type": "object"}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "cursor": {"type": "integer", "minimum": 0},
+    "operations": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/operation"}},
+    "changes": {"type": "array", "maxItems": 200, "items": {"$ref": "#/$defs/change"}},
+    "next_cursor": {"type": "integer", "minimum": 0},
+    "has_more": {"type": "boolean"}
+  }
+}

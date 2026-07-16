@@ -6,12 +6,14 @@ import math
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote
+from urllib.request import urlopen
 
 try:
     from .batch_queue import create_batch_id, list_batch_states
@@ -45,6 +47,7 @@ try:
         write_related_knowledge_to_note,
     )
     from .llm import apply_cli_extra_instructions
+    from .mobile_sync import MobileSyncStore
     from .markdown_writer import upsert_rating_block
     from .optimizer import OptimizeOptions, optimize_existing_note
     from .obsidian_archive import (
@@ -113,6 +116,7 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
         write_related_knowledge_to_note,
     )
     from bili_recipe_notes.llm import apply_cli_extra_instructions
+    from bili_recipe_notes.mobile_sync import MobileSyncStore
     from bili_recipe_notes.markdown_writer import upsert_rating_block
     from bili_recipe_notes.optimizer import OptimizeOptions, optimize_existing_note
     from bili_recipe_notes.obsidian_archive import (
@@ -171,6 +175,7 @@ PAGES = [
     "知识库",
     "二次分析",
     "环境检查",
+    "手机客户端",
     "UP 主链接",
 ]
 EXPORT_KINDS = ["obsidian", "pdf", "docx", "zip"]
@@ -964,6 +969,155 @@ def _render_cooking_mode(st, config: UIConfig) -> None:
             st.markdown(f"**{marker} {index}. {candidate.title}**  \n{candidate.action}")
 
 
+def _lan_ip_address() -> str:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        return str(probe.getsockname()[0])
+    except OSError:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except OSError:
+            return "127.0.0.1"
+    finally:
+        probe.close()
+
+
+def _render_mobile_client_admin(st, config: UIConfig) -> None:
+    st.subheader("手机客户端")
+    st.warning("当前使用 HTTP，仅适合可信家庭局域网。不要在公共 Wi-Fi 中启动或配对。")
+    try:
+        store = MobileSyncStore(Path.cwd(), out_dir=config.out_dir)
+        index_result = store.index_recipes()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"同步服务数据初始化失败：{_clean_error(exc)}")
+        return
+
+    base_url = st.text_input("手机同步地址", value=f"http://{_lan_ip_address()}:8765")
+    try:
+        with urlopen("http://127.0.0.1:8765/api/v1/health", timeout=0.8) as response:  # noqa: S310
+            health = json.load(response)
+        st.success(f"同步 API 正常 · 协议 v{health.get('protocol_version', '?')}")
+    except Exception:  # noqa: BLE001
+        st.warning("同步 API 当前不可访问；请使用 start-ui-mac.command 一键启动管理页和同步服务。")
+    metrics = st.columns(4)
+    metrics[0].metric("菜谱", index_result["indexed"])
+    metrics[1].metric("服务修订", store.current_revision())
+    metrics[2].metric("已配对设备", len([item for item in store.list_devices() if not item["revoked_at"]]))
+    metrics[3].metric("待解决冲突", len(store.list_conflicts()))
+    if index_result["duplicates"]:
+        st.warning("发现重复菜谱身份，手机客户端只发布最近修改的一份。")
+        st.json(index_result["duplicates"])
+
+    if st.button("生成 10 分钟配对二维码", type="primary"):
+        credential = store.issue_pairing_credential(base_url)
+        st.session_state["mobile_pairing_payload"] = credential.qr_payload()
+        st.session_state["mobile_pairing_expires"] = credential.expires_at
+    pairing_payload = st.session_state.get("mobile_pairing_payload")
+    if isinstance(pairing_payload, str):
+        try:
+            import qrcode
+
+            st.image(qrcode.make(pairing_payload), caption="在手机客户端中扫码", width=280)
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"二维码生成失败，可复制下方配对数据：{_clean_error(exc)}")
+        st.caption(f"有效期至：{st.session_state.get('mobile_pairing_expires', '')}")
+        with st.expander("查看配对数据"):
+            st.code(pairing_payload, language="json")
+
+    st.markdown("#### 已配对设备")
+    devices = store.list_devices()
+    if not devices:
+        st.info("还没有配对设备。")
+    for device in devices:
+        columns = st.columns([3, 3, 1])
+        columns[0].write(f"**{device['name']}**")
+        columns[1].caption(f"最近连接：{device['last_seen_at']}")
+        if device["revoked_at"]:
+            columns[2].caption("已撤销")
+        elif columns[2].button("撤销", key=f"mobile_revoke_{device['id']}"):
+            store.revoke_device(str(device["id"]))
+            st.rerun()
+
+    st.markdown("#### 实践日志")
+    recipes = store.list_recipes()
+    recipe_titles = {str(item["id"]): str(item.get("title") or item["id"]) for item in recipes}
+    logs = store.list_practice_logs()
+    if not logs:
+        st.info("手机客户端同步心得后会显示在这里。")
+    else:
+        labels = {
+            str(item["id"]): f"{recipe_titles.get(str(item['recipe_id']), '未知菜谱')} · {item['cooked_on']} · {item['notes'][:24]}"
+            for item in logs
+        }
+        selected_id = st.selectbox("选择日志", list(labels), format_func=labels.get)
+        selected = next(item for item in logs if item["id"] == selected_id)
+        if selected.get("photo_sha256"):
+            found = store.asset_path(str(selected["photo_sha256"]))
+            if found:
+                st.image(str(found[0]), caption="实践照片", width=320)
+        outcome_values = ["", "success", "partial", "failed"]
+        outcome_labels = {"": "未填写", "success": "成功", "partial": "部分成功", "failed": "失败"}
+        with st.form(f"mobile_log_{selected_id}"):
+            cooked_on = st.date_input("实践日期", value=datetime.strptime(selected["cooked_on"], "%Y-%m-%d").date())
+            outcome = st.selectbox(
+                "结果", outcome_values, index=outcome_values.index(selected.get("outcome") or ""), format_func=outcome_labels.get
+            )
+            rating = st.selectbox("评分", [None, 1, 2, 3, 4, 5], index=int(selected.get("rating") or 0))
+            notes = st.text_area("心得", value=selected["notes"], height=140, max_chars=5000)
+            save_log = st.form_submit_button("保存并同步", type="primary", disabled=not notes.strip())
+        if save_log:
+            store.admin_save_practice_log(
+                {
+                    **selected,
+                    "cooked_on": cooked_on.isoformat(),
+                    "outcome": outcome or None,
+                    "rating": rating,
+                    "notes": notes.strip(),
+                }
+            )
+            st.success("已保存，手机客户端下次同步时会收到更新。")
+            st.rerun()
+        confirm_delete = st.checkbox("确认软删除这条日志", key=f"mobile_delete_confirm_{selected_id}")
+        if st.button("软删除日志", disabled=not confirm_delete, key=f"mobile_delete_{selected_id}"):
+            store.admin_delete_practice_log(selected_id)
+            st.rerun()
+
+    conflicts = store.list_conflicts()
+    st.markdown("#### 同步冲突")
+    if not conflicts:
+        st.success("没有待解决冲突。")
+    for conflict in conflicts:
+        with st.expander(f"日志 {conflict['entity_id']} · {conflict['created_at']}"):
+            left, right = st.columns(2)
+            left.markdown("**服务器版本**")
+            left.json(conflict["server"])
+            right.markdown("**离线传入版本**")
+            right.json(conflict["incoming"])
+            merged_text = st.text_area(
+                "手工合并 JSON",
+                value=json.dumps(conflict["incoming"], ensure_ascii=False, indent=2),
+                key=f"conflict_merged_payload_{conflict['id']}",
+            )
+            keep_server, keep_incoming, use_merged = st.columns(3)
+            if keep_server.button("保留服务器版本", key=f"conflict_server_{conflict['id']}"):
+                store.resolve_conflict(str(conflict["id"]), "server")
+                st.rerun()
+            if keep_incoming.button("采用离线版本", key=f"conflict_incoming_{conflict['id']}"):
+                store.resolve_conflict(str(conflict["id"]), "incoming")
+                st.rerun()
+            if use_merged.button("应用手工合并", key=f"conflict_merged_{conflict['id']}"):
+                try:
+                    merged = json.loads(merged_text)
+                    if not isinstance(merged, dict):
+                        raise ValueError("合并结果必须是 JSON 对象")
+                    store.resolve_conflict(str(conflict["id"]), "merged", merged)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"合并失败：{_clean_error(exc)}")
+                else:
+                    st.rerun()
+
+
 def main() -> None:
     import streamlit as st
 
@@ -1034,6 +1188,9 @@ def main() -> None:
 
     if active_page == "烹饪模式":
         _render_cooking_mode(st, config)
+
+    if active_page == "手机客户端":
+        _render_mobile_client_admin(st, config)
 
     if active_page == "草稿与归档":
         st.subheader("草稿与归档")

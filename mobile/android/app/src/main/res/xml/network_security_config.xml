@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- The app only connects to a user-paired private LAN address. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

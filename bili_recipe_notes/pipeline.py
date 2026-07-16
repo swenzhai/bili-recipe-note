@@ -285,6 +285,8 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
                 "uploader": info.get("uploader"),
                 "bvid": bvid,
                 "cid": cid,
+                "part_id": part_id,
+                "part_label": part_label,
                 "duration": info.get("duration"),
                 "output_folder": str(folder),
             }
@@ -297,6 +299,8 @@ def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = No
             "uploader": info.get("uploader"),
             "bvid": bvid,
             "cid": cid,
+            "part_id": part_id,
+            "part_label": part_label,
             "duration": info.get("duration"),
         }
 

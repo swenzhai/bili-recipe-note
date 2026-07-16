@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+import uuid
 import zipfile
 from pathlib import Path
 
 from bili_recipe_notes.exports import export_docx, export_obsidian, export_pdf, export_recipe_bundle
+from bili_recipe_notes.mobile_sync import MobileSyncStore
 
 
 def test_exports_keep_full_text_and_bundle_images(tmp_path: Path) -> None:
@@ -45,3 +48,55 @@ def test_bundle_does_not_include_unrelated_files(tmp_path: Path) -> None:
 
     with zipfile.ZipFile(bundle) as archive:
         assert archive.namelist() == ["note.md"]
+
+
+def test_bundle_includes_mobile_practice_logs(tmp_path: Path) -> None:
+    folder = tmp_path / "outputs" / "recipe"
+    folder.mkdir(parents=True)
+    note = folder / "note.md"
+    note.write_text("# 番茄炒蛋\n", encoding="utf-8")
+    (folder / "recipe.json").write_text(
+        json.dumps(
+            {
+                "title": "番茄炒蛋",
+                "source_url": "https://www.bilibili.com/video/BV1demo",
+                "steps": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (folder / "job.json").write_text(json.dumps({"bvid": "BV1demo", "cid": "100"}), encoding="utf-8")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    recipe_id = json.loads((folder / "sync-meta.json").read_text(encoding="utf-8"))["recipe_id"]
+    paired = store.pair_device(
+        store.issue_pairing_credential("http://192.168.1.2:8765").pairing_token,
+        "iPhone",
+    )
+    log_id = str(uuid.uuid4())
+    store.sync(
+        paired["device_id"],
+        0,
+        [
+            {
+                "op_id": str(uuid.uuid4()),
+                "entity_type": "practice_log",
+                "entity_id": log_id,
+                "action": "upsert",
+                "base_version": 0,
+                "payload": {
+                    "id": log_id,
+                    "recipe_id": recipe_id,
+                    "cooked_on": "2026-07-16",
+                    "notes": "少放一点盐",
+                },
+            }
+        ],
+    )
+
+    bundle = export_recipe_bundle(note)
+
+    with zipfile.ZipFile(bundle) as archive:
+        exported = json.loads(archive.read("practice-logs.json"))
+        assert exported[0]["notes"] == "少放一点盐"

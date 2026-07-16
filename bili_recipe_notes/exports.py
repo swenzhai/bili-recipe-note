@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import sqlite3
 import zipfile
 from pathlib import Path
 
@@ -193,6 +194,7 @@ def export_recipe_bundle(note_path: Path, output_path: Path | None = None) -> Pa
         "job.json",
         "extra_analysis.md",
         "extra_analysis.json",
+        "sync-meta.json",
     }
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(folder.rglob("*")):
@@ -201,7 +203,44 @@ def export_recipe_bundle(note_path: Path, output_path: Path | None = None) -> Pa
             relative = path.relative_to(folder)
             if relative.parts[0] == "images" or path.name in allowed_names:
                 archive.write(path, relative.as_posix())
+        _add_practice_logs_to_bundle(archive, folder)
     return output
+
+
+def _add_practice_logs_to_bundle(archive: zipfile.ZipFile, folder: Path) -> None:
+    metadata_path = folder / "sync-meta.json"
+    if not metadata_path.is_file():
+        return
+    try:
+        recipe_id = str(json.loads(metadata_path.read_text(encoding="utf-8")).get("recipe_id") or "")
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return
+    database = next(
+        (
+            parent / ".bili-recipe-notes" / "mobile-sync.sqlite3"
+            for parent in [folder.parent, *folder.parents]
+            if (parent / ".bili-recipe-notes" / "mobile-sync.sqlite3").is_file()
+        ),
+        None,
+    )
+    if not recipe_id or database is None:
+        return
+    try:
+        connection = sqlite3.connect(database)
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT * FROM practice_logs WHERE recipe_id=? ORDER BY cooked_on,created_at", (recipe_id,)
+        ).fetchall()
+        logs = [dict(row) for row in rows]
+        archive.writestr("practice-logs.json", json.dumps(logs, ensure_ascii=False, indent=2) + "\n")
+        for digest in {str(row["photo_sha256"]) for row in rows if row["photo_sha256"]}:
+            asset = connection.execute("SELECT path FROM assets WHERE sha256=?", (digest,)).fetchone()
+            if asset and Path(str(asset["path"])).is_file():
+                source = Path(str(asset["path"]))
+                archive.write(source, f"practice-images/{source.name}")
+        connection.close()
+    except (OSError, sqlite3.Error):
+        return
 
 
 def _pdf_hex(text: str) -> str:
