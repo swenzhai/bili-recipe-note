@@ -68,6 +68,14 @@ python -m bili_recipe_notes "https://www.bilibili.com/video/BVxxxx"
 - `--llm-extra-instructions-file prompt.txt`（从 UTF-8 文件载入高级提示词）
 - `--creator-home`（输入博主主页链接，提取全部视频链接）
 - `--creator-links-file all_links.txt`（提取结果文件名，默认 `creator_video_links.txt`）
+- `--batch`（创建持久化批次并在当前终端顺序执行）
+- `--batch-file links.txt`（从文本文件读取批量 URL，可重复使用；传 `-` 时从 stdin 读取）
+- `--batch-url URL`（额外加入一个 URL，可多次指定）
+- `--batch-id ID`（为新批次指定便于记忆的稳定 ID）
+- `--target-stage raw|recipe`（只形成原始版，或继续到完整菜谱版）
+- `--create-only`（只创建 pending 批次，不执行下载、字幕、Whisper 或 LLM）
+- `--resume-batch ID` / `--retry-batch ID`（继续未完成阶段 / 只重试失败阶段）
+- `--list-batches` / `--show-batch ID`（查看批次列表或逐条状态）
 
 提取博主全部视频链接示例：
 
@@ -76,6 +84,111 @@ python -m bili_recipe_notes "https://space.bilibili.com/123456/video" --creator-
 ```
 
 执行后会在 `outputs/creator_video_links.txt` 生成该主页下全部视频 URL，便于后续批量整理菜谱。
+
+### CLI 批量处理
+
+批量 CLI 与 UI 使用同一套批次文件和两阶段流水线。命令默认在当前终端前台顺序运行，每完成一个阶段都会保存状态；终端意外关闭后可按批次 ID 续跑，不需要保持 UI 开启。
+
+从 UP 主已保存链接清单运行到原始版：
+
+```bash
+python -m bili_recipe_notes \
+  --batch \
+  --batch-file "outputs/creators/419872064-老饭骨/video_links.txt" \
+  --batch-id laofangu-raw \
+  --target-stage raw \
+  --cookies .bili-recipe-notes/cookies/bilibili-edge.txt \
+  --whisper-model medium \
+  --no-screenshot
+```
+
+只保存为待执行批次，暂时不做任何视频处理：
+
+```bash
+python -m bili_recipe_notes \
+  --batch \
+  --batch-file links.txt \
+  --batch-id my-recipes \
+  --target-stage raw \
+  --create-only
+```
+
+稍后继续到原始版：
+
+```bash
+python -m bili_recipe_notes \
+  --resume-batch my-recipes \
+  --target-stage raw \
+  --cookies .bili-recipe-notes/cookies/bilibili-edge.txt \
+  --whisper-model medium
+```
+
+已有原始版后继续生成完整菜谱，不会重新获取已有字幕或转写：
+
+```bash
+python -m bili_recipe_notes \
+  --resume-batch my-recipes \
+  --target-stage recipe \
+  --llm-provider codex \
+  --codex-model gpt-5.5 \
+  --max-steps 10 \
+  --max-images 4
+```
+
+如果不需要 LLM 和截图，可以只使用规则提取：
+
+```bash
+python -m bili_recipe_notes \
+  --resume-batch my-recipes \
+  --target-stage recipe \
+  --llm-provider none \
+  --no-llm-summary \
+  --no-screenshot
+```
+
+直接传入少量 URL：
+
+```bash
+python -m bili_recipe_notes "https://www.bilibili.com/video/BV1xxxx" \
+  --batch \
+  --batch-url "https://www.bilibili.com/video/BV2xxxx" \
+  --batch-id two-videos \
+  --target-stage recipe
+```
+
+也可以从管道读取，每行一个 URL；空行和以 `#` 开头的注释会被忽略，重复链接自动去重：
+
+```bash
+printf '%s\n' \
+  'https://www.bilibili.com/video/BV1xxxx' \
+  'https://www.bilibili.com/video/BV2xxxx' | \
+python -m bili_recipe_notes --batch --batch-file - --batch-id piped-videos --target-stage raw
+```
+
+查看状态和重试失败项：
+
+```bash
+python -m bili_recipe_notes --list-batches
+python -m bili_recipe_notes --show-batch my-recipes
+python -m bili_recipe_notes \
+  --retry-batch my-recipes \
+  --target-stage recipe \
+  --cookies .bili-recipe-notes/cookies/bilibili-edge.txt
+```
+
+Windows PowerShell 的参数完全相同，只需按 PowerShell 语法换行：
+
+```powershell
+python -m bili_recipe_notes `
+  --batch `
+  --batch-file "outputs\creators\419872064-老饭骨\video_links.txt" `
+  --batch-id laofangu-win `
+  --target-stage raw `
+  --cookies ".bili-recipe-notes\cookies\bilibili-edge.txt" `
+  --whisper-model medium
+```
+
+批次状态保存在 `.bili-recipe-notes/batches/<批次ID>.json`，输出仍写入 `--out` 指定的目录。每次续跑都会采用当前命令传入的 Whisper、LLM、截图和审核设置；Cookie 不会写入工作产物，换电脑后应传入该电脑自己的 Cookie 文件。批次中只要有条目失败，CLI 会返回退出码 `1`；全部成功或没有待处理条目时返回 `0`。
 
 ### 本地 UI
 
@@ -114,9 +227,13 @@ UI 会在浏览器中打开，支持：
 - 将最终版本归档到现有或新建的 Obsidian vault；同一来源重复归档会更新原笔记
 - 批量任务完成后可逐条编辑、审核、归档，也可一次归档全部已完成草稿
 - 提取 UP 主主页下的视频链接
+- 递归展开 UP 主投稿中的隐藏合集，并按 UP 主长期保存完整链接清单
 - 扫描历史记录、搜索并预览已生成的菜谱
 - 在历史记录中可选择“仅重写 note.md”，只基于本地 `recipe.json` 重试 LLM，不重新下载视频
 - 批量读取多行 URL 或链接文件，失败不中断，已生成内容可跳过，并支持断点续跑
+- 批次可只运行到“原始版”（元数据与字幕/转写），之后再批量继续生成菜谱，避免重复抓取
+- 大批次在后台顺序运行，页面会立即返回；可刷新查看每条阶段状态和最新日志
+- 可把整个批次导出为跨平台工作交接包，在 macOS 与 Windows 间恢复产物和续跑状态
 - 检查本地环境：依赖包、ffmpeg、yt-dlp Bilibili 支持、opencode、Codex CLI、Whisper
 - 编辑 `recipe.json` / `transcript.json` 后重新生成笔记
 - 单步截图重截
@@ -186,6 +303,29 @@ AI 提炼的通用烹饪技巧先标记为“AI 候选”。在知识库中人�
 .bili-recipe-notes/batches/
 ```
 
+UP 主全量链接会按 UID 独立保存：
+
+```text
+outputs/creators/<UID>-<UP名称>/
+├── video_links.txt
+└── creator.json
+```
+
+抓取后可以默认全选并排除少量非菜谱视频；链接文档始终保留抓到的全部视频，批次只包含最终勾选项。可以仅创建待执行批次，不立即下载字幕或调用 LLM。
+
+### 在 Mac 与 Windows 间交接工作
+
+UI 的“工作交接”页面可以把一个批次导出为 `.handoff.zip`。交接包会保存：
+
+- 批次内的全部视频 URL，包括尚未执行的条目；
+- 已完成原始阶段的 `source.json`、`transcript.json` 与阶段状态；
+- 已完成菜谱阶段的 `recipe.json`、`note.md`、质量报告、审核文件和步骤图片；
+- 与该批次匹配的 UP 主 `video_links.txt` 和 `creator.json`。
+
+交接包不会保存 Bilibili Cookie、临时音频/视频、Obsidian 本机归档路径或原电脑绝对路径。导入另一台电脑后，文件路径会自动映射到当前“输出目录”；完成度较低的传入结果不会覆盖更完整的本地结果，同等完成度采用传入版本并在覆盖前保留 `.bak`。然后到“批量处理”选择该批次，点击“继续未完成”即可从已有阶段继续。
+
+推荐的实际用法：在 Mac 导出后用 AirDrop、U 盘、局域网共享或网盘传送 ZIP；Windows 处理完成后再导出同一批次并传回 Mac。每台电脑都需要单独安装运行环境，并在需要访问登录态视频时从本机 Edge 重新导入 Cookie。大于 200 MB 的交接包建议直接传文件，不通过浏览器下载按钮。
+
 个人厨艺知识库会保存到：
 
 ```text
@@ -239,6 +379,8 @@ UI 中的菜谱预览会把 `note.md` 内的 `images/...` 相对路径解析到�
 
 部分视频需登录态。可将浏览器导出的 Netscape 格式 cookies 保存为 `cookies.txt`，通过 `--cookies` 传入。
 
+本地 UI 的“Bilibili 登录”设置也支持直接从已登录的 Edge 手动导入和刷新。工具只保留 Bilibili 域 Cookie，验证登录成功后保存到 `.bili-recipe-notes/cookies/bilibili-edge.txt`，不会在日志或批次文件中写入 Cookie 内容。
+
 如果遇到 Bilibili `HTTP Error 412: Precondition Failed`：
 
 - 先关闭 UI 重新双击启动文件，启动脚本会自动检查并重装项目锁定的 `yt-dlp` 版本。
@@ -249,6 +391,7 @@ UI 中的菜谱预览会把 `note.md` 内的 `images/...` 相对路径解析到�
 
 ```text
 outputs/视频标题/
+├── source.json          # 原视频元数据；原始阶段即生成
 ├── recipe.json
 ├── recipe.review.json   # 开启逐项审核时生成
 ├── note.md

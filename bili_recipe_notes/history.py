@@ -86,6 +86,17 @@ def is_complete_output(folder: str | Path) -> bool:
     )
 
 
+def is_raw_output(folder: str | Path) -> bool:
+    """Return whether metadata and a usable transcript are available for recipe generation."""
+    output_folder = Path(folder)
+    job = _read_json(output_folder / "job.json")
+    stages = job.get("stages") if isinstance(job.get("stages"), dict) else {}
+    raw_stage = stages.get("raw") if isinstance(stages.get("raw"), dict) else {}
+    status_ok = raw_stage.get("status") == "done" or job.get("status") in {"raw_ready", "done"}
+    metadata_ok = bool(_read_json(output_folder / "source.json") or job.get("source_url"))
+    return bool(status_ok and metadata_ok and _has_usable_transcript(output_folder / "transcript.json"))
+
+
 def scan_history(out_dir: str | Path) -> list[HistoryItem]:
     root = Path(out_dir)
     if not root.exists():
@@ -163,5 +174,18 @@ def find_history_by_url(out_dir: str | Path, url: str) -> HistoryItem | None:
         return None
     for item in scan_history(out_dir):
         if item.source_url.strip() == target and item.status == "done" and is_complete_output(item.output_folder):
+            return item
+    return None
+
+
+def find_history_record_by_url(out_dir: str | Path, url: str) -> HistoryItem | None:
+    """Find any usable record for a URL, including raw-only outputs."""
+    target = url.strip()
+    if not target:
+        return None
+    for item in scan_history(out_dir):
+        if item.source_url.strip() == target and (
+            is_complete_output(item.output_folder) or is_raw_output(item.output_folder)
+        ):
             return item
     return None

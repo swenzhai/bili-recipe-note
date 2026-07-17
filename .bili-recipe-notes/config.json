@@ -1,6 +1,6 @@
 {
   "out_dir": "outputs",
-  "cookies": null,
+  "cookies": "/Users/swen/Documents/Code/bili-recipe-note/.bili-recipe-notes/cookies/bilibili-edge.txt",
   "language": "zh",
   "whisper_model": "small",
   "enable_screenshot": true,

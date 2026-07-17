@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import tempfile
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.request import Request, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
+
+from .config import CONFIG_DIR_NAME
+from .storage import atomic_write_bytes
 
 FINGERPRINT_URL = "https://api.bilibili.com/x/frontend/finger/spi"
+LOGIN_STATUS_URL = "https://api.bilibili.com/x/web-interface/nav"
 BILIBILI_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -18,6 +26,95 @@ BILIBILI_HEADERS = {
 
 _fingerprint_cookies: dict[str, str] | None = None
 _fingerprint_loaded = False
+
+
+@dataclass
+class CreatorVideo:
+    bvid: str
+    title: str
+    url: str
+
+
+@dataclass
+class CreatorCrawlResult:
+    uid: str
+    uploader: str
+    videos: list[CreatorVideo]
+    complete: bool = True
+    warnings: list[str] = field(default_factory=list)
+
+
+def imported_cookie_path(project_root: str | Path | None = None) -> Path:
+    root = Path(project_root) if project_root else Path.cwd()
+    return root / CONFIG_DIR_NAME / "cookies" / "bilibili-edge.txt"
+
+
+def validate_bilibili_cookie_file(cookie_path: str | Path) -> bool:
+    """Verify a Netscape cookie file against Bilibili without exposing cookie values."""
+    from yt_dlp.cookies import YoutubeDLCookieJar
+
+    jar = YoutubeDLCookieJar(str(cookie_path))
+    jar.load(ignore_discard=True, ignore_expires=True)
+    opener = build_opener(HTTPCookieProcessor(jar))
+    request = Request(LOGIN_STATUS_URL, headers=BILIBILI_HEADERS)
+    with opener.open(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return bool(payload.get("code") == 0 and isinstance(data, dict) and data.get("isLogin") is True)
+
+
+def import_edge_cookies(
+    project_root: str | Path | None = None,
+    profile: str | None = None,
+) -> Path:
+    """Import only live Bilibili cookies from Edge into a private Netscape file."""
+    from yt_dlp import YoutubeDL
+    from yt_dlp.cookies import YoutubeDLCookieJar
+
+    with YoutubeDL({"quiet": True, "cookiesfrombrowser": ("edge", profile, None, None)}) as ydl:
+        source_jar = ydl.cookiejar
+
+    filtered = YoutubeDLCookieJar()
+    now = time.time()
+    for cookie in source_jar:
+        domain = (cookie.domain or "").lower().lstrip(".")
+        if not (domain == "bilibili.com" or domain.endswith(".bilibili.com")):
+            continue
+        if cookie.expires is not None and cookie.expires <= now:
+            continue
+        filtered.set_cookie(cookie)
+    if not filtered:
+        raise RuntimeError("Edge 中没有找到可用的 Bilibili Cookie，请先确认已经登录。")
+
+    destination = imported_cookie_path(project_root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(destination.parent, 0o700)
+    except OSError:
+        pass
+
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".edge-cookie-", suffix=".txt")
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        filtered.filename = str(temporary_path)
+        # Expired cookies were filtered above; yt-dlp encodes live session cookies
+        # with expires=0, which requires ignore_expires=True while saving.
+        filtered.save(ignore_discard=True, ignore_expires=True)
+        if not validate_bilibili_cookie_file(temporary_path):
+            raise RuntimeError("Edge 中的 Bilibili 登录态无效或已经过期，请重新登录后再刷新。")
+        atomic_write_bytes(destination, temporary_path.read_bytes(), backup=False)
+        try:
+            os.chmod(destination, 0o600)
+        except OSError:
+            pass
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return destination
+
+
+def remove_imported_cookies(project_root: str | Path | None = None) -> None:
+    imported_cookie_path(project_root).unlink(missing_ok=True)
 
 
 def _fetch_fingerprint_cookies() -> dict[str, str] | None:
@@ -158,11 +255,12 @@ def fetch_video_info(url: str, cookies: str | None = None) -> dict:
         _cleanup_ydl_opts(opts)
 
 
-def extract_creator_video_links(home_url: str, cookies: str | None = None) -> list[str]:
-    """Extract all video URLs from a Bilibili creator page.
-
-    This relies on yt-dlp playlist extraction against creator spaces.
-    """
+def crawl_creator_videos(home_url: str, cookies: str | None = None) -> CreatorCrawlResult:
+    """Recursively crawl creator uploads and nested hidden-mode collections."""
+    uid_match = re.search(r"space\.bilibili\.com/(\d+)", home_url)
+    if not uid_match:
+        raise ValueError("请输入有效的 Bilibili UP 主空间链接。")
+    uid = uid_match.group(1)
     opts = _base_ydl_opts(cookies)
     opts.update({
         "quiet": True,
@@ -173,36 +271,85 @@ def extract_creator_video_links(home_url: str, cookies: str | None = None) -> li
 
     from yt_dlp import YoutubeDL
 
+    warnings: list[str] = []
+    complete = True
+    videos: list[CreatorVideo] = []
+    seen_bvids: set[str] = set()
+    visited_playlists: set[str] = set()
+
+    def bvid_from_entry(entry: dict) -> str | None:
+        for candidate in (entry.get("id"), entry.get("url"), entry.get("webpage_url")):
+            match = re.search(r"(BV[0-9A-Za-z]{10})", str(candidate or ""), flags=re.IGNORECASE)
+            if match:
+                return "BV" + match.group(1)[2:]
+        return None
+
     try:
         with YoutubeDL(_yt_dlp_opts(opts)) as ydl:
             info = ydl.extract_info(home_url, download=False)
+            uploader = str(info.get("uploader") or "").strip()
+
+            def walk_entries(container: dict, depth: int = 0) -> None:
+                nonlocal complete, uploader
+                if depth > 8:
+                    complete = False
+                    warnings.append("合集嵌套层级超过安全上限，已停止继续展开。")
+                    return
+                raw_entries = container.get("entries") or []
+                iterator = iter(raw_entries)
+                while True:
+                    try:
+                        entry = next(iterator)
+                    except StopIteration:
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        complete = False
+                        warnings.append(f"读取投稿分页失败：{exc}")
+                        break
+                    if not isinstance(entry, dict):
+                        continue
+                    uploader = uploader or str(entry.get("uploader") or "").strip()
+                    bvid = bvid_from_entry(entry)
+                    if bvid:
+                        if bvid not in seen_bvids:
+                            seen_bvids.add(bvid)
+                            videos.append(
+                                CreatorVideo(
+                                    bvid=bvid,
+                                    title=str(entry.get("title") or bvid).strip(),
+                                    url=f"https://www.bilibili.com/video/{bvid}",
+                                )
+                            )
+                        continue
+
+                    nested_url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
+                    if not nested_url or nested_url in visited_playlists:
+                        continue
+                    if "space.bilibili.com" not in nested_url:
+                        continue
+                    visited_playlists.add(nested_url)
+                    try:
+                        nested = ydl.extract_info(nested_url, download=False)
+                    except Exception as exc:  # noqa: BLE001
+                        complete = False
+                        warnings.append(f"合集展开失败：{nested_url}：{exc}")
+                        continue
+                    if isinstance(nested, dict):
+                        walk_entries(nested, depth + 1)
+
+            visited_playlists.add(home_url)
+            walk_entries(info)
     except Exception as exc:
         _raise_friendly_error(exc)
     finally:
         _cleanup_ydl_opts(opts)
 
-    entries = info.get("entries") or []
-    links: list[str] = []
-    for entry in entries:
-        if not entry:
-            continue
-        webpage_url = entry.get("webpage_url")
-        if webpage_url:
-            links.append(webpage_url)
-            continue
-        bvid = entry.get("id")
-        if bvid:
-            links.append(f"https://www.bilibili.com/video/{bvid}")
+    return CreatorCrawlResult(uid=uid, uploader=uploader or uid, videos=videos, complete=complete, warnings=warnings)
 
-    # de-dup while preserving order
-    seen: set[str] = set()
-    unique_links: list[str] = []
-    for link in links:
-        if link in seen:
-            continue
-        seen.add(link)
-        unique_links.append(link)
-    return unique_links
+
+def extract_creator_video_links(home_url: str, cookies: str | None = None) -> list[str]:
+    """Compatibility wrapper returning all canonical creator video URLs."""
+    return [video.url for video in crawl_creator_videos(home_url, cookies=cookies).videos]
 
 
 def download_subtitles(url: str, output_dir: Path, language: str = "zh", cookies: str | None = None) -> list[Path]:

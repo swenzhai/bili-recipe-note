@@ -51,6 +51,23 @@ def _open_edit_page(out_dir: Path) -> AppTest:
     return at.run()
 
 
+def test_batch_import_discovers_saved_creator_links(tmp_path: Path) -> None:
+    creator_dir = tmp_path / "creators" / "123-chef"
+    creator_dir.mkdir(parents=True)
+    links_path = creator_dir / "video_links.txt"
+    links_path.write_text("https://www.bilibili.com/video/BV1xx411c7mD\n", encoding="utf-8")
+    (creator_dir / "creator.json").write_text(
+        json.dumps({"uploader": "厨师", "video_count": 1}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    assert ui._saved_creator_link_documents(tmp_path) == [links_path]
+    assert "厨师 | 1 条" in ui._creator_link_document_label(links_path)
+    assert ui._load_batch_urls("", "", links_path) == [
+        "https://www.bilibili.com/video/BV1xx411c7mD"
+    ]
+
+
 def test_empty_recipe_tables_have_fixed_distinct_schemas() -> None:
     assert ui._editor_table([], ui.INGREDIENT_COLUMNS) == {
         "name": [],

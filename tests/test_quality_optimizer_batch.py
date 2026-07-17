@@ -8,7 +8,7 @@ import pytest
 from bili_recipe_notes import optimizer, pipeline
 from bili_recipe_notes.batch_queue import create_batch_state, load_batch_state
 from bili_recipe_notes.optimizer import OptimizeOptions, optimize_existing_note
-from bili_recipe_notes.pipeline import BatchJobOptions, RecipeJobResult, run_batch
+from bili_recipe_notes.pipeline import BatchJobOptions, RawJobResult, RecipeJobResult, run_batch
 from bili_recipe_notes.quality import analyze_recipe_quality, write_quality_report
 from bili_recipe_notes.recipe_extractor import Recipe, RecipeIngredient, RecipeStep
 
@@ -195,3 +195,38 @@ def test_run_batch_retry_failed_only_processes_failed(monkeypatch, tmp_path) -> 
 
     assert [item.url for item in result.items] == ["https://x/failed"]
     assert processed == ["https://x/failed"]
+
+
+def test_run_batch_can_stop_at_raw_stage_and_persist_stage_state(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    def _capture(options, log=None):
+        folder = tmp_path / "outputs" / "raw"
+        folder.mkdir(parents=True)
+        source = folder / "source.json"
+        transcript = folder / "transcript.json"
+        job = folder / "job.json"
+        source.write_text(json.dumps({"source_url": options.url}), encoding="utf-8")
+        transcript.write_text(json.dumps([{"start": 0, "end": 1, "text": "切菜"}]), encoding="utf-8")
+        job.write_text(
+            json.dumps({"status": "raw_ready", "source_url": options.url, "stages": {"raw": {"status": "done"}}}),
+            encoding="utf-8",
+        )
+        return RawJobResult(folder, source, transcript, job)
+
+    monkeypatch.setattr(pipeline, "capture_raw_material", _capture)
+
+    result = run_batch(
+        BatchJobOptions(
+            urls=["https://x/raw"],
+            out=str(tmp_path / "outputs"),
+            batch_id="raw-batch",
+            target_stage="raw",
+        )
+    )
+    state = load_batch_state("raw-batch", project_root=tmp_path)
+
+    assert result.items[0].status == "raw_ready"
+    assert state.items[0].status == "raw_ready"
+    assert state.items[0].stages["raw"].status == "done"
+    assert state.items[0].stages["recipe"].status == "pending"

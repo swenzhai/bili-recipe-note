@@ -23,6 +23,7 @@ sys.modules.setdefault("rich", rich_module)
 sys.modules.setdefault("rich.console", rich_console_module)
 
 from bili_recipe_notes import cli, pipeline
+from bili_recipe_notes.downloader import CreatorCrawlResult, CreatorVideo
 from bili_recipe_notes.pipeline import BatchJobOptions, RecipeJobOptions, RecipeJobResult
 from bili_recipe_notes.recipe_extractor import TranscriptSegment
 
@@ -562,3 +563,100 @@ def test_ui_cleans_ansi_error_text() -> None:
     import bili_recipe_notes.ui as ui
 
     assert ui._clean_error(Exception("\x1b[0;31mERROR:\x1b[0m failed")) == "ERROR: failed"
+
+
+def test_capture_raw_material_stops_before_recipe_generation(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        pipeline,
+        "fetch_video_info",
+        lambda url, cookies=None: {"title": "demo", "uploader": "up", "id": "BV1xx411c7mD"},
+    )
+    monkeypatch.setattr(pipeline, "download_subtitles", lambda url, output_dir, **kwargs: [output_dir / "subtitle.vtt"])
+    monkeypatch.setattr(
+        pipeline,
+        "parse_subtitle_file",
+        lambda path: [TranscriptSegment(start=0.0, end=1.0, text="先准备鸡蛋")],
+    )
+
+    result = pipeline.capture_raw_material(
+        RecipeJobOptions(
+            url="https://www.bilibili.com/video/BV1xx411c7mD",
+            out=str(tmp_path / "outputs"),
+            no_screenshot=True,
+            no_llm_summary=True,
+        )
+    )
+
+    assert result.source_path.is_file()
+    assert result.transcript_path.is_file()
+    assert not (result.output_folder / "recipe.json").exists()
+    assert not (result.output_folder / "note.md").exists()
+    job = json.loads(result.job_path.read_text(encoding="utf-8"))
+    assert job["status"] == "raw_ready"
+    assert job["stages"]["raw"]["status"] == "done"
+    assert job["stages"]["recipe"]["status"] == "pending"
+
+
+def test_generate_recipe_from_raw_does_not_refetch_source(monkeypatch, tmp_path) -> None:
+    folder = tmp_path / "outputs" / "raw"
+    folder.mkdir(parents=True)
+    (folder / "source.json").write_text(
+        json.dumps(
+            {
+                "source_url": "https://www.bilibili.com/video/BV1xx411c7mD",
+                "video_title": "demo",
+                "uploader": "up",
+                "bvid": "BV1xx411c7mD",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (folder / "transcript.json").write_text(
+        json.dumps([{"start": 0, "end": 1, "text": "先准备鸡蛋"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (folder / "job.json").write_text(
+        json.dumps({"status": "raw_ready", "stages": {"raw": {"status": "done"}, "recipe": {"status": "pending"}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline, "fetch_video_info", lambda *args, **kwargs: pytest.fail("must not fetch info"))
+    monkeypatch.setattr(pipeline, "download_subtitles", lambda *args, **kwargs: pytest.fail("must not fetch subtitles"))
+
+    result = pipeline.generate_recipe_from_raw(
+        folder,
+        RecipeJobOptions(
+            url="https://www.bilibili.com/video/BV1xx411c7mD",
+            out=str(tmp_path / "outputs"),
+            no_screenshot=True,
+            no_llm_summary=True,
+        ),
+    )
+
+    assert result.recipe_path.is_file()
+    assert result.note_path.is_file()
+    assert json.loads((folder / "job.json").read_text(encoding="utf-8"))["stages"]["recipe"]["status"] == "done"
+
+
+def test_creator_archive_uses_stable_folder_and_keeps_previous_list(monkeypatch, tmp_path) -> None:
+    crawls = iter(
+        [
+            CreatorCrawlResult(
+                uid="123",
+                uploader="厨师",
+                videos=[CreatorVideo("BV1xx411c7mD", "菜谱一", "https://www.bilibili.com/video/BV1xx411c7mD")],
+            ),
+            CreatorCrawlResult(
+                uid="123",
+                uploader="厨师改名",
+                videos=[CreatorVideo("BV1ab411c7mE", "菜谱二", "https://www.bilibili.com/video/BV1ab411c7mE")],
+            ),
+        ]
+    )
+    monkeypatch.setattr(pipeline, "crawl_creator_videos", lambda *args, **kwargs: next(crawls))
+
+    first = pipeline.crawl_and_archive_creator("https://space.bilibili.com/123/video", None, str(tmp_path / "out"))
+    second = pipeline.crawl_and_archive_creator("https://space.bilibili.com/123/video", None, str(tmp_path / "out"))
+
+    assert first.creator_dir == second.creator_dir
+    assert "BV1ab411c7mE" in second.links_path.read_text(encoding="utf-8")
+    assert "BV1xx411c7mD" in second.links_path.with_name("video_links.txt.bak").read_text(encoding="utf-8")

@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -16,7 +17,8 @@ from urllib.parse import unquote
 from urllib.request import urlopen
 
 try:
-    from .batch_queue import create_batch_id, list_batch_states
+    from .batch_queue import create_batch_id, create_batch_state, list_batch_states
+    from .batch_runner import get_background_batch_status, read_batch_log, start_background_batch
     from .config import UIConfig, load_config, save_config
     from .content_analysis import ContentAnalysisOptions, analyze_video_content
     from .cooking_mode import (
@@ -26,8 +28,10 @@ try:
         shopping_list_markdown,
     )
     from .environment import run_environment_checks
+    from .downloader import import_edge_cookies, remove_imported_cookies, validate_bilibili_cookie_file
     from .exports import export_note
     from .history import HistoryItem, scan_history
+    from .handoff import export_batch_handoff, import_handoff_bundle
     from .knowledge_base import (
         KnowledgeExtractionOptions,
         add_practice_record,
@@ -59,12 +63,11 @@ try:
     from .pipeline import (
         BatchJobOptions,
         RecipeJobOptions,
-        extract_creator_links,
+        crawl_and_archive_creator,
         generate_recipe_note,
         recapture_step_screenshot,
         regenerate_note_from_recipe,
         regenerate_recipe_from_transcript,
-        run_batch,
     )
     from .quality import analyze_recipe_quality
     from .recipe_extractor import (
@@ -85,7 +88,8 @@ try:
     )
     from .storage import atomic_write_json, atomic_write_text
 except ImportError:  # pragma: no cover - supports direct streamlit script execution
-    from bili_recipe_notes.batch_queue import create_batch_id, list_batch_states
+    from bili_recipe_notes.batch_queue import create_batch_id, create_batch_state, list_batch_states
+    from bili_recipe_notes.batch_runner import get_background_batch_status, read_batch_log, start_background_batch
     from bili_recipe_notes.config import UIConfig, load_config, save_config
     from bili_recipe_notes.content_analysis import ContentAnalysisOptions, analyze_video_content
     from bili_recipe_notes.cooking_mode import (
@@ -95,8 +99,10 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
         shopping_list_markdown,
     )
     from bili_recipe_notes.environment import run_environment_checks
+    from bili_recipe_notes.downloader import import_edge_cookies, remove_imported_cookies, validate_bilibili_cookie_file
     from bili_recipe_notes.exports import export_note
     from bili_recipe_notes.history import HistoryItem, scan_history
+    from bili_recipe_notes.handoff import export_batch_handoff, import_handoff_bundle
     from bili_recipe_notes.knowledge_base import (
         KnowledgeExtractionOptions,
         add_practice_record,
@@ -128,12 +134,11 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
     from bili_recipe_notes.pipeline import (
         BatchJobOptions,
         RecipeJobOptions,
-        extract_creator_links,
+        crawl_and_archive_creator,
         generate_recipe_note,
         recapture_step_screenshot,
         regenerate_note_from_recipe,
         regenerate_recipe_from_transcript,
-        run_batch,
     )
     from bili_recipe_notes.quality import analyze_recipe_quality
     from bili_recipe_notes.recipe_extractor import (
@@ -171,6 +176,7 @@ PAGES = [
     "草稿与归档",
     "审核确认",
     "批量处理",
+    "工作交接",
     "编辑修复",
     "知识库",
     "二次分析",
@@ -353,16 +359,82 @@ def _merge_editor_rows(value: Any, columns: Iterable[str], originals: Any) -> li
     return merged
 
 
-def _load_batch_urls(links_text: str, links_file: str) -> list[str]:
+def _saved_creator_link_documents(out_dir: str | Path) -> list[Path]:
+    root = Path(out_dir).expanduser()
+    documents = [path for path in (root / "creators").glob("*/video_links.txt") if path.is_file()]
+    return sorted(documents, key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def _creator_link_document_label(path_value: str | Path | None) -> str:
+    if not path_value:
+        return "不使用已保存清单"
+    path = Path(path_value)
+    uploader = path.parent.name
+    count = 0
+    manifest_path = path.parent / "creator.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        manifest = {}
+    if isinstance(manifest, dict):
+        uploader = str(manifest.get("uploader") or uploader)
+        count = int(manifest.get("video_count") or 0)
+    if count <= 0:
+        try:
+            count = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+        except OSError:
+            count = 0
+    return f"{uploader} | {count} 条 | {path}"
+
+
+def _load_batch_urls(
+    links_text: str,
+    links_file: str,
+    saved_creator_links: str | Path | None = None,
+) -> list[str]:
     urls = [line.strip() for line in links_text.splitlines() if line.strip()]
-    if links_file.strip():
-        path = Path(links_file.strip()).expanduser()
+    file_values = [str(saved_creator_links or "").strip(), links_file.strip()]
+    for file_value in file_values:
+        if not file_value:
+            continue
+        path = Path(file_value).expanduser()
         if not path.exists():
             raise FileNotFoundError(f"链接文件不存在：{path}")
         if not path.is_file():
             raise IsADirectoryError(f"链接文件路径不是文件：{path}")
         urls.extend(line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
     return list(dict.fromkeys(urls))
+
+
+BATCH_STATUS_LABELS = {
+    "pending": "待执行",
+    "running": "处理中",
+    "raw_running": "原始版处理中",
+    "raw_ready": "原始版就绪",
+    "recipe_running": "菜谱处理中",
+    "done": "已完成",
+    "skipped": "已跳过",
+    "failed": "失败",
+}
+
+
+def _batch_item_row(item: Any) -> dict[str, Any]:
+    stages = getattr(item, "stages", {}) or {}
+
+    def stage_status(name: str) -> str:
+        stage = stages.get(name)
+        raw = getattr(stage, "status", "pending") if stage else "pending"
+        return BATCH_STATUS_LABELS.get(raw, raw)
+
+    status = str(getattr(item, "status", "pending"))
+    return {
+        "URL": getattr(item, "url", ""),
+        "状态": BATCH_STATUS_LABELS.get(status, status),
+        "原始版": stage_status("raw"),
+        "菜谱版": stage_status("recipe"),
+        "输出目录": getattr(item, "output_folder", None) or "",
+        "错误": getattr(item, "error", None) or "",
+    }
 
 
 def _backup_files(paths: Iterable[Path | None], action: str) -> list[Path]:
@@ -694,7 +766,38 @@ def _display_quality(st, output_folder: Path) -> None:
 def _render_sidebar(st, config: UIConfig) -> UIConfig:
     st.sidebar.header("默认配置")
     config.out_dir = st.sidebar.text_input("输出目录", value=config.out_dir)
-    config.cookies = _optional_text(st.sidebar.text_input("cookies 文件路径", value=config.cookies or ""))
+    with st.sidebar.expander("Bilibili 登录", expanded=not bool(config.cookies)):
+        config.cookies = _optional_text(st.text_input("cookies 文件路径", value=config.cookies or ""))
+        st.caption("可从已登录的 Edge 导入，仅在本机保存 Bilibili 域 Cookie。")
+        cookie_import, cookie_validate, cookie_remove = st.columns(3)
+        with cookie_import:
+            import_clicked = st.button("从 Edge 导入/刷新", use_container_width=True)
+        with cookie_validate:
+            validate_clicked = st.button("验证登录", disabled=not bool(config.cookies), use_container_width=True)
+        with cookie_remove:
+            remove_clicked = st.button("删除登录文件", use_container_width=True)
+        if import_clicked:
+            try:
+                with st.spinner("正在从 Edge 导入并验证登录..."):
+                    cookie_path = import_edge_cookies()
+                config.cookies = str(cookie_path)
+                save_config(config)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Cookie 导入失败：{_clean_error(exc)}")
+            else:
+                _rerun_with_notice(st, f"已从 Edge 导入并验证登录：{cookie_path}")
+        if validate_clicked and config.cookies:
+            try:
+                valid = validate_bilibili_cookie_file(config.cookies)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"登录验证失败：{_clean_error(exc)}")
+            else:
+                (st.success if valid else st.error)("Bilibili 登录有效。" if valid else "登录已失效，请刷新 Cookie。")
+        if remove_clicked:
+            remove_imported_cookies()
+            config.cookies = None
+            save_config(config)
+            _rerun_with_notice(st, "已删除本地导入的 Bilibili 登录文件。", level="info")
     config.language = st.sidebar.text_input("字幕/转写语言", value=config.language)
     config.whisper_model = st.sidebar.selectbox(
         "Whisper 模型",
@@ -1545,18 +1648,59 @@ def main() -> None:
 
     if active_page == "批量处理":
         st.subheader("批量处理")
-        links_text = st.text_area("视频 URL，每行一个", height=180)
-        links_file = st.text_input("或读取链接文件路径", placeholder="outputs/creator_video_links.txt")
+        saved_link_documents = _saved_creator_link_documents(config.out_dir)
+        saved_link_options = [""] + [str(path) for path in saved_link_documents]
+        if st.session_state.get("batch_saved_creator_links") not in saved_link_options:
+            st.session_state["batch_saved_creator_links"] = saved_link_options[1] if saved_link_documents else ""
+        selected_saved_links = st.selectbox(
+            "已保存的 UP 主链接清单",
+            saved_link_options,
+            format_func=_creator_link_document_label,
+            key="batch_saved_creator_links",
+            help="默认选择最近一次抓取的 UP 主清单；创建新批次时会直接读取，不需要粘贴 URL。",
+        )
+        if selected_saved_links:
+            selected_count = len(_load_batch_urls("", "", selected_saved_links))
+            st.success(f"已导入最近保存的链接清单，共 {selected_count} 条。")
+        elif not saved_link_documents:
+            st.info("还没有已保存的 UP 主链接清单；可先到“UP 主链接”页面抓取，或在下面手动输入。")
+        with st.expander("手动添加 URL 或导入其他文件（可选）", expanded=not bool(selected_saved_links)):
+            links_text = st.text_area("视频 URL，每行一个", height=180)
+            links_file = st.text_input("其他链接文件路径", placeholder="outputs/creator_video_links.txt")
+        target_label = st.radio(
+            "运行到目标阶段",
+            ["仅形成原始版", "生成完整菜谱版"],
+            horizontal=True,
+            help="完整菜谱版会自动补齐缺失的原始版；已有原始版不会重复抓字幕。",
+        )
+        target_stage = "raw" if target_label == "仅形成原始版" else "recipe"
         skip_existing = st.checkbox("已生成则跳过", value=True)
-        use_queue = st.checkbox("保存为可续跑批次", value=True)
+        st.caption("批量任务会在后台运行并自动保存进度，关闭当前页面后仍可在本次 UI 进程中继续。")
         try:
             batch_states = list_batch_states()
         except Exception as exc:  # noqa: BLE001
             batch_states = []
             st.error(f"读取批次状态失败：{_clean_error(exc)}")
-        batch_labels = [f"{state.batch_id} | {state.updated_at} | {len(state.items)} 条" for state in batch_states]
-        selected_batch_label = st.selectbox("已有批次", [""] + batch_labels)
-        selected_batch_id = selected_batch_label.split(" | ", 1)[0] if selected_batch_label else None
+        batch_by_id = {state.batch_id: state for state in batch_states}
+        next_batch_select = st.session_state.pop("_next_batch_select", None)
+        if next_batch_select in batch_by_id:
+            st.session_state["batch_select"] = next_batch_select
+
+        def batch_label(value: str) -> str:
+            if not value:
+                return ""
+            state = batch_by_id.get(value)
+            if state:
+                return f"{value} | {state.updated_at} | {len(state.items)} 条"
+            return value
+
+        selected_batch_value = st.selectbox(
+            "已有批次",
+            [""] + list(batch_by_id),
+            format_func=batch_label,
+            key="batch_select",
+        ) or None
+        selected_batch_id = selected_batch_value.split(" | ", 1)[0] if selected_batch_value else None
 
         col_new, col_resume, col_retry = st.columns(3)
         run_mode = None
@@ -1578,75 +1722,84 @@ def main() -> None:
                 if run_mode in {"resume-unfinished", "retry-failed"} and selected_batch_id:
                     urls = []
                 else:
-                    urls = _load_batch_urls(links_text, links_file)
+                    urls = _load_batch_urls(links_text, links_file, selected_saved_links)
                 if not urls and run_mode not in {"resume-unfinished", "retry-failed"}:
                     raise ValueError("请先输入 URL 或提供有效的链接文件。")
 
                 save_config(config)
-                log = _log_box(st, height=260)
-                batch_id = None
+                batch_id: str | None = None
                 resume_mode = "new"
-                if run_mode == "new-queue":
+                if run_mode in {"new-queue", "new-direct"}:
                     batch_id = create_batch_id()
                 elif run_mode in {"resume-unfinished", "retry-failed"}:
                     batch_id = selected_batch_id
                     resume_mode = run_mode
-                elif use_queue:
-                    batch_id = create_batch_id()
-                result = run_batch(
-                    BatchJobOptions(
-                        urls=urls,
-                        cookies=_optional_text(config.cookies),
-                        out=config.out_dir,
-                        no_screenshot=not config.enable_screenshot,
-                        whisper_model=config.whisper_model,
-                        language=config.language,
-                        keep_media=config.keep_media,
-                        no_llm_summary=not config.enable_llm_summary or config.llm_provider == "none",
-                        llm_provider=config.llm_provider,
-                        openai_model=config.openai_model,
-                        local_llm_command=config.local_llm_command,
-                        codex_model=config.codex_model,
-                        codex_profile=config.codex_profile,
-                        llm_cli_extra_instructions=config.llm_cli_extra_instructions,
-                        max_recipe_steps=config.max_recipe_steps,
-                        max_step_images=config.max_step_images,
-                        enable_recipe_review=config.enable_recipe_review,
-                        skip_existing=skip_existing,
-                        batch_id=batch_id,
-                        resume_mode=resume_mode,
-                    ),
-                    log=log,
+                options = BatchJobOptions(
+                    urls=urls,
+                    cookies=_optional_text(config.cookies),
+                    out=config.out_dir,
+                    no_screenshot=not config.enable_screenshot,
+                    whisper_model=config.whisper_model,
+                    language=config.language,
+                    keep_media=config.keep_media,
+                    no_llm_summary=not config.enable_llm_summary or config.llm_provider == "none",
+                    llm_provider=config.llm_provider,
+                    openai_model=config.openai_model,
+                    local_llm_command=config.local_llm_command,
+                    codex_model=config.codex_model,
+                    codex_profile=config.codex_profile,
+                    llm_cli_extra_instructions=config.llm_cli_extra_instructions,
+                    max_recipe_steps=config.max_recipe_steps,
+                    max_step_images=config.max_step_images,
+                    enable_recipe_review=config.enable_recipe_review,
+                    skip_existing=skip_existing,
+                    batch_id=batch_id,
+                    resume_mode=resume_mode,
+                    target_stage=target_stage,
                 )
+                if run_mode in {"new-queue", "new-direct"}:
+                    options_snapshot = {key: value for key, value in options.__dict__.items() if key != "urls"}
+                    create_batch_state(urls, options_snapshot, batch_id=batch_id)
+                    options.urls = []
+                    options.resume_mode = "resume-unfinished"
+
+                def post_process(result) -> None:
+                    if not config.auto_archive_after_generation:
+                        return
+                    completed_folders = [
+                        item.output_folder for item in result.items if item.output_folder and item.status == "done"
+                    ]
+                    if completed_folders:
+                        archive_recipe_batch(completed_folders, _vault_path(config))
+                        if config.archive_knowledge_with_recipe:
+                            _archive_approved_knowledge(config)
+
+                background = start_background_batch(options, on_complete=post_process)
             except Exception as exc:  # noqa: BLE001 - batch failures must not take down the UI
                 st.error(f"批量处理失败：{_clean_error(exc)}")
             else:
-                st.dataframe([item.__dict__ for item in result.items], width="stretch")
-                if config.auto_archive_after_generation:
-                    completed_folders = [item.output_folder for item in result.items if item.output_folder and item.status == "done"]
-                    if completed_folders:
-                        archived_batch = archive_recipe_batch(completed_folders, _vault_path(config))
-                        knowledge_results, knowledge_error = (
-                            _archive_approved_knowledge(config)
-                            if config.archive_knowledge_with_recipe
-                            else ((), None)
-                        )
-                        st.success(
-                            f"自动归档完成：成功 {archived_batch.archived_count}，"
-                            f"跳过 {archived_batch.skipped_count}，失败 {archived_batch.failed_count}。"
-                        )
-                        if knowledge_results:
-                            st.caption(f"同步 {len(knowledge_results)} 条已确认通用技巧。")
-                        if knowledge_error:
-                            st.warning(f"技巧同步失败：{_clean_error(knowledge_error)}")
-                if batch_id:
-                    st.success(f"批次状态已保存：{batch_id}")
+                st.session_state["_next_batch_select"] = batch_id
+                _rerun_with_notice(st, f"批次已在后台启动：{background.batch_id}")
 
         if selected_batch_id:
-            selected_state = next((state for state in batch_states if state.batch_id == selected_batch_id), None)
+            selected_state = batch_by_id.get(selected_batch_id)
             if selected_state:
                 st.markdown("#### 批次状态")
-                st.dataframe([item.__dict__ for item in selected_state.items], width="stretch")
+                background = get_background_batch_status(selected_batch_id)
+                if background:
+                    status_text = {
+                        "running": "后台运行中",
+                        "done": "后台运行完成",
+                        "done_with_errors": "后台运行完成（有失败项）",
+                        "failed": "后台运行失败",
+                    }.get(background.status, background.status)
+                    st.info(f"{status_text}；启动时间：{background.started_at}")
+                if st.button("刷新批次进度", key=f"refresh_batch_{selected_batch_id}"):
+                    st.rerun()
+                st.dataframe([_batch_item_row(item) for item in selected_state.items], width="stretch")
+                batch_log = read_batch_log(selected_batch_id)
+                if batch_log:
+                    st.text_area("后台运行日志（最新）", value=batch_log, height=220, disabled=True)
                 completed_batch_items = [
                     item
                     for item in selected_state.items
@@ -1717,6 +1870,153 @@ def main() -> None:
                             f"跳过 {archived_batch.skipped_count}，失败 {archived_batch.failed_count}"
                             f"{knowledge_message}。",
                         )
+
+    if active_page == "工作交接":
+        st.subheader("两台电脑工作交接")
+        st.caption(
+            "把一个批次的链接、原始字幕和已生成菜谱打成 ZIP；另一台电脑导入后可直接继续未完成任务。"
+            "Cookie、临时音视频和本机归档路径不会进入交接包。"
+        )
+        export_tab, import_tab = st.tabs(["从这台电脑导出", "导入另一台电脑的工作"])
+
+        with export_tab:
+            try:
+                handoff_states = list_batch_states()
+            except Exception as exc:  # noqa: BLE001
+                handoff_states = []
+                st.error(f"读取批次失败：{_clean_error(exc)}")
+            if not handoff_states:
+                st.info("当前没有批次。先在“UP 主链接”或“批量处理”页面创建批次。")
+            else:
+                handoff_by_id = {state.batch_id: state for state in handoff_states}
+                export_batch_id = st.selectbox(
+                    "选择要交接的批次",
+                    list(handoff_by_id),
+                    format_func=lambda value: (
+                        f"{value} | {len(handoff_by_id[value].items)} 条 | "
+                        f"更新于 {handoff_by_id[value].updated_at}"
+                    ),
+                    key="handoff_export_batch",
+                )
+                export_state = handoff_by_id[export_batch_id]
+                recipe_ready = sum(
+                    1 for item in export_state.items if item.stages.get("recipe") and item.stages["recipe"].status == "done"
+                )
+                raw_ready = sum(
+                    1
+                    for item in export_state.items
+                    if item.stages.get("raw")
+                    and item.stages["raw"].status == "done"
+                    and not (item.stages.get("recipe") and item.stages["recipe"].status == "done")
+                )
+                st.info(
+                    f"批次共 {len(export_state.items)} 条：菜谱版 {recipe_ready}，仅原始版 {raw_ready}，"
+                    f"其余链接也会保留为待执行。"
+                )
+                destination = st.text_input(
+                    "保存位置（可选）",
+                    placeholder=f"留空则保存到 {Path(config.out_dir).expanduser() / 'handoffs'}",
+                    key="handoff_export_destination",
+                    help="也可以直接填 U 盘、移动硬盘或网盘同步目录。若填目录，会自动生成文件名。",
+                )
+                if st.button("生成工作交接包", type="primary", key="handoff_export_start"):
+                    try:
+                        with st.spinner("正在整理已完成工作文件..."):
+                            exported = export_batch_handoff(
+                                export_batch_id,
+                                config.out_dir,
+                                destination=_optional_text(destination),
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"导出失败：{_clean_error(exc)}")
+                    else:
+                        st.session_state["last_handoff_export"] = str(exported.path)
+                        st.success(
+                            f"交接包已生成：菜谱版 {exported.recipe_count}，原始版 {exported.raw_count}，"
+                            f"共 {exported.item_count} 条链接。"
+                        )
+                exported_value = st.session_state.get("last_handoff_export")
+                exported_path = Path(exported_value) if isinstance(exported_value, str) else None
+                if exported_path and exported_path.is_file():
+                    size_mb = exported_path.stat().st_size / 1024**2
+                    st.code(str(exported_path), language="text")
+                    st.caption(f"文件大小：{size_mb:.1f} MB。可用 AirDrop、U 盘、局域网共享或网盘传到另一台电脑。")
+                    open_col, download_col = st.columns(2)
+                    with open_col:
+                        if st.button("在文件夹中显示", key="handoff_reveal_export"):
+                            _open_folder(exported_path.parent)
+                    with download_col:
+                        if size_mb <= 200:
+                            try:
+                                handoff_bytes = exported_path.read_bytes()
+                            except OSError as exc:
+                                st.warning(f"暂时无法读取交接包：{_clean_error(exc)}")
+                            else:
+                                st.download_button(
+                                    "浏览器下载交接包",
+                                    data=handoff_bytes,
+                                    file_name=exported_path.name,
+                                    mime="application/zip",
+                                    key="handoff_download_export",
+                                )
+                        else:
+                            st.caption("文件超过 200 MB，请直接从上面的文件路径传输，避免浏览器占用过多内存。")
+
+        with import_tab:
+            st.info("导入不会带入另一台电脑的登录信息。首次继续下载前，请在侧栏重新导入本机 Edge Cookie。")
+            import_path = st.text_input(
+                "交接包路径",
+                placeholder="U 盘、共享目录或已经下载的 .handoff.zip 文件",
+                key="handoff_import_path",
+            )
+            uploaded_handoff = st.file_uploader(
+                "或者直接选择交接包",
+                type=["zip"],
+                key="handoff_import_upload",
+                help="大文件更推荐填写上面的本地路径。",
+            )
+            import_clicked = st.button(
+                "校验并导入",
+                type="primary",
+                disabled=not import_path.strip() and uploaded_handoff is None,
+                key="handoff_import_start",
+            )
+            if import_clicked:
+                temporary_path: Path | None = None
+                try:
+                    source = Path(import_path).expanduser() if import_path.strip() else None
+                    if source is None and uploaded_handoff is not None:
+                        suffix = Path(uploaded_handoff.name).suffix or ".zip"
+                        with tempfile.NamedTemporaryFile(prefix="bili-handoff-", suffix=suffix, delete=False) as file:
+                            file.write(uploaded_handoff.getbuffer())
+                            temporary_path = Path(file.name)
+                        source = temporary_path
+                    if source is None:
+                        raise ValueError("请选择交接包。")
+                    with st.spinner("正在校验并恢复工作文件..."):
+                        imported = import_handoff_bundle(source, config.out_dir)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"导入失败：{_clean_error(exc)}")
+                else:
+                    st.session_state["last_handoff_import"] = imported
+                    st.session_state["batch_select"] = imported.batch_id
+                    st.success(
+                        f"导入完成：菜谱版 {imported.recipe_count}，仅原始版 {imported.raw_count}，"
+                        f"待执行 {imported.pending_count}。"
+                    )
+                    if imported.backup_count:
+                        st.caption(f"有 {imported.backup_count} 个同名文件在更新前保留了 .bak。")
+                finally:
+                    if temporary_path is not None:
+                        temporary_path.unlink(missing_ok=True)
+
+            imported = st.session_state.get("last_handoff_import")
+            if imported:
+                st.code(str(imported.batch_path), language="text")
+                if st.button("打开批次并继续处理", type="primary", key="handoff_go_batch"):
+                    st.session_state["_next_batch_select"] = imported.batch_id
+                    st.session_state["_next_page"] = "批量处理"
+                    st.rerun()
 
     if active_page == "编辑修复":
         st.subheader("编辑与修复")
@@ -2553,18 +2853,17 @@ def main() -> None:
             st.info("点击“运行环境检查”开始探测。")
 
     if active_page == "UP 主链接":
-        st.subheader("提取 UP 主视频链接")
+        st.subheader("导入 UP 主全部视频")
+        st.caption("抓取完成后总会保存独立链接清单；可以只创建待执行批次，稍后再生成菜谱。")
         home_url = st.text_input("UP 主主页 URL", placeholder="https://space.bilibili.com/123456/video")
-        filename = st.text_input("链接文件名", value="creator_video_links.txt")
-        if st.button("开始提取", type="primary", disabled=not home_url.strip()):
+        if st.button("抓取并保存全部链接", type="primary", disabled=not home_url.strip()):
             log = _log_box(st, height=180)
             try:
-                with st.spinner("正在提取视频链接..."):
-                    links_path = extract_creator_links(
+                with st.spinner("正在递归提取投稿和合集..."):
+                    archive_result = crawl_and_archive_creator(
                         url=home_url.strip(),
                         cookies=_optional_text(config.cookies),
                         out=config.out_dir,
-                        filename=filename.strip() or "creator_video_links.txt",
                         log=log,
                     )
             except Exception as exc:  # noqa: BLE001
@@ -2572,16 +2871,134 @@ def main() -> None:
                 log(error_message)
                 st.error(f"提取失败：{error_message}")
             else:
+                st.session_state["creator_archive_result"] = archive_result
+                st.session_state["batch_saved_creator_links"] = str(archive_result.links_path)
+
+        archive_result = st.session_state.get("creator_archive_result")
+        if archive_result:
+            crawl = archive_result.crawl
+            st.success(f"{crawl.uploader}：已保存 {len(crawl.videos)} 个视频链接。")
+            st.caption(f"链接清单：{archive_result.links_path}")
+            st.caption(f"结构化清单：{archive_result.manifest_path}")
+            if crawl.warnings:
+                st.warning("\n".join(crawl.warnings))
+            accept_partial = crawl.complete or st.checkbox(
+                "我确认接受当前不完整结果并继续创建批次",
+                value=False,
+                key=f"creator_partial_{crawl.uid}",
+            )
+            rows = [
+                {"选择": True, "标题": video.title, "BV": video.bvid, "URL": video.url}
+                for video in crawl.videos
+            ]
+            edited_rows = st.data_editor(
+                rows,
+                hide_index=True,
+                disabled=["标题", "BV", "URL"],
+                width="stretch",
+                key=f"creator_videos_{crawl.uid}_{archive_result.manifest_path.stat().st_mtime_ns}",
+            )
+            selected_urls = [str(row["URL"]) for row in edited_rows if row.get("选择")]
+            st.caption(f"已选择 {len(selected_urls)} / {len(rows)} 个视频；链接文档仍保留全部视频。")
+            creator_target_label = st.radio(
+                "立即运行时的目标阶段",
+                ["仅形成原始版", "生成完整菜谱版"],
+                horizontal=True,
+                key=f"creator_target_{crawl.uid}",
+            )
+            creator_target = "raw" if creator_target_label == "仅形成原始版" else "recipe"
+
+            creator_batch_options = BatchJobOptions(
+                urls=selected_urls,
+                cookies=_optional_text(config.cookies),
+                out=config.out_dir,
+                no_screenshot=not config.enable_screenshot,
+                whisper_model=config.whisper_model,
+                language=config.language,
+                keep_media=config.keep_media,
+                no_llm_summary=not config.enable_llm_summary or config.llm_provider == "none",
+                llm_provider=config.llm_provider,
+                openai_model=config.openai_model,
+                local_llm_command=config.local_llm_command,
+                codex_model=config.codex_model,
+                codex_profile=config.codex_profile,
+                llm_cli_extra_instructions=config.llm_cli_extra_instructions,
+                max_recipe_steps=config.max_recipe_steps,
+                max_step_images=config.max_step_images,
+                enable_recipe_review=config.enable_recipe_review,
+                skip_existing=True,
+                target_stage=creator_target,
+            )
+            deferred_col, immediate_col = st.columns(2)
+            can_create = bool(selected_urls) and bool(accept_partial)
+            with deferred_col:
+                defer_clicked = st.button(
+                    "保存清单并创建待执行批次",
+                    disabled=not can_create,
+                    use_container_width=True,
+                )
+            with immediate_col:
+                run_clicked = st.button(
+                    "保存清单并立即运行",
+                    type="primary",
+                    disabled=not can_create,
+                    use_container_width=True,
+                )
+            if defer_clicked:
+                batch_id = create_batch_id()
+                options_snapshot = {
+                    key: value for key, value in creator_batch_options.__dict__.items() if key != "urls"
+                }
+                state = create_batch_state(selected_urls, options_snapshot, batch_id=batch_id)
+                st.success(f"待执行批次已创建：{state.batch_id}，共 {len(state.items)} 条。")
+            if run_clicked:
+                batch_id = create_batch_id()
+                creator_batch_options.batch_id = batch_id
                 try:
-                    if not links_path.is_file():
-                        raise FileNotFoundError(f"提取器未生成链接文件：{links_path}")
-                    content = links_path.read_text(encoding="utf-8")
+                    options_snapshot = {
+                        key: value for key, value in creator_batch_options.__dict__.items() if key != "urls"
+                    }
+                    create_batch_state(selected_urls, options_snapshot, batch_id=batch_id)
+                    creator_batch_options.urls = []
+                    creator_batch_options.resume_mode = "resume-unfinished"
+
+                    def post_process_creator(result) -> None:
+                        if not config.auto_archive_after_generation:
+                            return
+                        completed_folders = [
+                            item.output_folder for item in result.items if item.output_folder and item.status == "done"
+                        ]
+                        if completed_folders:
+                            archive_recipe_batch(completed_folders, _vault_path(config))
+                            if config.archive_knowledge_with_recipe:
+                                _archive_approved_knowledge(config)
+
+                    background = start_background_batch(
+                        creator_batch_options,
+                        on_complete=post_process_creator,
+                    )
                 except Exception as exc:  # noqa: BLE001
-                    st.error(f"读取链接文件失败：{_clean_error(exc)}")
+                    st.error(f"批次启动失败：{_clean_error(exc)}")
                 else:
-                    st.success(f"已写入：{links_path}")
-                    st.text_area("链接预览", value=content, height=240)
-                    st.download_button("下载链接文件", data=content, file_name=links_path.name, mime="text/plain")
+                    st.session_state["creator_active_batch_id"] = batch_id
+                    st.success(f"批次已在后台启动：{background.batch_id}。可到“批量处理”页面查看进度。")
+
+            active_creator_batch = st.session_state.get("creator_active_batch_id")
+            if active_creator_batch:
+                background = get_background_batch_status(str(active_creator_batch))
+                if background:
+                    st.info(f"后台批次 {active_creator_batch}：{background.status}")
+                creator_log = read_batch_log(str(active_creator_batch))
+                if creator_log:
+                    st.text_area("后台运行日志（最新）", value=creator_log, height=180, disabled=True)
+
+            content = archive_result.links_path.read_text(encoding="utf-8")
+            st.download_button(
+                "下载全部视频链接",
+                data=content,
+                file_name=f"{crawl.uid}-video_links.txt",
+                mime="text/plain",
+            )
 
 
 if __name__ == "__main__":

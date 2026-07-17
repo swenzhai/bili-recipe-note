@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import types
+from http.cookiejar import Cookie, CookieJar
 from pathlib import Path
 
 import pytest
@@ -94,3 +95,147 @@ def test_lowres_video_prefers_video_only_and_atomically_replaces_old_file(monkey
     assert not old_video.exists()
     assert captured["format"].startswith("worstvideo/")
     assert "+" not in captured["format"]
+
+
+def test_creator_crawl_recursively_expands_collections_and_deduplicates(monkeypatch) -> None:
+    home = "https://space.bilibili.com/123/video"
+    collection = "https://space.bilibili.com/123/lists/99?type=season"
+    payloads = {
+        home: {
+            "entries": [
+                {"id": "BV1xx411c7mD", "title": "菜谱一", "uploader": "厨师"},
+                {"url": collection, "title": "隐藏合集"},
+            ]
+        },
+        collection: {
+            "entries": [
+                {"id": "BV1xx411c7mD", "title": "重复"},
+                {"webpage_url": "https://www.bilibili.com/video/BV1ab411c7mE", "title": "菜谱二"},
+            ]
+        },
+    }
+
+    class _YDL:
+        def __init__(self, _opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, url, download=False):
+            return payloads[url]
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", types.SimpleNamespace(YoutubeDL=_YDL))
+
+    result = downloader.crawl_creator_videos(home, cookies="cookies.txt")
+
+    assert result.complete is True
+    assert result.uploader == "厨师"
+    assert [video.bvid for video in result.videos] == ["BV1xx411c7mD", "BV1ab411c7mE"]
+
+
+def test_creator_crawl_marks_nested_failure_incomplete(monkeypatch) -> None:
+    home = "https://space.bilibili.com/123/video"
+    collection = "https://space.bilibili.com/123/lists/99?type=season"
+
+    class _YDL:
+        def __init__(self, _opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def extract_info(self, url, download=False):
+            if url == home:
+                return {"entries": [{"url": collection}]}
+            raise RuntimeError("blocked")
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", types.SimpleNamespace(YoutubeDL=_YDL))
+
+    result = downloader.crawl_creator_videos(home, cookies="cookies.txt")
+
+    assert result.complete is False
+    assert "blocked" in result.warnings[0]
+
+
+def _cookie(name: str, value: str, domain: str) -> Cookie:
+    return Cookie(
+        version=0,
+        name=name,
+        value=value,
+        port=None,
+        port_specified=False,
+        domain=domain,
+        domain_specified=True,
+        domain_initial_dot=domain.startswith("."),
+        path="/",
+        path_specified=True,
+        secure=True,
+        expires=None,
+        discard=True,
+        comment=None,
+        comment_url=None,
+        rest={},
+    )
+
+
+def test_import_edge_cookies_filters_domains_and_sets_private_mode(monkeypatch, tmp_path) -> None:
+    import yt_dlp
+
+    jar = CookieJar()
+    jar.set_cookie(_cookie("SESSDATA", "secret", ".bilibili.com"))
+    jar.set_cookie(_cookie("other", "do-not-save", ".example.com"))
+
+    class _YDL:
+        def __init__(self, _opts):
+            self.cookiejar = jar
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _YDL)
+    monkeypatch.setattr(downloader, "validate_bilibili_cookie_file", lambda _path: True)
+
+    path = downloader.import_edge_cookies(project_root=tmp_path)
+    content = path.read_text(encoding="utf-8")
+
+    assert "bilibili.com" in content
+    assert "example.com" not in content
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_failed_edge_cookie_validation_preserves_previous_file(monkeypatch, tmp_path) -> None:
+    import yt_dlp
+
+    destination = downloader.imported_cookie_path(tmp_path)
+    destination.parent.mkdir(parents=True)
+    destination.write_text("previous-cookie-file", encoding="utf-8")
+    jar = CookieJar()
+    jar.set_cookie(_cookie("SESSDATA", "new-secret", ".bilibili.com"))
+
+    class _YDL:
+        def __init__(self, _opts):
+            self.cookiejar = jar
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _YDL)
+    monkeypatch.setattr(downloader, "validate_bilibili_cookie_file", lambda _path: False)
+
+    with pytest.raises(RuntimeError, match="登录态无效"):
+        downloader.import_edge_cookies(project_root=tmp_path)
+
+    assert destination.read_text(encoding="utf-8") == "previous-cookie-file"
