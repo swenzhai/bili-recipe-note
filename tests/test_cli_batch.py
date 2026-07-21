@@ -143,3 +143,62 @@ def test_cli_rejects_batch_only_flags_without_batch_mode() -> None:
     with pytest.raises(ValueError, match="Batch-only"):
         cli.run(args)
 
+
+def test_cli_exports_and_imports_handoff_without_ui(monkeypatch, tmp_path: Path, capsys) -> None:
+    source_root = tmp_path / "source"
+    destination_root = tmp_path / "destination"
+    transfer_dir = tmp_path / "transfer"
+    source_root.mkdir()
+    destination_root.mkdir()
+    transfer_dir.mkdir()
+
+    monkeypatch.chdir(source_root)
+    create_batch_state(
+        ["https://www.bilibili.com/video/BV1handoff"],
+        {"target_stage": "raw", "out": "outputs", "cookies": "secret.txt"},
+        batch_id="cli-handoff",
+    )
+    export_args = cli.build_parser().parse_args(
+        [
+            "--export-handoff",
+            "cli-handoff",
+            "--out",
+            "outputs",
+            "--handoff-destination",
+            str(transfer_dir),
+        ]
+    )
+
+    assert cli.run(export_args) == 0
+    bundles = list(transfer_dir.glob("cli-handoff-*.handoff.zip"))
+    assert len(bundles) == 1
+    assert capsys.readouterr().out.rstrip().endswith(f"HANDOFF_PATH={bundles[0]}")
+
+    monkeypatch.chdir(destination_root)
+    import_args = cli.build_parser().parse_args(
+        ["--import-handoff", str(bundles[0]), "--out", "restored-outputs"]
+    )
+
+    assert cli.run(import_args) == 0
+    assert capsys.readouterr().out.rstrip().endswith("BATCH_ID=cli-handoff")
+    restored = load_batch_state("cli-handoff", project_root=destination_root)
+    assert [item.url for item in restored.items] == ["https://www.bilibili.com/video/BV1handoff"]
+    assert restored.items[0].status == "pending"
+    assert restored.options["out"] == str((destination_root / "restored-outputs").resolve())
+    assert "cookies" not in restored.options
+
+
+def test_cli_rejects_handoff_destination_without_export() -> None:
+    args = cli.build_parser().parse_args(["--list-batches", "--handoff-destination", "/tmp/export"])
+
+    with pytest.raises(ValueError, match="requires --export-handoff"):
+        cli.run(args)
+
+
+def test_cli_rejects_export_handoff_with_video_input() -> None:
+    args = cli.build_parser().parse_args(
+        ["https://example.com/BV1", "--export-handoff", "demo"]
+    )
+
+    with pytest.raises(ValueError, match="does not accept video URLs"):
+        cli.run(args)

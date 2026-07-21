@@ -80,6 +80,7 @@ echo "Press Ctrl+C in this window to stop the server."
 echo
 
 API_LOG=".venv/mobile-api.log"
+UI_LOG=".venv/ui.log"
 API_PID=""
 cleanup_api() {
     if [ -n "$API_PID" ] && kill -0 "$API_PID" >/dev/null 2>&1; then
@@ -114,10 +115,29 @@ if [ "$API_READY" -ne 1 ]; then
     exit 1
 fi
 
-"$PYTHON_EXE" -m streamlit run bili_recipe_notes/ui.py \
-    --server.address=127.0.0.1 \
-    --browser.serverAddress=127.0.0.1 \
-    --server.headless=false
+export ARROW_DEFAULT_MEMORY_POOL="system"
+UI_RESTART_COUNT=0
+UI_MAX_RESTARTS=3
+while true; do
+    "$PYTHON_EXE" -m streamlit run bili_recipe_notes/ui.py \
+        --server.address=127.0.0.1 \
+        --browser.serverAddress=127.0.0.1 \
+        --server.headless=false 2>&1 | tee -a "$UI_LOG"
+    UI_STATUS=${PIPESTATUS[0]}
+    if [ "$UI_STATUS" -eq 0 ] || [ "$UI_STATUS" -eq 130 ] || [ "$UI_STATUS" -eq 143 ]; then
+        break
+    fi
+    UI_RESTART_COUNT=$((UI_RESTART_COUNT + 1))
+    if [ "$UI_RESTART_COUNT" -gt "$UI_MAX_RESTARTS" ]; then
+        echo "UI stopped repeatedly. Recent log output:"
+        tail -n 60 "$UI_LOG" 2>/dev/null || true
+        break
+    fi
+    echo
+    echo "UI process exited unexpectedly (status $UI_STATUS). Restarting in 2 seconds..."
+    echo "Diagnostic log: $(pwd)/$UI_LOG"
+    sleep 2
+done
 
 cleanup_api
 trap - EXIT INT TERM

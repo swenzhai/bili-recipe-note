@@ -203,6 +203,7 @@ STEP_COLUMNS = (
     "screenshot_path",
 )
 FLASH_STATE_KEY = "_ui_flash_message"
+LARGE_TABLE_PAGE_SIZE = 50
 
 
 def _optional_text(value: str | None) -> str | None:
@@ -216,6 +217,34 @@ def _clean_error(exc: Exception) -> str:
 
 def _render_paths(paths: list[Path]) -> str:
     return "\n".join(str(path) for path in paths)
+
+
+def _paged_values(st, values: list[Any], *, key: str, page_size: int = LARGE_TABLE_PAGE_SIZE) -> tuple[list[Any], int]:
+    """Limit each Arrow table conversion to a small, predictable page."""
+
+    if len(values) <= page_size:
+        return values, 0
+    page_count = math.ceil(len(values) / page_size)
+    page = st.selectbox(
+        "表格页码",
+        list(range(page_count)),
+        format_func=lambda index: f"第 {index + 1}/{page_count} 页",
+        key=key,
+    )
+    start = int(page) * page_size
+    st.caption(f"当前显示第 {start + 1}–{min(start + page_size, len(values))} 条，共 {len(values)} 条。")
+    return values[start : start + page_size], start
+
+
+def _stabilize_arrow_memory_pool() -> None:
+    """Avoid the mimalloc path implicated in native Arrow crashes on macOS/Python 3.14."""
+
+    try:
+        import pyarrow as pa
+
+        pa.set_memory_pool(pa.system_memory_pool())
+    except Exception:
+        pass
 
 
 def _local_markdown_image(base_dir: Path, raw_path: str) -> Path | None:
@@ -1224,6 +1253,7 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
 def main() -> None:
     import streamlit as st
 
+    _stabilize_arrow_memory_pool()
     st.set_page_config(page_title="Bili Recipe Notes", layout="wide")
     st.title("Bili Recipe Notes")
     _show_pending_notice(st)
@@ -1312,6 +1342,7 @@ def main() -> None:
         ]
         st.caption(f"共 {len(filtered)} 条")
         if filtered:
+            visible_history, _ = _paged_values(st, filtered, key="history_table_page")
             st.dataframe(
                 [
                     {
@@ -1332,7 +1363,7 @@ def main() -> None:
                         "完成时间": item.finished_at or "",
                         "目录": str(item.output_folder),
                     }
-                    for item in filtered
+                    for item in visible_history
                 ],
                 width="stretch",
             )
@@ -1796,7 +1827,12 @@ def main() -> None:
                     st.info(f"{status_text}；启动时间：{background.started_at}")
                 if st.button("刷新批次进度", key=f"refresh_batch_{selected_batch_id}"):
                     st.rerun()
-                st.dataframe([_batch_item_row(item) for item in selected_state.items], width="stretch")
+                visible_batch_items, _ = _paged_values(
+                    st,
+                    selected_state.items,
+                    key=f"batch_table_page_{selected_batch_id}",
+                )
+                st.dataframe([_batch_item_row(item) for item in visible_batch_items], width="stretch")
                 batch_log = read_batch_log(selected_batch_id)
                 if batch_log:
                     st.text_area("后台运行日志（最新）", value=batch_log, height=220, disabled=True)
@@ -2887,19 +2923,56 @@ def main() -> None:
                 value=False,
                 key=f"creator_partial_{crawl.uid}",
             )
+            result_version = archive_result.manifest_path.stat().st_mtime_ns
+            selection_key = f"creator_selected_{crawl.uid}_{result_version}"
+            revision_key = f"creator_selection_revision_{crawl.uid}_{result_version}"
+            if selection_key not in st.session_state:
+                st.session_state[selection_key] = [video.url for video in crawl.videos]
+                st.session_state[revision_key] = 0
+            selected_set = set(st.session_state[selection_key])
+            select_all_col, clear_all_col = st.columns(2)
+            with select_all_col:
+                if st.button("全选全部视频", key=f"creator_select_all_{crawl.uid}_{result_version}"):
+                    st.session_state[selection_key] = [video.url for video in crawl.videos]
+                    st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
+                    st.rerun()
+            with clear_all_col:
+                if st.button("清空全部选择", key=f"creator_clear_all_{crawl.uid}_{result_version}"):
+                    st.session_state[selection_key] = []
+                    st.session_state[revision_key] = int(st.session_state.get(revision_key, 0)) + 1
+                    st.rerun()
+            visible_videos, page_start = _paged_values(
+                st,
+                list(crawl.videos),
+                key=f"creator_table_page_{crawl.uid}_{result_version}",
+            )
             rows = [
-                {"选择": True, "标题": video.title, "BV": video.bvid, "URL": video.url}
-                for video in crawl.videos
+                {"选择": video.url in selected_set, "标题": video.title, "BV": video.bvid, "URL": video.url}
+                for video in visible_videos
             ]
             edited_rows = st.data_editor(
                 rows,
                 hide_index=True,
                 disabled=["标题", "BV", "URL"],
                 width="stretch",
-                key=f"creator_videos_{crawl.uid}_{archive_result.manifest_path.stat().st_mtime_ns}",
+                key=(
+                    f"creator_videos_{crawl.uid}_{result_version}_{page_start}_"
+                    f"{st.session_state.get(revision_key, 0)}"
+                ),
             )
-            selected_urls = [str(row["URL"]) for row in edited_rows if row.get("选择")]
-            st.caption(f"已选择 {len(selected_urls)} / {len(rows)} 个视频；链接文档仍保留全部视频。")
+            for row in edited_rows:
+                url = str(row.get("URL") or "")
+                if not url:
+                    continue
+                if row.get("选择"):
+                    selected_set.add(url)
+                else:
+                    selected_set.discard(url)
+            selected_urls = [video.url for video in crawl.videos if video.url in selected_set]
+            st.session_state[selection_key] = selected_urls
+            st.caption(
+                f"已选择 {len(selected_urls)} / {len(crawl.videos)} 个视频；链接文档仍保留全部视频。"
+            )
             creator_target_label = st.radio(
                 "立即运行时的目标阶段",
                 ["仅形成原始版", "生成完整菜谱版"],

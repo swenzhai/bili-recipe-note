@@ -76,6 +76,9 @@ python -m bili_recipe_notes "https://www.bilibili.com/video/BVxxxx"
 - `--create-only`（只创建 pending 批次，不执行下载、字幕、Whisper 或 LLM）
 - `--resume-batch ID` / `--retry-batch ID`（继续未完成阶段 / 只重试失败阶段）
 - `--list-batches` / `--show-batch ID`（查看批次列表或逐条状态）
+- `--export-handoff ID`（把批次和已完成工作导出为跨平台交接包）
+- `--import-handoff PATH`（校验并导入 `.handoff.zip`）
+- `--handoff-destination PATH`（指定交接包导出文件或目录）
 
 提取博主全部视频链接示例：
 
@@ -192,9 +195,18 @@ python -m bili_recipe_notes `
 
 ### 本地 UI
 
-安装依赖后可启动本地 Web UI：
+安装依赖后可启动本地 Web UI。macOS/Linux 直接运行时建议在 PyArrow 导入前选择系统内存池：
+
+```bash
+ARROW_DEFAULT_MEMORY_POOL=system python -m streamlit run bili_recipe_notes/ui.py \
+  --server.address=127.0.0.1 \
+  --browser.serverAddress=127.0.0.1
+```
+
+Windows PowerShell：
 
 ```powershell
+$env:ARROW_DEFAULT_MEMORY_POOL = "system"
 python -m streamlit run bili_recipe_notes/ui.py --server.address=127.0.0.1 --browser.serverAddress=127.0.0.1
 ```
 
@@ -204,6 +216,8 @@ python -m streamlit run bili_recipe_notes/ui.py --server.address=127.0.0.1 --bro
 - macOS: `start-ui-mac.command`
 
 macOS 直接双击 `start-ui-mac.command` 即可。首次打开会自动在项目目录创建隔离的 `.venv` 并安装依赖，可能需要几分钟；以后双击会直接启动并打开浏览器，不会把依赖安装到 Conda base 环境。
+
+macOS 启动器会自动设置稳定的 Arrow 内存池，把 Whisper 批处理放在独立进程，并在 UI 意外退出时最多自动重启 3 次。UI 诊断日志保存在 `.venv/ui.log`，手机 API 日志保存在 `.venv/mobile-api.log`。后台批次拥有独立 PID 和持久状态，即使网页刷新或 UI 重启也会继续运行。
 
 如果从压缩包或网络下载后 macOS 丢失了执行权限，运行一次：
 
@@ -313,7 +327,7 @@ outputs/creators/<UID>-<UP名称>/
 
 抓取后可以默认全选并排除少量非菜谱视频；链接文档始终保留抓到的全部视频，批次只包含最终勾选项。可以仅创建待执行批次，不立即下载字幕或调用 LLM。
 
-### 在 Mac 与 Windows 间交接工作
+### 在 Mac、Windows 与 Linux 间交接工作
 
 UI 的“工作交接”页面可以把一个批次导出为 `.handoff.zip`。交接包会保存：
 
@@ -325,6 +339,36 @@ UI 的“工作交接”页面可以把一个批次导出为 `.handoff.zip`。�
 交接包不会保存 Bilibili Cookie、临时音频/视频、Obsidian 本机归档路径或原电脑绝对路径。导入另一台电脑后，文件路径会自动映射到当前“输出目录”；完成度较低的传入结果不会覆盖更完整的本地结果，同等完成度采用传入版本并在覆盖前保留 `.bak`。然后到“批量处理”选择该批次，点击“继续未完成”即可从已有阶段继续。
 
 推荐的实际用法：在 Mac 导出后用 AirDrop、U 盘、局域网共享或网盘传送 ZIP；Windows 处理完成后再导出同一批次并传回 Mac。每台电脑都需要单独安装运行环境，并在需要访问登录态视频时从本机 Edge 重新导入 Cookie。大于 200 MB 的交接包建议直接传文件，不通过浏览器下载按钮。
+
+Linux 服务器不需要启动 UI。导入交接包：
+
+```bash
+python -m bili_recipe_notes \
+  --import-handoff /srv/transfer/my-recipes.handoff.zip \
+  --out outputs
+```
+
+成功后最后一行会输出 `BATCH_ID=<批次ID>`。查看并继续运行：
+
+```bash
+python -m bili_recipe_notes --show-batch my-recipes
+python -m bili_recipe_notes \
+  --resume-batch my-recipes \
+  --target-stage recipe \
+  --cookies /srv/secrets/bilibili.txt \
+  --whisper-model medium
+```
+
+处理完成后从 Linux 导出到共享目录：
+
+```bash
+python -m bili_recipe_notes \
+  --export-handoff my-recipes \
+  --out outputs \
+  --handoff-destination /srv/transfer/out
+```
+
+成功后最后一行会输出 `HANDOFF_PATH=<交接包路径>`，可把该文件传回 Mac 或另一台服务器继续导入。同一批次在两台电脑上合并时仍采用前述完成度规则，Cookie 不会进入交接包。
 
 个人厨艺知识库会保存到：
 

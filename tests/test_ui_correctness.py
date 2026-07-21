@@ -7,7 +7,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from bili_recipe_notes import ui
-from bili_recipe_notes.batch_queue import BatchQueueItem, BatchQueueState
+from bili_recipe_notes.batch_queue import BatchQueueItem, BatchQueueState, create_batch_state
 
 
 def _recipe(title: str, *, ingredients: list[dict] | None = None, seasonings: list[dict] | None = None) -> dict:
@@ -368,3 +368,25 @@ def test_batch_results_keep_per_item_edit_review_and_archive_actions(monkeypatch
 
     labels = {button.label for button in at.button}
     assert {"编辑这条", "审核这条", "直接归档这条", "归档本批次全部已完成草稿"} <= labels
+
+
+def test_large_batch_remains_paged_while_switching_pages(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    create_batch_state(
+        [f"https://www.bilibili.com/video/BV{index:010d}" for index in range(1206)],
+        {},
+        batch_id="large-ui-batch",
+        project_root=tmp_path,
+    )
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at.selectbox(key="main_page").set_value("批量处理")
+    at.run()
+    at.selectbox(key="batch_select").set_value("large-ui-batch")
+    at.run()
+
+    assert not at.exception
+    assert at.selectbox(key="batch_table_page_large-ui-batch") is not None
+    for page in ("环境检查", "草稿与归档", "批量处理", "工作交接", "批量处理"):
+        at.selectbox(key="main_page").set_value(page)
+        at.run()
+        assert not at.exception

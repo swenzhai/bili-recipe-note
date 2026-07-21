@@ -15,6 +15,7 @@ from .batch_queue import (
     list_batch_states,
     load_batch_state,
 )
+from .handoff import HandoffError, export_batch_handoff, import_handoff_bundle
 from .pipeline import BatchJobOptions, RecipeJobOptions, extract_creator_links, generate_recipe_note, run_batch
 
 console = Console()
@@ -54,12 +55,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--creator-home", action="store_true", help="Treat URL as creator homepage and extract all video links")
     parser.add_argument("--creator-links-file", default="creator_video_links.txt")
-    batch_mode = parser.add_mutually_exclusive_group()
-    batch_mode.add_argument("--batch", action="store_true", help="Create and synchronously run a persistent batch")
-    batch_mode.add_argument("--resume-batch", metavar="BATCH_ID", help="Continue missing stages in an existing batch")
-    batch_mode.add_argument("--retry-batch", metavar="BATCH_ID", help="Retry only failed stages in an existing batch")
-    batch_mode.add_argument("--show-batch", metavar="BATCH_ID", help="Show one persisted batch and exit")
-    batch_mode.add_argument("--list-batches", action="store_true", help="List persisted batches and exit")
+    action_mode = parser.add_mutually_exclusive_group()
+    action_mode.add_argument("--batch", action="store_true", help="Create and synchronously run a persistent batch")
+    action_mode.add_argument("--resume-batch", metavar="BATCH_ID", help="Continue missing stages in an existing batch")
+    action_mode.add_argument("--retry-batch", metavar="BATCH_ID", help="Retry only failed stages in an existing batch")
+    action_mode.add_argument("--show-batch", metavar="BATCH_ID", help="Show one persisted batch and exit")
+    action_mode.add_argument("--list-batches", action="store_true", help="List persisted batches and exit")
+    action_mode.add_argument(
+        "--export-handoff",
+        metavar="BATCH_ID",
+        help="Export one batch and its durable work files as a portable handoff ZIP",
+    )
+    action_mode.add_argument(
+        "--import-handoff",
+        metavar="ZIP_PATH",
+        help="Validate and import a handoff ZIP into this project",
+    )
+    parser.add_argument(
+        "--handoff-destination",
+        metavar="PATH",
+        default=None,
+        help="Destination ZIP or directory for --export-handoff (default: OUT/handoffs)",
+    )
     parser.add_argument(
         "--batch-url",
         action="append",
@@ -266,7 +283,57 @@ def _run_batch_mode(args: argparse.Namespace, extra_instructions: str | None) ->
     return 1 if failed else 0
 
 
+def _run_handoff_mode(args: argparse.Namespace) -> int:
+    export_batch_id = getattr(args, "export_handoff", None)
+    import_path = getattr(args, "import_handoff", None)
+    destination = getattr(args, "handoff_destination", None)
+    supplied_urls = bool(
+        getattr(args, "url", None) or getattr(args, "batch_url", None) or getattr(args, "batch_file", None)
+    )
+    if supplied_urls:
+        raise ValueError("Handoff import/export does not accept video URLs or --batch-file")
+    if getattr(args, "creator_home", False):
+        raise ValueError("--creator-home cannot be combined with handoff import/export")
+    if getattr(args, "batch_id", None) or getattr(args, "create_only", False):
+        raise ValueError("Handoff import/export does not accept --batch-id or --create-only")
+    if import_path:
+        if destination:
+            raise ValueError("--handoff-destination can only be used with --export-handoff")
+        result = import_handoff_bundle(import_path, getattr(args, "out", "outputs"))
+        console.print(
+            f"[green]Handoff imported:[/green] {result.batch_id} | items={result.item_count} "
+            f"| recipe={result.recipe_count} | raw={result.raw_count} | pending={result.pending_count}"
+        )
+        if result.backup_count:
+            console.print(f"Existing files backed up before merge: {result.backup_count}")
+        # Keep the final line unstyled and unwrapped so shell scripts can parse it reliably.
+        print(f"BATCH_ID={result.batch_id}")
+        return 0
+    if export_batch_id:
+        result = export_batch_handoff(
+            export_batch_id,
+            getattr(args, "out", "outputs"),
+            destination=destination,
+        )
+        console.print(
+            f"[green]Handoff exported:[/green] {result.batch_id} | items={result.item_count} "
+            f"| recipe={result.recipe_count} | raw={result.raw_count} | size={result.size_bytes} bytes"
+        )
+        # Keep the final line unstyled and unwrapped so shell scripts can parse it reliably.
+        print(f"HANDOFF_PATH={result.path}")
+        return 0
+    raise ValueError("Choose --import-handoff or --export-handoff")
+
+
 def run(args: argparse.Namespace) -> int:
+    handoff_requested = bool(
+        getattr(args, "export_handoff", None) or getattr(args, "import_handoff", None)
+    )
+    if handoff_requested:
+        return _run_handoff_mode(args)
+    if getattr(args, "handoff_destination", None):
+        raise ValueError("--handoff-destination requires --export-handoff")
+
     batch_requested = any(
         (
             getattr(args, "batch", False),
@@ -320,6 +387,6 @@ def main() -> int:
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted. Persisted batch progress can be continued with --resume-batch.[/yellow]")
         return 130
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError, HandoffError) as exc:
         console.print(f"[red]Error: {exc}[/red]")
         return 2
