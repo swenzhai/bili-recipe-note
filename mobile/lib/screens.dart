@@ -112,14 +112,22 @@ class _PairingScreenState extends State<PairingScreen> {
   );
 }
 
-class HomeScreen extends StatelessWidget {
+class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.controller});
   final AppController controller;
 
   @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  int destination = 0;
+
+  @override
   Widget build(BuildContext context) => AnimatedBuilder(
-    animation: controller,
+    animation: widget.controller,
     builder: (context, _) {
+      final controller = widget.controller;
       final categories = {
         '',
         ...controller.recipes.map((recipe) => recipe.category),
@@ -134,7 +142,7 @@ class HomeScreen extends StatelessWidget {
       }.toList();
       return Scaffold(
         appBar: AppBar(
-          title: const Text('我的菜谱'),
+          title: Text(destination == 0 ? '我的菜谱' : '本餐点菜'),
           actions: [
             IconButton(
               onPressed: controller.syncing ? null : controller.synchronize,
@@ -162,116 +170,177 @@ class HomeScreen extends StatelessWidget {
             ),
           ],
         ),
-        body: Column(
-          children: [
-            Material(
-              color: controller.syncError == null
-                  ? Theme.of(context).colorScheme.secondaryContainer
-                  : Theme.of(context).colorScheme.errorContainer,
-              child: ListTile(
-                dense: true,
-                leading: controller.syncing
-                    ? const SizedBox.square(
-                        dimension: 20,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : Icon(
-                        controller.syncError == null
-                            ? Icons.cloud_done
-                            : Icons.cloud_off,
-                      ),
-                title: Text(
-                  controller.syncing
-                      ? '正在同步…'
-                      : controller.syncError != null
-                      ? '离线使用 · ${controller.syncError}'
-                      : controller.lastSync == null
-                      ? '本地缓存'
-                      : '上次同步 ${_clock(controller.lastSync!)}',
-                ),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
-              child: TextField(
-                onChanged: controller.setSearch,
-                decoration: const InputDecoration(
-                  prefixIcon: Icon(Icons.search),
-                  hintText: '标题、食材、步骤、技巧…',
-                ),
-              ),
-            ),
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Row(
+        body: destination == 0
+            ? Column(
                 children: [
-                  _filter(
-                    '分类',
-                    categories,
-                    controller.category,
-                    (value) => controller.setFilters(category: value),
-                  ),
-                  const SizedBox(width: 10),
-                  _filter(
-                    '菜系',
-                    cuisines,
-                    controller.cuisine,
-                    (value) => controller.setFilters(cuisine: value),
-                  ),
-                  const SizedBox(width: 10),
-                  _filter(
-                    '标签',
-                    tags,
-                    controller.tag,
-                    (value) => controller.setFilters(tag: value),
-                  ),
-                ],
-              ),
-            ),
-            Expanded(
-              child: controller.recipes.isEmpty
-                  ? const Center(
-                      child: Padding(
-                        padding: EdgeInsets.all(24),
-                        child: Text('本地没有匹配菜谱。首次使用请连接 Mac 完成同步。'),
-                      ),
-                    )
-                  : RefreshIndicator(
-                      onRefresh: controller.synchronize,
-                      child: ListView.separated(
-                        padding: const EdgeInsets.all(16),
-                        itemCount: controller.recipes.length,
-                        separatorBuilder: (_, _) => const SizedBox(height: 8),
-                        itemBuilder: (context, index) {
-                          final recipe = controller.recipes[index];
-                          return Card(
-                            child: ListTile(
-                              title: Text(recipe.title),
-                              subtitle: Text(
-                                [
-                                      recipe.category,
-                                      recipe.cuisine,
-                                      recipe.totalTime,
-                                    ]
-                                    .where((value) => value.isNotEmpty)
-                                    .join(' · '),
-                              ),
-                              trailing: const Icon(Icons.chevron_right),
-                              onTap: () => Navigator.push(
-                                context,
-                                MaterialPageRoute(
-                                  builder: (_) => RecipeDetailScreen(
-                                    controller: controller,
-                                    recipe: recipe,
-                                  ),
-                                ),
-                              ),
+                  Material(
+                    color: controller.syncError == null
+                        ? Theme.of(context).colorScheme.secondaryContainer
+                        : Theme.of(context).colorScheme.errorContainer,
+                    child: ListTile(
+                      dense: true,
+                      leading: controller.syncing
+                          ? const SizedBox.square(
+                              dimension: 20,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : Icon(
+                              controller.syncError == null
+                                  ? Icons.cloud_done
+                                  : Icons.cloud_off,
                             ),
-                          );
-                        },
+                      title: Text(
+                        controller.syncing
+                            ? '正在同步…'
+                            : controller.syncError != null
+                            ? '离线使用 · ${controller.syncError}'
+                            : controller.lastSync == null
+                            ? '本地缓存'
+                            : '上次同步 ${_clock(controller.lastSync!)}',
                       ),
                     ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
+                    child: TextField(
+                      onChanged: controller.setSearch,
+                      decoration: const InputDecoration(
+                        prefixIcon: Icon(Icons.search),
+                        hintText: '标题、食材、步骤、技巧…',
+                      ),
+                    ),
+                  ),
+                  SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Row(
+                      children: [
+                        _filter(
+                          '分类',
+                          categories,
+                          controller.category,
+                          (value) => controller.setFilters(category: value),
+                        ),
+                        const SizedBox(width: 10),
+                        _filter(
+                          '菜系',
+                          cuisines,
+                          controller.cuisine,
+                          (value) => controller.setFilters(cuisine: value),
+                        ),
+                        const SizedBox(width: 10),
+                        _filter(
+                          '标签',
+                          tags,
+                          controller.tag,
+                          (value) => controller.setFilters(tag: value),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Expanded(
+                    child: controller.recipes.isEmpty
+                        ? const Center(
+                            child: Padding(
+                              padding: EdgeInsets.all(24),
+                              child: Text('本地没有匹配菜谱。首次使用请连接 Mac 完成同步。'),
+                            ),
+                          )
+                        : RefreshIndicator(
+                            onRefresh: controller.synchronize,
+                            child: ListView.separated(
+                              padding: const EdgeInsets.all(16),
+                              itemCount: controller.recipes.length,
+                              separatorBuilder: (_, _) =>
+                                  const SizedBox(height: 8),
+                              itemBuilder: (context, index) {
+                                final recipe = controller.recipes[index];
+                                return Card(
+                                  child: ListTile(
+                                    title: Text(recipe.title),
+                                    subtitle: Text(
+                                      [
+                                            recipe.category,
+                                            recipe.cuisine,
+                                            recipe.totalTime,
+                                          ]
+                                          .where((value) => value.isNotEmpty)
+                                          .join(' · '),
+                                    ),
+                                    trailing: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        IconButton(
+                                          key: ValueKey(
+                                            'add-meal-${recipe.id}',
+                                          ),
+                                          onPressed:
+                                              controller.isRecipeInMeal(
+                                                recipe.id,
+                                              )
+                                              ? null
+                                              : () => _addToMeal(
+                                                  context,
+                                                  controller,
+                                                  recipe,
+                                                ),
+                                          icon: Icon(
+                                            controller.isRecipeInMeal(recipe.id)
+                                                ? Icons.check_circle
+                                                : Icons.add_circle_outline,
+                                          ),
+                                          tooltip:
+                                              controller.isRecipeInMeal(
+                                                recipe.id,
+                                              )
+                                              ? '已加入本餐'
+                                              : '加入本餐',
+                                        ),
+                                        const Icon(Icons.chevron_right),
+                                      ],
+                                    ),
+                                    onTap: () => Navigator.push(
+                                      context,
+                                      MaterialPageRoute(
+                                        builder: (_) => RecipeDetailScreen(
+                                          controller: controller,
+                                          recipe: recipe,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                  ),
+                ],
+              )
+            : MealOrderView(
+                controller: controller,
+                onBrowseRecipes: () => setState(() => destination = 0),
+              ),
+        bottomNavigationBar: NavigationBar(
+          selectedIndex: destination,
+          onDestinationSelected: (value) => setState(() => destination = value),
+          destinations: [
+            const NavigationDestination(
+              icon: Icon(Icons.menu_book_outlined),
+              selectedIcon: Icon(Icons.menu_book),
+              label: '菜谱',
+            ),
+            NavigationDestination(
+              icon: Badge(
+                isLabelVisible: controller.mealItemCount > 0,
+                label: Text('${controller.mealItemCount}'),
+                child: const Icon(Icons.room_service_outlined),
+              ),
+              selectedIcon: Badge(
+                isLabelVisible: controller.mealItemCount > 0,
+                label: Text('${controller.mealItemCount}'),
+                child: const Icon(Icons.room_service),
+              ),
+              label: '本餐',
             ),
           ],
         ),
@@ -297,7 +366,25 @@ class HomeScreen extends StatelessWidget {
         ],
       ),
     );
-    if (confirmed == true) await controller.unpair();
+    if (confirmed == true) await widget.controller.unpair();
+  }
+
+  Future<void> _addToMeal(
+    BuildContext context,
+    AppController controller,
+    RecipeSummary recipe,
+  ) async {
+    final added = await controller.addRecipeToMeal(recipe);
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(added ? '已将“${recipe.title}”加入本餐' : '这道菜已经在本餐中'),
+        action: SnackBarAction(
+          label: '查看',
+          onPressed: () => setState(() => destination = 1),
+        ),
+      ),
+    );
   }
 
   Widget _filter(
@@ -324,6 +411,272 @@ class HomeScreen extends StatelessWidget {
       onChanged: (value) => onChanged(value ?? ''),
     ),
   );
+}
+
+class MealOrderView extends StatefulWidget {
+  const MealOrderView({
+    super.key,
+    required this.controller,
+    required this.onBrowseRecipes,
+  });
+
+  final AppController controller;
+  final VoidCallback onBrowseRecipes;
+
+  @override
+  State<MealOrderView> createState() => _MealOrderViewState();
+}
+
+class _MealOrderViewState extends State<MealOrderView> {
+  final checkedShoppingItems = <String>{};
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = widget.controller;
+    final order = controller.mealOrder;
+    if (order == null || controller.mealItems.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.room_service_outlined,
+                size: 72,
+                color: Theme.of(context).colorScheme.outline,
+              ),
+              const SizedBox(height: 16),
+              Text('本餐还没有菜', style: Theme.of(context).textTheme.headlineSmall),
+              const SizedBox(height: 8),
+              const Text('从菜谱列表选择想吃的菜，系统会自动汇总采购清单。'),
+              const SizedBox(height: 20),
+              FilledButton.icon(
+                onPressed: widget.onBrowseRecipes,
+                icon: const Icon(Icons.add),
+                label: const Text('去点菜'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    final isCooking = order.status == MealOrderStatus.cooking;
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 28),
+      children: [
+        Card(
+          color: Theme.of(context).colorScheme.primaryContainer,
+          child: ListTile(
+            leading: const Icon(Icons.today),
+            title: Text('${order.title} · ${controller.mealItemCount} 道菜'),
+            subtitle: Text(
+              isCooking
+                  ? '正在做饭 · 已完成 ${controller.completedMealItemCount} 道'
+                  : '${order.mealDate} · 调整份量后再开始做饭',
+            ),
+            trailing: IconButton(
+              onPressed: () => _confirmClearMeal(context),
+              icon: const Icon(Icons.delete_sweep_outlined),
+              tooltip: '清空本餐',
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        ...controller.mealItems.map(
+          (item) => _mealItemCard(context, item, isCooking),
+        ),
+        const SizedBox(height: 18),
+        Text('采购清单', style: Theme.of(context).textTheme.headlineSmall),
+        const SizedBox(height: 4),
+        Text(
+          '相同食材和相同单位会自动合并；复杂用量保留原文。',
+          style: Theme.of(context).textTheme.bodySmall,
+        ),
+        const SizedBox(height: 8),
+        Card(
+          child: Column(
+            children: controller.shoppingList.map((entry) {
+              final key = '${entry.name}\u0000${entry.amount}';
+              return CheckboxListTile(
+                value: checkedShoppingItems.contains(key),
+                onChanged: (checked) => setState(() {
+                  if (checked == true) {
+                    checkedShoppingItems.add(key);
+                  } else {
+                    checkedShoppingItems.remove(key);
+                  }
+                }),
+                title: Text(entry.name),
+                subtitle: Text(entry.recipeTitles.join('、')),
+                secondary: Text(entry.amount),
+                controlAffinity: ListTileControlAffinity.leading,
+              );
+            }).toList(),
+          ),
+        ),
+        const SizedBox(height: 20),
+        FilledButton.icon(
+          onPressed: _startCooking,
+          icon: Icon(isCooking ? Icons.play_arrow : Icons.soup_kitchen),
+          label: Text(isCooking ? '继续做饭' : '确认菜单并开始做饭'),
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          onPressed: widget.onBrowseRecipes,
+          icon: const Icon(Icons.add),
+          label: const Text('继续点菜'),
+        ),
+      ],
+    );
+  }
+
+  Widget _mealItemCard(
+    BuildContext context,
+    MealOrderItem item,
+    bool isCooking,
+  ) => Card(
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(8, 8, 4, 8),
+      child: Column(
+        children: [
+          ListTile(
+            leading: isCooking
+                ? Checkbox(
+                    value: item.completed,
+                    onChanged: (value) => widget.controller
+                        .setMealItemCompleted(item, value ?? false),
+                  )
+                : const Icon(Icons.restaurant_menu),
+            title: Text(
+              item.recipe.title,
+              style: item.completed
+                  ? const TextStyle(decoration: TextDecoration.lineThrough)
+                  : null,
+            ),
+            subtitle: item.note.isEmpty ? null : Text(item.note),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => RecipeDetailScreen(
+                  controller: widget.controller,
+                  recipe: item.recipe,
+                ),
+              ),
+            ),
+            trailing: PopupMenuButton<String>(
+              onSelected: (action) {
+                if (action == 'note') _editNote(context, item);
+                if (action == 'remove') widget.controller.removeMealItem(item);
+              },
+              itemBuilder: (_) => const [
+                PopupMenuItem(value: 'note', child: Text('编辑备注')),
+                PopupMenuItem(value: 'remove', child: Text('移出本餐')),
+              ],
+            ),
+          ),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              const Text('份量'),
+              IconButton(
+                onPressed: item.servingsMultiplier <= 0.5
+                    ? null
+                    : () => widget.controller.setMealItemMultiplier(
+                        item,
+                        item.servingsMultiplier - 0.5,
+                      ),
+                icon: const Icon(Icons.remove_circle_outline),
+                tooltip: '减少份量',
+              ),
+              SizedBox(
+                width: 44,
+                child: Text(
+                  '${item.servingsMultiplier.toStringAsFixed(1)}×',
+                  textAlign: TextAlign.center,
+                ),
+              ),
+              IconButton(
+                onPressed: item.servingsMultiplier >= 4
+                    ? null
+                    : () => widget.controller.setMealItemMultiplier(
+                        item,
+                        item.servingsMultiplier + 0.5,
+                      ),
+                icon: const Icon(Icons.add_circle_outline),
+                tooltip: '增加份量',
+              ),
+            ],
+          ),
+        ],
+      ),
+    ),
+  );
+
+  Future<void> _editNote(BuildContext context, MealOrderItem item) async {
+    var draft = item.note;
+    final note = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('给“${item.recipe.title}”加备注'),
+        content: TextFormField(
+          initialValue: item.note,
+          autofocus: true,
+          maxLength: 200,
+          minLines: 2,
+          maxLines: 4,
+          onChanged: (value) => draft = value,
+          decoration: const InputDecoration(hintText: '例如：少辣、不要香菜'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, draft),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    if (note != null) await widget.controller.setMealItemNote(item, note);
+  }
+
+  Future<void> _startCooking() async {
+    await widget.controller.beginMealCooking();
+    if (!mounted) return;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MealCookingScreen(controller: widget.controller),
+      ),
+    );
+  }
+
+  Future<void> _confirmClearMeal(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('清空本餐？'),
+        content: const Text('已选菜品、份量和备注都会删除。菜谱本身不会受到影响。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      checkedShoppingItems.clear();
+      await widget.controller.clearMeal();
+    }
+  }
 }
 
 class RecipeDetailScreen extends StatefulWidget {
@@ -371,6 +724,17 @@ class _RecipeDetailScreenState extends State<RecipeDetailScreen> {
                 style: Theme.of(context).textTheme.titleMedium,
               ),
             ),
+          AnimatedBuilder(
+            animation: widget.controller,
+            builder: (context, _) {
+              final added = widget.controller.isRecipeInMeal(recipe.id);
+              return FilledButton.tonalIcon(
+                onPressed: added ? null : _addToMeal,
+                icon: Icon(added ? Icons.check_circle : Icons.add_circle),
+                label: Text(added ? '已加入本餐' : '加入本餐'),
+              );
+            },
+          ),
           _listSection(context, '食材', recipe.ingredients.map(_ingredient)),
           _listSection(context, '调料', recipe.seasonings.map(_ingredient)),
           Text('步骤', style: Theme.of(context).textTheme.headlineSmall),
@@ -448,6 +812,14 @@ class _RecipeDetailScreenState extends State<RecipeDetailScreen> {
       ),
     );
     if (mounted) setState(() => refresh++);
+  }
+
+  Future<void> _addToMeal() async {
+    await widget.controller.addRecipeToMeal(widget.recipe);
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('已将“${widget.recipe.title}”加入本餐')));
   }
 
   Widget _listSection(
@@ -547,9 +919,11 @@ class CookingScreen extends StatefulWidget {
     super.key,
     required this.controller,
     required this.recipe,
+    this.initialMultiplier = 1,
   });
   final AppController controller;
   final RecipeSummary recipe;
+  final double initialMultiplier;
 
   @override
   State<CookingScreen> createState() => _CookingScreenState();
@@ -557,7 +931,13 @@ class CookingScreen extends StatefulWidget {
 
 class _CookingScreenState extends State<CookingScreen> {
   int index = 0;
-  double multiplier = 1;
+  late double multiplier;
+
+  @override
+  void initState() {
+    super.initState();
+    multiplier = widget.initialMultiplier.clamp(0.5, 4).toDouble();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -621,32 +1001,35 @@ class _CookingScreenState extends State<CookingScreen> {
                 ),
               ),
             ),
-            Row(
-              children: [
-                Expanded(
-                  child: OutlinedButton(
-                    onPressed: index == 0
-                        ? null
-                        : () => setState(() => index--),
-                    child: const Text('上一步'),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: FilledButton(
-                    onPressed: () {
-                      if (index < steps.length - 1) {
-                        setState(() => index++);
-                      } else {
-                        Navigator.pop(context);
-                      }
-                    },
-                    child: Text(index == steps.length - 1 ? '完成' : '下一步'),
-                  ),
-                ),
-              ],
-            ),
           ],
+        ),
+      ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 12),
+          child: Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  onPressed: index == 0 ? null : () => setState(() => index--),
+                  child: const Text('上一步'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: FilledButton(
+                  onPressed: () {
+                    if (index < steps.length - 1) {
+                      setState(() => index++);
+                    } else {
+                      Navigator.pop(context, true);
+                    }
+                  },
+                  child: Text(index == steps.length - 1 ? '完成' : '下一步'),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -654,19 +1037,151 @@ class _CookingScreenState extends State<CookingScreen> {
 }
 
 String scaleAmount(String amount, double multiplier) {
-  if (multiplier == 1 || amount.isEmpty || ['少许', '适量'].any(amount.contains)) {
-    return amount;
+  return scaleRecipeAmount(amount, multiplier);
+}
+
+class MealCookingScreen extends StatefulWidget {
+  const MealCookingScreen({super.key, required this.controller});
+
+  final AppController controller;
+
+  @override
+  State<MealCookingScreen> createState() => _MealCookingScreenState();
+}
+
+class _MealCookingScreenState extends State<MealCookingScreen> {
+  String? selectedItemId;
+
+  @override
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: widget.controller,
+    builder: (context, _) {
+      final items = widget.controller.mealItems;
+      if (items.isEmpty) {
+        return const Scaffold(body: Center(child: Text('本餐已结束。')));
+      }
+      final incomplete = items.where((item) => !item.completed).toList();
+      final selected = items.firstWhere(
+        (item) => item.id == selectedItemId,
+        orElse: () => incomplete.isNotEmpty ? incomplete.first : items.last,
+      );
+      return Scaffold(
+        appBar: AppBar(title: const Text('本餐烹饪')),
+        body: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            LinearProgressIndicator(
+              value: items.isEmpty
+                  ? 0
+                  : widget.controller.completedMealItemCount / items.length,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '已完成 ${widget.controller.completedMealItemCount}/${items.length} 道菜',
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 16),
+            ...items.map(
+              (item) => Card(
+                color: item.id == selected.id
+                    ? Theme.of(context).colorScheme.secondaryContainer
+                    : null,
+                child: ListTile(
+                  leading: Icon(
+                    item.completed
+                        ? Icons.check_circle
+                        : Icons.radio_button_unchecked,
+                    color: item.completed
+                        ? Theme.of(context).colorScheme.primary
+                        : null,
+                  ),
+                  title: Text(item.recipe.title),
+                  subtitle: Text(
+                    [
+                      '${item.servingsMultiplier.toStringAsFixed(1)}× 份量',
+                      if (item.note.isNotEmpty) item.note,
+                    ].join(' · '),
+                  ),
+                  onTap: () => setState(() => selectedItemId = item.id),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            if (incomplete.isEmpty)
+              FilledButton.icon(
+                onPressed: _finishMeal,
+                icon: const Icon(Icons.celebration),
+                label: const Text('完成本餐'),
+              )
+            else ...[
+              Text(
+                '接下来：${selected.recipe.title}',
+                style: Theme.of(context).textTheme.headlineSmall,
+              ),
+              if (selected.note.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Text('备注：${selected.note}'),
+                ),
+              const SizedBox(height: 12),
+              FilledButton.icon(
+                onPressed: selected.completed ? null : () => _cook(selected),
+                icon: const Icon(Icons.soup_kitchen),
+                label: Text(
+                  selected.recipe.steps.isEmpty ? '标记这道菜完成' : '开始烹饪这道菜',
+                ),
+              ),
+            ],
+          ],
+        ),
+      );
+    },
+  );
+
+  Future<void> _cook(MealOrderItem item) async {
+    var completed = true;
+    if (item.recipe.steps.isNotEmpty) {
+      completed =
+          await Navigator.push<bool>(
+            context,
+            MaterialPageRoute(
+              builder: (_) => CookingScreen(
+                controller: widget.controller,
+                recipe: item.recipe,
+                initialMultiplier: item.servingsMultiplier,
+              ),
+            ),
+          ) ??
+          false;
+    }
+    if (!completed) return;
+    await widget.controller.setMealItemCompleted(item, true);
+    if (!mounted) return;
+    final incomplete = widget.controller.mealItems.where(
+      (candidate) => !candidate.completed,
+    );
+    setState(() => selectedItemId = incomplete.firstOrNull?.id);
+    if (incomplete.isEmpty) await _finishMeal();
   }
-  final matches = RegExp(r'\d+(?:\.\d+)?').allMatches(amount).toList();
-  if (matches.length != 1) return amount;
-  final match = matches.single;
-  final original = double.tryParse(match.group(0)!);
-  if (original == null) return amount;
-  final scaled = original * multiplier;
-  final text = scaled == scaled.roundToDouble()
-      ? scaled.toInt().toString()
-      : scaled.toStringAsFixed(1);
-  return amount.replaceRange(match.start, match.end, text);
+
+  Future<void> _finishMeal() async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('本餐完成'),
+        content: const Text('所有菜都已完成，辛苦了，开饭吧！'),
+        actions: [
+          FilledButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('开饭'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    await widget.controller.finishMealCooking();
+    if (mounted) Navigator.pop(context);
+  }
 }
 
 class PracticeEditor extends StatefulWidget {

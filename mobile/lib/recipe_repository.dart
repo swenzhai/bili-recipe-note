@@ -76,6 +76,83 @@ class RecipeRepository {
       database.practiceLogs(recipeId);
   Future<List<Map<String, dynamic>>> conflicts() => database.conflicts();
 
+  Future<MealOrder?> activeMealOrder() => database.activeMealOrder();
+
+  Future<List<MealOrderItem>> mealOrderItems(String orderId) =>
+      database.mealOrderItems(orderId);
+
+  Future<bool> addRecipeToMeal(RecipeSummary recipe) async {
+    var order = await database.activeMealOrder();
+    if (order == null) {
+      final now = DateTime.now().toUtc().toIso8601String();
+      order = MealOrder(
+        id: _uuid.v4(),
+        title: '本餐',
+        mealDate: DateTime.now().toIso8601String().substring(0, 10),
+        status: MealOrderStatus.draft,
+        createdAt: now,
+        updatedAt: now,
+      );
+      await database.saveMealOrder(order);
+    }
+    if (await database.mealOrderItem(order.id, recipe.id) != null) {
+      return false;
+    }
+    await database.saveMealOrderItem(
+      MealOrderItem(
+        id: _uuid.v4(),
+        orderId: order.id,
+        recipeId: recipe.id,
+        recipe: recipe,
+        servingsMultiplier: 1,
+        note: '',
+        sortOrder: await database.nextMealItemSortOrder(order.id),
+        completed: false,
+      ),
+    );
+    await _touchMealOrder(order);
+    return true;
+  }
+
+  Future<void> updateMealOrderItem(MealOrderItem item) async {
+    await database.saveMealOrderItem(item);
+    final order = await database.activeMealOrder();
+    if (order != null) await _touchMealOrder(order);
+  }
+
+  Future<void> removeMealOrderItem(MealOrderItem item) async {
+    await database.removeMealOrderItem(item.id);
+    final order = await database.activeMealOrder();
+    if (order == null) return;
+    final remaining = await database.mealOrderItems(order.id);
+    if (remaining.isEmpty) {
+      await database.deleteMealOrder(order.id);
+    } else {
+      await _touchMealOrder(order);
+    }
+  }
+
+  Future<void> clearMealOrder(MealOrder order) =>
+      database.deleteMealOrder(order.id);
+
+  Future<void> startMealOrder(MealOrder order) =>
+      _saveMealStatus(order, MealOrderStatus.cooking);
+
+  Future<void> completeMealOrder(MealOrder order) =>
+      _saveMealStatus(order, MealOrderStatus.completed);
+
+  Future<void> _saveMealStatus(MealOrder order, MealOrderStatus status) =>
+      database.saveMealOrder(
+        order.copyWith(
+          status: status,
+          updatedAt: DateTime.now().toUtc().toIso8601String(),
+        ),
+      );
+
+  Future<void> _touchMealOrder(MealOrder order) => database.saveMealOrder(
+    order.copyWith(updatedAt: DateTime.now().toUtc().toIso8601String()),
+  );
+
   Future<PracticeLog> savePractice({
     PracticeLog? existing,
     required String recipeId,

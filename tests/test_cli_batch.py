@@ -202,3 +202,31 @@ def test_cli_rejects_export_handoff_with_video_input() -> None:
 
     with pytest.raises(ValueError, match="does not accept video URLs"):
         cli.run(args)
+
+
+def test_cli_exports_web_library_to_default_output_path(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    captured = {}
+
+    def fake_export(project_root, out_dir, destination):
+        captured.update(project_root=project_root, out_dir=out_dir, destination=destination)
+        from bili_recipe_notes.web_export import WebLibraryExportResult
+
+        return WebLibraryExportResult(
+            path=(tmp_path / "outputs" / "bili-recipe-web-library.json").resolve(),
+            recipe_count=3,
+            asset_count=2,
+            practice_log_count=1,
+            size_bytes=128,
+        )
+
+    monkeypatch.setattr(cli, "export_web_library", fake_export)
+    args = cli.build_parser().parse_args(["--export-web-library"])
+
+    assert cli.run(args) == 0
+    assert captured["project_root"] == tmp_path
+    assert captured["out_dir"] == Path("outputs")
+    assert captured["destination"] == Path("outputs/bili-recipe-web-library.json")
+    assert capsys.readouterr().out.rstrip().endswith(
+        f"WEB_LIBRARY_PATH={(tmp_path / 'outputs' / 'bili-recipe-web-library.json').resolve()}"
+    )

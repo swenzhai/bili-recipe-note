@@ -87,6 +87,7 @@ try:
         review_path,
     )
     from .storage import atomic_write_json, atomic_write_text
+    from .web_export import build_web_library_payload, web_library_bytes
 except ImportError:  # pragma: no cover - supports direct streamlit script execution
     from bili_recipe_notes.batch_queue import create_batch_id, create_batch_state, list_batch_states
     from bili_recipe_notes.batch_runner import get_background_batch_status, read_batch_log, start_background_batch
@@ -158,6 +159,7 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
         review_path,
     )
     from bili_recipe_notes.storage import atomic_write_json, atomic_write_text
+    from bili_recipe_notes.web_export import build_web_library_payload, web_library_bytes
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -1117,13 +1119,35 @@ def _lan_ip_address() -> str:
 
 def _render_mobile_client_admin(st, config: UIConfig) -> None:
     st.subheader("手机客户端")
-    st.warning("当前使用 HTTP，仅适合可信家庭局域网。不要在公共 Wi-Fi 中启动或配对。")
     try:
         store = MobileSyncStore(Path.cwd(), out_dir=config.out_dir)
         index_result = store.index_recipes()
     except Exception as exc:  # noqa: BLE001
         st.error(f"同步服务数据初始化失败：{_clean_error(exc)}")
         return
+
+    st.markdown("#### 网页离线版（推荐个人使用）")
+    st.caption("不需要 Apple 开发者账号。先在 iPhone 的 Safari 打开网页版并添加到主屏幕，再把下面的菜谱包导入一次。")
+    try:
+        web_payload = build_web_library_payload(store)
+        st.download_button(
+            "下载网页版菜谱包",
+            data=web_library_bytes(web_payload),
+            file_name="bili-recipe-web-library.json",
+            mime="application/json",
+            type="primary",
+            width="stretch",
+        )
+        st.caption(
+            f"包含 {len(web_payload['recipes'])} 道菜谱、{len(web_payload['assets'])} 张步骤图；"
+            "菜谱包只在 Mac 与 iPhone 之间传递，不会上传到网页版服务器。"
+        )
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"网页版菜谱包生成失败：{_clean_error(exc)}")
+
+    st.divider()
+    st.markdown("#### 原生 App 局域网同步（保留）")
+    st.warning("当前使用 HTTP，仅适合可信家庭局域网。不要在公共 Wi-Fi 中启动或配对。")
 
     base_url = st.text_input("手机同步地址", value=f"http://{_lan_ip_address()}:8765")
     try:

@@ -105,6 +105,180 @@ class RecipeSummary {
       : const [];
 }
 
+enum MealOrderStatus {
+  draft,
+  cooking,
+  completed;
+
+  static MealOrderStatus parse(String value) => values.firstWhere(
+    (status) => status.name == value,
+    orElse: () => MealOrderStatus.draft,
+  );
+}
+
+class MealOrder {
+  const MealOrder({
+    required this.id,
+    required this.title,
+    required this.mealDate,
+    required this.status,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  final String id;
+  final String title;
+  final String mealDate;
+  final MealOrderStatus status;
+  final String createdAt;
+  final String updatedAt;
+
+  MealOrder copyWith({
+    String? title,
+    MealOrderStatus? status,
+    String? updatedAt,
+  }) => MealOrder(
+    id: id,
+    title: title ?? this.title,
+    mealDate: mealDate,
+    status: status ?? this.status,
+    createdAt: createdAt,
+    updatedAt: updatedAt ?? this.updatedAt,
+  );
+}
+
+class MealOrderItem {
+  const MealOrderItem({
+    required this.id,
+    required this.orderId,
+    required this.recipeId,
+    required this.recipe,
+    required this.servingsMultiplier,
+    required this.note,
+    required this.sortOrder,
+    required this.completed,
+  });
+
+  final String id;
+  final String orderId;
+  final String recipeId;
+  final RecipeSummary recipe;
+  final double servingsMultiplier;
+  final String note;
+  final int sortOrder;
+  final bool completed;
+
+  MealOrderItem copyWith({
+    double? servingsMultiplier,
+    String? note,
+    int? sortOrder,
+    bool? completed,
+  }) => MealOrderItem(
+    id: id,
+    orderId: orderId,
+    recipeId: recipeId,
+    recipe: recipe,
+    servingsMultiplier: servingsMultiplier ?? this.servingsMultiplier,
+    note: note ?? this.note,
+    sortOrder: sortOrder ?? this.sortOrder,
+    completed: completed ?? this.completed,
+  );
+}
+
+class ShoppingListEntry {
+  const ShoppingListEntry({
+    required this.name,
+    required this.amount,
+    required this.recipeTitles,
+  });
+
+  final String name;
+  final String amount;
+  final List<String> recipeTitles;
+}
+
+String scaleRecipeAmount(String amount, double multiplier) {
+  if (multiplier == 1 || amount.isEmpty || ['少许', '适量'].any(amount.contains)) {
+    return amount;
+  }
+  final matches = RegExp(r'\d+(?:\.\d+)?').allMatches(amount).toList();
+  if (matches.length != 1) return amount;
+  final match = matches.single;
+  final original = double.tryParse(match.group(0)!);
+  if (original == null) return amount;
+  final scaled = original * multiplier;
+  final text = _formatAmountNumber(scaled);
+  return amount.replaceRange(match.start, match.end, text);
+}
+
+List<ShoppingListEntry> buildShoppingList(Iterable<MealOrderItem> items) {
+  final accumulators = <String, _ShoppingAccumulator>{};
+  for (final item in items) {
+    for (final ingredient in [
+      ...item.recipe.ingredients,
+      ...item.recipe.seasonings,
+    ]) {
+      final name = ingredient['name']?.toString().trim() ?? '';
+      if (name.isEmpty) continue;
+      final rawAmount = ingredient['amount']?.toString().trim() ?? '';
+      final amount = scaleRecipeAmount(rawAmount, item.servingsMultiplier);
+      final key = name.toLowerCase();
+      final accumulator = accumulators.putIfAbsent(
+        key,
+        () => _ShoppingAccumulator(name),
+      );
+      accumulator.add(amount, item.recipe.title);
+    }
+  }
+  final entries = accumulators.values.map((item) => item.build()).toList();
+  entries.sort((left, right) => left.name.compareTo(right.name));
+  return entries;
+}
+
+String _formatAmountNumber(double value) => value == value.roundToDouble()
+    ? value.toInt().toString()
+    : value.toStringAsFixed(1).replaceFirst(RegExp(r'\.0$'), '');
+
+class _ShoppingAccumulator {
+  _ShoppingAccumulator(this.name);
+
+  final String name;
+  final Map<String, double> numericAmounts = {};
+  final List<String> literalAmounts = [];
+  final List<String> recipeTitles = [];
+
+  void add(String amount, String recipeTitle) {
+    if (!recipeTitles.contains(recipeTitle)) recipeTitles.add(recipeTitle);
+    if (amount.isEmpty) return;
+    final match = RegExp(r'^\s*(\d+(?:\.\d+)?)\s*(.*?)\s*$').firstMatch(amount);
+    if (match == null) {
+      if (!literalAmounts.contains(amount)) literalAmounts.add(amount);
+      return;
+    }
+    final value = double.tryParse(match.group(1)!);
+    final unit = match.group(2)!.trim();
+    if (value == null) {
+      if (!literalAmounts.contains(amount)) literalAmounts.add(amount);
+      return;
+    }
+    numericAmounts[unit] = (numericAmounts[unit] ?? 0) + value;
+  }
+
+  ShoppingListEntry build() {
+    final parts = <String>[
+      ...numericAmounts.entries.map(
+        (entry) => '${_formatAmountNumber(entry.value)}${entry.key}',
+      ),
+      ...literalAmounts,
+    ];
+    return ShoppingListEntry(
+      name: name,
+      amount: parts.isEmpty ? '按需准备' : parts.join(' + '),
+      recipeTitles: List.unmodifiable(recipeTitles),
+    );
+  }
+}
+
 class PracticeLog {
   const PracticeLog({
     required this.id,

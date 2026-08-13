@@ -17,6 +17,7 @@ from .batch_queue import (
 )
 from .handoff import HandoffError, export_batch_handoff, import_handoff_bundle
 from .pipeline import BatchJobOptions, RecipeJobOptions, extract_creator_links, generate_recipe_note, run_batch
+from .web_export import DEFAULT_WEB_LIBRARY_NAME, export_web_library
 
 console = Console()
 
@@ -70,6 +71,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--import-handoff",
         metavar="ZIP_PATH",
         help="Validate and import a handoff ZIP into this project",
+    )
+    action_mode.add_argument(
+        "--export-web-library",
+        metavar="PATH",
+        nargs="?",
+        const="",
+        help="Export all recipes and step images for the offline web app (default: OUT/bili-recipe-web-library.json)",
     )
     parser.add_argument(
         "--handoff-destination",
@@ -326,6 +334,21 @@ def _run_handoff_mode(args: argparse.Namespace) -> int:
 
 
 def run(args: argparse.Namespace) -> int:
+    web_destination = getattr(args, "export_web_library", None)
+    if web_destination is not None:
+        if any((getattr(args, "url", None), getattr(args, "batch_url", None), getattr(args, "batch_file", None))):
+            raise ValueError("--export-web-library does not accept video URLs or --batch-file")
+        out_dir = Path(getattr(args, "out", "outputs")).expanduser()
+        destination = Path(web_destination).expanduser() if web_destination else out_dir / DEFAULT_WEB_LIBRARY_NAME
+        result = export_web_library(Path.cwd(), out_dir, destination)
+        console.print(
+            f"[green]Web library exported:[/green] recipes={result.recipe_count} "
+            f"| images={result.asset_count} | logs={result.practice_log_count} "
+            f"| size={result.size_bytes} bytes"
+        )
+        print(f"WEB_LIBRARY_PATH={result.path}")
+        return 0
+
     handoff_requested = bool(
         getattr(args, "export_handoff", None) or getattr(args, "import_handoff", None)
     )

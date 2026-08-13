@@ -22,47 +22,79 @@ class LocalDatabase {
     _database = await _factory.openDatabase(
       path,
       options: OpenDatabaseOptions(
-        version: 1,
+        version: 2,
+        onConfigure: (db) => db.execute('PRAGMA foreign_keys = ON'),
         onCreate: (db, _) async {
-          await db.execute('''
+          await _createVersionOneTables(db);
+          await _createMealOrderTables(db);
+        },
+        onUpgrade: (db, oldVersion, _) async {
+          if (oldVersion < 2) await _createMealOrderTables(db);
+        },
+      ),
+    );
+    return _database!;
+  }
+
+  Future<void> _createVersionOneTables(Database db) async {
+    await db.execute('''
         CREATE TABLE recipes(
           id TEXT PRIMARY KEY, title TEXT NOT NULL, category TEXT NOT NULL,
           cuisine TEXT NOT NULL, tags TEXT NOT NULL, search_text TEXT NOT NULL,
           payload_json TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0
         )
       ''');
-          await db.execute('''
+    await db.execute('''
         CREATE TABLE practice_logs(
           id TEXT PRIMARY KEY, recipe_id TEXT NOT NULL, cooked_on TEXT NOT NULL,
           outcome TEXT, rating INTEGER, notes TEXT NOT NULL, photo_sha256 TEXT,
           local_photo_path TEXT, version INTEGER NOT NULL, deleted_at TEXT
         )
       ''');
-          await db.execute('''
+    await db.execute('''
         CREATE TABLE outbox(
           entity_id TEXT PRIMARY KEY, op_id TEXT NOT NULL, action TEXT NOT NULL,
           base_version INTEGER NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL
         )
       ''');
-          await db.execute('''
+    await db.execute('''
         CREATE TABLE assets(
           sha256 TEXT PRIMARY KEY, mime_type TEXT, byte_size INTEGER,
           kind TEXT, local_path TEXT
         )
       ''');
-          await db.execute('''
+    await db.execute('''
         CREATE TABLE conflicts(
           id TEXT PRIMARY KEY, entity_id TEXT NOT NULL,
           incoming_json TEXT NOT NULL, server_json TEXT NOT NULL
         )
       ''');
-          await db.execute(
-            'CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)',
-          );
-        },
-      ),
+    await db.execute(
+      'CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)',
     );
-    return _database!;
+  }
+
+  Future<void> _createMealOrderTables(Database db) async {
+    await db.execute('''
+      CREATE TABLE meal_orders(
+        id TEXT PRIMARY KEY, title TEXT NOT NULL, meal_date TEXT NOT NULL,
+        status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE meal_order_items(
+        id TEXT PRIMARY KEY,
+        order_id TEXT NOT NULL REFERENCES meal_orders(id) ON DELETE CASCADE,
+        recipe_id TEXT NOT NULL, recipe_snapshot_json TEXT NOT NULL,
+        servings_multiplier REAL NOT NULL DEFAULT 1,
+        note TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL,
+        completed INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(order_id, recipe_id)
+      )
+    ''');
+    await db.execute(
+      'CREATE INDEX idx_meal_order_items_order ON meal_order_items(order_id, sort_order)',
+    );
   }
 
   Future<void> saveSetting(String key, String value) async {
@@ -158,6 +190,117 @@ class LocalDatabase {
         'kind': asset['kind'],
       }, conflictAlgorithm: ConflictAlgorithm.ignore);
     }
+  }
+
+  Future<MealOrder?> activeMealOrder() async {
+    final db = await database;
+    final rows = await db.query(
+      'meal_orders',
+      where: "status IN ('draft', 'cooking')",
+      orderBy: 'updated_at DESC',
+      limit: 1,
+    );
+    return rows.isEmpty ? null : _mealOrderFromRow(rows.first);
+  }
+
+  MealOrder _mealOrderFromRow(Map<String, Object?> row) => MealOrder(
+    id: row['id'] as String,
+    title: row['title'] as String,
+    mealDate: row['meal_date'] as String,
+    status: MealOrderStatus.parse(row['status'] as String),
+    createdAt: row['created_at'] as String,
+    updatedAt: row['updated_at'] as String,
+  );
+
+  Future<void> saveMealOrder(MealOrder order) async {
+    final db = await database;
+    final values = {
+      'id': order.id,
+      'title': order.title,
+      'meal_date': order.mealDate,
+      'status': order.status.name,
+      'created_at': order.createdAt,
+      'updated_at': order.updatedAt,
+    };
+    final updated = await db.update(
+      'meal_orders',
+      values,
+      where: 'id=?',
+      whereArgs: [order.id],
+    );
+    if (updated == 0) await db.insert('meal_orders', values);
+  }
+
+  Future<List<MealOrderItem>> mealOrderItems(String orderId) async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      '''
+      SELECT item.*, recipe.payload_json AS current_recipe_json
+      FROM meal_order_items AS item
+      LEFT JOIN recipes AS recipe ON recipe.id = item.recipe_id AND recipe.deleted = 0
+      WHERE item.order_id = ?
+      ORDER BY item.sort_order, item.id
+      ''',
+      [orderId],
+    );
+    return rows.map((row) {
+      final rawRecipe =
+          row['current_recipe_json'] as String? ??
+          row['recipe_snapshot_json'] as String;
+      return MealOrderItem(
+        id: row['id'] as String,
+        orderId: row['order_id'] as String,
+        recipeId: row['recipe_id'] as String,
+        recipe: RecipeSummary.fromPayload(
+          jsonDecode(rawRecipe) as Map<String, dynamic>,
+        ),
+        servingsMultiplier: (row['servings_multiplier'] as num).toDouble(),
+        note: row['note'] as String,
+        sortOrder: row['sort_order'] as int,
+        completed: row['completed'] == 1,
+      );
+    }).toList();
+  }
+
+  Future<MealOrderItem?> mealOrderItem(String orderId, String recipeId) async {
+    final items = await mealOrderItems(orderId);
+    for (final item in items) {
+      if (item.recipeId == recipeId) return item;
+    }
+    return null;
+  }
+
+  Future<int> nextMealItemSortOrder(String orderId) async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      'SELECT MAX(sort_order) AS maximum FROM meal_order_items WHERE order_id=?',
+      [orderId],
+    );
+    return ((rows.single['maximum'] as int?) ?? -1) + 1;
+  }
+
+  Future<void> saveMealOrderItem(MealOrderItem item) async {
+    final db = await database;
+    await db.insert('meal_order_items', {
+      'id': item.id,
+      'order_id': item.orderId,
+      'recipe_id': item.recipeId,
+      'recipe_snapshot_json': jsonEncode(item.recipe.payload),
+      'servings_multiplier': item.servingsMultiplier,
+      'note': item.note,
+      'sort_order': item.sortOrder,
+      'completed': item.completed ? 1 : 0,
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
+  }
+
+  Future<void> removeMealOrderItem(String itemId) async {
+    final db = await database;
+    await db.delete('meal_order_items', where: 'id=?', whereArgs: [itemId]);
+  }
+
+  Future<void> deleteMealOrder(String orderId) async {
+    final db = await database;
+    await db.delete('meal_orders', where: 'id=?', whereArgs: [orderId]);
   }
 
   Future<List<PracticeLog>> practiceLogs(String recipeId) async {

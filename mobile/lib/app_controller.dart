@@ -20,10 +20,21 @@ class AppController extends ChangeNotifier {
   String tag = '';
   List<RecipeSummary> recipes = [];
   List<Map<String, dynamic>> conflicts = [];
+  MealOrder? mealOrder;
+  List<MealOrderItem> mealItems = [];
+
+  int get mealItemCount => mealItems.length;
+  int get completedMealItemCount =>
+      mealItems.where((item) => item.completed).length;
+  List<ShoppingListEntry> get shoppingList => buildShoppingList(mealItems);
+
+  bool isRecipeInMeal(String recipeId) =>
+      mealItems.any((item) => item.recipeId == recipeId);
 
   Future<void> initialize() async {
     paired = await repository.isPaired;
     await refreshLocal();
+    await refreshMeal();
     initialized = true;
     notifyListeners();
     if (paired) await synchronize();
@@ -58,6 +69,14 @@ class AppController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> refreshMeal() async {
+    mealOrder = await repository.activeMealOrder();
+    mealItems = mealOrder == null
+        ? []
+        : await repository.mealOrderItems(mealOrder!.id);
+    notifyListeners();
+  }
+
   Future<void> setSearch(String value) async {
     query = value;
     await refreshLocal();
@@ -83,6 +102,7 @@ class AppController extends ChangeNotifier {
       await repository.synchronize();
       lastSync = DateTime.now();
       await refreshLocal();
+      await refreshMeal();
     } catch (error) {
       syncError = error.toString();
     } finally {
@@ -127,6 +147,59 @@ class AppController extends ChangeNotifier {
     await repository.deletePractice(log);
     notifyListeners();
     await synchronize();
+  }
+
+  Future<bool> addRecipeToMeal(RecipeSummary recipe) async {
+    final added = await repository.addRecipeToMeal(recipe);
+    await refreshMeal();
+    return added;
+  }
+
+  Future<void> setMealItemMultiplier(
+    MealOrderItem item,
+    double multiplier,
+  ) async {
+    final normalized = multiplier.clamp(0.5, 4).toDouble();
+    await repository.updateMealOrderItem(
+      item.copyWith(servingsMultiplier: normalized),
+    );
+    await refreshMeal();
+  }
+
+  Future<void> setMealItemNote(MealOrderItem item, String note) async {
+    await repository.updateMealOrderItem(item.copyWith(note: note.trim()));
+    await refreshMeal();
+  }
+
+  Future<void> setMealItemCompleted(MealOrderItem item, bool completed) async {
+    await repository.updateMealOrderItem(item.copyWith(completed: completed));
+    await refreshMeal();
+  }
+
+  Future<void> removeMealItem(MealOrderItem item) async {
+    await repository.removeMealOrderItem(item);
+    await refreshMeal();
+  }
+
+  Future<void> clearMeal() async {
+    final order = mealOrder;
+    if (order == null) return;
+    await repository.clearMealOrder(order);
+    await refreshMeal();
+  }
+
+  Future<void> beginMealCooking() async {
+    final order = mealOrder;
+    if (order == null || mealItems.isEmpty) return;
+    await repository.startMealOrder(order);
+    await refreshMeal();
+  }
+
+  Future<void> finishMealCooking() async {
+    final order = mealOrder;
+    if (order == null) return;
+    await repository.completeMealOrder(order);
+    await refreshMeal();
   }
 
   Future<void> resolveConflict(

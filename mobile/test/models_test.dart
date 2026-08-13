@@ -42,4 +42,45 @@ void main() {
     expect(scaleAmount('少许', 3), '少许');
     expect(scaleAmount('2-3个', 2), '2-3个');
   });
+
+  test('shopping list merges matching ingredients after scaling', () {
+    MealOrderItem item(
+      String id,
+      String title,
+      double multiplier,
+      List<Map<String, Object>> ingredients,
+    ) => MealOrderItem(
+      id: id,
+      orderId: 'meal',
+      recipeId: id,
+      recipe: RecipeSummary.fromPayload({
+        'id': id,
+        'title': title,
+        'ingredients': ingredients,
+      }),
+      servingsMultiplier: multiplier,
+      note: '',
+      sortOrder: 0,
+      completed: false,
+    );
+
+    final shopping = buildShoppingList([
+      item('one', '番茄炒蛋', 1, [
+        {'name': '番茄', 'amount': '200克'},
+        {'name': '盐', 'amount': '少许'},
+      ]),
+      item('two', '番茄汤', 2, [
+        {'name': '番茄', 'amount': '100克'},
+        {'name': '盐', 'amount': '适量'},
+      ]),
+    ]);
+
+    final tomato = shopping.singleWhere((entry) => entry.name == '番茄');
+    expect(tomato.amount, '400克');
+    expect(tomato.recipeTitles, ['番茄炒蛋', '番茄汤']);
+    expect(
+      shopping.singleWhere((entry) => entry.name == '盐').amount,
+      '少许 + 适量',
+    );
+  });
 }
