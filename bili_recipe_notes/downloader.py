@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, TypeVar
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 from .config import CONFIG_DIR_NAME
@@ -23,9 +25,13 @@ BILIBILI_HEADERS = {
     "Referer": "https://www.bilibili.com/",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
+BILIBILI_412_MAX_ATTEMPTS = 5
+BILIBILI_412_BASE_WAIT_SECONDS = 30
+BILIBILI_412_MAX_WAIT_SECONDS = 300
 
 _fingerprint_cookies: dict[str, str] | None = None
 _fingerprint_loaded = False
+T = TypeVar("T")
 
 
 @dataclass
@@ -141,6 +147,12 @@ def _get_fingerprint_cookies() -> dict[str, str] | None:
     return _fingerprint_cookies
 
 
+def _reset_fingerprint_cookies() -> None:
+    global _fingerprint_cookies, _fingerprint_loaded
+    _fingerprint_cookies = None
+    _fingerprint_loaded = False
+
+
 def _write_temp_cookie_file(cookies: dict[str, str]) -> Path:
     cookie_file = tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".cookies.txt", delete=False)
     with cookie_file:
@@ -176,14 +188,56 @@ def _cleanup_ydl_opts(opts: dict) -> None:
 
 
 def _raise_friendly_error(exc: Exception) -> None:
-    message = str(exc)
-    if "BiliBili" in message and "HTTP Error 412" in message:
+    if _is_bilibili_412(exc):
         raise RuntimeError(
             "Bilibili returned HTTP 412 Precondition Failed. "
-            "This usually means the request fingerprint or cookies were rejected. "
-            "Try again first; if it still fails, refresh yt-dlp and use a fresh cookies.txt exported from your browser."
+            f"The request was still rejected after {BILIBILI_412_MAX_ATTEMPTS} attempts. "
+            "Refresh yt-dlp or use a fresh cookies.txt exported from your browser."
         ) from exc
     raise exc
+
+
+def _is_bilibili_412(exc: BaseException) -> bool:
+    """Recognize yt-dlp wrappers as well as the underlying HTTPError."""
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if getattr(current, "code", None) == 412:
+            return True
+        message = str(current)
+        if re.search(r"HTTP(?: Error)?\s+412\b", message, flags=re.IGNORECASE):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _run_with_bilibili_412_retry(operation: Callable[[], T]) -> T:
+    """Retry a Bilibili operation after refreshing its anonymous fingerprint."""
+    max_attempts = max(1, BILIBILI_412_MAX_ATTEMPTS)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if not _is_bilibili_412(exc):
+                raise
+            if attempt >= max_attempts:
+                _raise_friendly_error(exc)
+
+            _reset_fingerprint_cookies()
+            delay = min(
+                BILIBILI_412_BASE_WAIT_SECONDS * (2 ** (attempt - 1)),
+                BILIBILI_412_MAX_WAIT_SECONDS,
+            )
+            print(
+                "Bilibili returned HTTP 412; "
+                f"waiting {delay:g}s before retry {attempt + 1}/{max_attempts}...",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(delay)
+
+    raise AssertionError("unreachable")
 
 
 def _completed_downloads(
@@ -243,16 +297,18 @@ def _download_to_staging(
 
 
 def fetch_video_info(url: str, cookies: str | None = None) -> dict:
-    opts = _base_ydl_opts(cookies)
-    opts["skip_download"] = True
     from yt_dlp import YoutubeDL
-    try:
-        with YoutubeDL(_yt_dlp_opts(opts)) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception as exc:
-        _raise_friendly_error(exc)
-    finally:
-        _cleanup_ydl_opts(opts)
+
+    def operation() -> dict:
+        opts = _base_ydl_opts(cookies)
+        opts["skip_download"] = True
+        try:
+            with YoutubeDL(_yt_dlp_opts(opts)) as ydl:
+                return ydl.extract_info(url, download=False)
+        finally:
+            _cleanup_ydl_opts(opts)
+
+    return _run_with_bilibili_412_retry(operation)
 
 
 def crawl_creator_videos(home_url: str, cookies: str | None = None) -> CreatorCrawlResult:
@@ -261,21 +317,7 @@ def crawl_creator_videos(home_url: str, cookies: str | None = None) -> CreatorCr
     if not uid_match:
         raise ValueError("请输入有效的 Bilibili UP 主空间链接。")
     uid = uid_match.group(1)
-    opts = _base_ydl_opts(cookies)
-    opts.update({
-        "quiet": True,
-        "extract_flat": "in_playlist",
-        "skip_download": True,
-        "playlistend": None,
-    })
-
     from yt_dlp import YoutubeDL
-
-    warnings: list[str] = []
-    complete = True
-    videos: list[CreatorVideo] = []
-    seen_bvids: set[str] = set()
-    visited_playlists: set[str] = set()
 
     def bvid_from_entry(entry: dict) -> str | None:
         for candidate in (entry.get("id"), entry.get("url"), entry.get("webpage_url")):
@@ -284,67 +326,91 @@ def crawl_creator_videos(home_url: str, cookies: str | None = None) -> CreatorCr
                 return "BV" + match.group(1)[2:]
         return None
 
-    try:
-        with YoutubeDL(_yt_dlp_opts(opts)) as ydl:
-            info = ydl.extract_info(home_url, download=False)
-            uploader = str(info.get("uploader") or "").strip()
+    def operation() -> CreatorCrawlResult:
+        opts = _base_ydl_opts(cookies)
+        opts.update({
+            "quiet": True,
+            "extract_flat": "in_playlist",
+            "skip_download": True,
+            "playlistend": None,
+        })
+        warnings: list[str] = []
+        complete = True
+        videos: list[CreatorVideo] = []
+        seen_bvids: set[str] = set()
+        visited_playlists: set[str] = set()
 
-            def walk_entries(container: dict, depth: int = 0) -> None:
-                nonlocal complete, uploader
-                if depth > 8:
-                    complete = False
-                    warnings.append("合集嵌套层级超过安全上限，已停止继续展开。")
-                    return
-                raw_entries = container.get("entries") or []
-                iterator = iter(raw_entries)
-                while True:
-                    try:
-                        entry = next(iterator)
-                    except StopIteration:
-                        break
-                    except Exception as exc:  # noqa: BLE001
+        try:
+            with YoutubeDL(_yt_dlp_opts(opts)) as ydl:
+                info = ydl.extract_info(home_url, download=False)
+                uploader = str(info.get("uploader") or "").strip()
+
+                def walk_entries(container: dict, depth: int = 0) -> None:
+                    nonlocal complete, uploader
+                    if depth > 8:
                         complete = False
-                        warnings.append(f"读取投稿分页失败：{exc}")
-                        break
-                    if not isinstance(entry, dict):
-                        continue
-                    uploader = uploader or str(entry.get("uploader") or "").strip()
-                    bvid = bvid_from_entry(entry)
-                    if bvid:
-                        if bvid not in seen_bvids:
-                            seen_bvids.add(bvid)
-                            videos.append(
-                                CreatorVideo(
-                                    bvid=bvid,
-                                    title=str(entry.get("title") or bvid).strip(),
-                                    url=f"https://www.bilibili.com/video/{bvid}",
+                        warnings.append("合集嵌套层级超过安全上限，已停止继续展开。")
+                        return
+                    raw_entries = container.get("entries") or []
+                    iterator = iter(raw_entries)
+                    while True:
+                        try:
+                            entry = next(iterator)
+                        except StopIteration:
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            if _is_bilibili_412(exc):
+                                raise
+                            complete = False
+                            warnings.append(f"读取投稿分页失败：{exc}")
+                            break
+                        if not isinstance(entry, dict):
+                            continue
+                        uploader = uploader or str(entry.get("uploader") or "").strip()
+                        bvid = bvid_from_entry(entry)
+                        if bvid:
+                            if bvid not in seen_bvids:
+                                seen_bvids.add(bvid)
+                                videos.append(
+                                    CreatorVideo(
+                                        bvid=bvid,
+                                        title=str(entry.get("title") or bvid).strip(),
+                                        url=f"https://www.bilibili.com/video/{bvid}",
+                                    )
                                 )
-                            )
-                        continue
+                            continue
 
-                    nested_url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
-                    if not nested_url or nested_url in visited_playlists:
-                        continue
-                    if "space.bilibili.com" not in nested_url:
-                        continue
-                    visited_playlists.add(nested_url)
-                    try:
-                        nested = ydl.extract_info(nested_url, download=False)
-                    except Exception as exc:  # noqa: BLE001
-                        complete = False
-                        warnings.append(f"合集展开失败：{nested_url}：{exc}")
-                        continue
-                    if isinstance(nested, dict):
-                        walk_entries(nested, depth + 1)
+                        nested_url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
+                        if not nested_url or nested_url in visited_playlists:
+                            continue
+                        if "space.bilibili.com" not in nested_url:
+                            continue
+                        visited_playlists.add(nested_url)
+                        try:
+                            nested = ydl.extract_info(nested_url, download=False)
+                        except Exception as exc:  # noqa: BLE001
+                            if _is_bilibili_412(exc):
+                                raise
+                            complete = False
+                            warnings.append(f"合集展开失败：{nested_url}：{exc}")
+                            continue
+                        if isinstance(nested, dict):
+                            walk_entries(nested, depth + 1)
 
-            visited_playlists.add(home_url)
-            walk_entries(info)
-    except Exception as exc:
-        _raise_friendly_error(exc)
-    finally:
-        _cleanup_ydl_opts(opts)
+                visited_playlists.add(home_url)
+                walk_entries(info)
+        finally:
+            _cleanup_ydl_opts(opts)
 
-    return CreatorCrawlResult(uid=uid, uploader=uploader or uid, videos=videos, complete=complete, warnings=warnings)
+        return CreatorCrawlResult(
+            uid=uid,
+            uploader=uploader or uid,
+            videos=videos,
+            complete=complete,
+            warnings=warnings,
+        )
+
+    return _run_with_bilibili_412_retry(operation)
 
 
 def extract_creator_video_links(home_url: str, cookies: str | None = None) -> list[str]:
@@ -353,56 +419,59 @@ def extract_creator_video_links(home_url: str, cookies: str | None = None) -> li
 
 
 def download_subtitles(url: str, output_dir: Path, language: str = "zh", cookies: str | None = None) -> list[Path]:
-    opts = _base_ydl_opts(cookies)
-    opts.update({
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": [language, f"{language}-CN", "zh-Hans", "zh"],
-        "subtitlesformat": "vtt/srt/json3",
-        "quiet": True,
-    })
-    try:
-        return _download_to_staging(
-            url,
-            output_dir,
-            "subtitle",
-            opts,
-            allowed_suffixes={".vtt", ".srt", ".json3"},
-        )
-    except Exception as exc:
-        _raise_friendly_error(exc)
-    finally:
-        _cleanup_ydl_opts(opts)
+    def operation() -> list[Path]:
+        opts = _base_ydl_opts(cookies)
+        opts.update({
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": [language, f"{language}-CN", "zh-Hans", "zh"],
+            "subtitlesformat": "vtt/srt/json3",
+            "quiet": True,
+        })
+        try:
+            return _download_to_staging(
+                url,
+                output_dir,
+                "subtitle",
+                opts,
+                allowed_suffixes={".vtt", ".srt", ".json3"},
+            )
+        finally:
+            _cleanup_ydl_opts(opts)
+
+    return _run_with_bilibili_412_retry(operation)
 
 
 def download_audio(url: str, output_dir: Path, cookies: str | None = None) -> Path:
-    opts = _base_ydl_opts(cookies)
-    opts.update({
-        "format": "bestaudio/best",
-        "quiet": True,
-    })
-    try:
-        files = _download_to_staging(url, output_dir, "audio", opts)
-        return files[0]
-    except Exception as exc:
-        _raise_friendly_error(exc)
-    finally:
-        _cleanup_ydl_opts(opts)
+    def operation() -> Path:
+        opts = _base_ydl_opts(cookies)
+        opts.update({
+            "format": "bestaudio/best",
+            "quiet": True,
+        })
+        try:
+            files = _download_to_staging(url, output_dir, "audio", opts)
+            return files[0]
+        finally:
+            _cleanup_ydl_opts(opts)
+
+    return _run_with_bilibili_412_retry(operation)
 
 
 def download_lowres_video(url: str, output_dir: Path, cookies: str | None = None) -> Path:
-    opts = _base_ydl_opts(cookies)
-    opts.update({
-        # Screenshots do not need an audio stream.  Prefer a video-only stream,
-        # while retaining a combined-stream fallback for sites without DASH.
-        "format": "worstvideo/bestvideo/worst",
-        "quiet": True,
-    })
-    try:
-        files = _download_to_staging(url, output_dir, "video", opts)
-        return files[0]
-    except Exception as exc:
-        _raise_friendly_error(exc)
-    finally:
-        _cleanup_ydl_opts(opts)
+    def operation() -> Path:
+        opts = _base_ydl_opts(cookies)
+        opts.update({
+            # Screenshots do not need an audio stream.  Prefer a video-only stream,
+            # while retaining a combined-stream fallback for sites without DASH.
+            "format": "worstvideo/bestvideo/worst",
+            "quiet": True,
+        })
+        try:
+            files = _download_to_staging(url, output_dir, "video", opts)
+            return files[0]
+        finally:
+            _cleanup_ydl_opts(opts)
+
+    return _run_with_bilibili_412_retry(operation)

@@ -49,6 +49,8 @@ class RecipeJobOptions:
     language: str = "zh"
     keep_media: bool = False
     no_llm_summary: bool = False
+    require_llm: bool = False
+    require_screenshot: bool = False
     llm_provider: str = "opencode"
     openai_model: str = "gpt-5.5"
     local_llm_command: str | None = None
@@ -93,6 +95,8 @@ class BatchJobOptions:
     language: str = "zh"
     keep_media: bool = False
     no_llm_summary: bool = False
+    require_llm: bool = False
+    require_screenshot: bool = False
     llm_provider: str = "opencode"
     openai_model: str = "gpt-5.5"
     local_llm_command: str | None = None
@@ -233,6 +237,48 @@ def _validate_generated_artifacts(
 
 def _has_step_images(recipe: Recipe) -> bool:
     return any(bool(step.screenshot_path) for step in recipe.steps)
+
+
+def _has_existing_step_images(folder: Path, recipe: Recipe) -> bool:
+    for step in recipe.steps:
+        raw_path = str(step.screenshot_path or "").strip()
+        if not raw_path:
+            continue
+        relative = Path(raw_path.replace("\\", "/"))
+        if relative.is_absolute():
+            continue
+        image_path = folder / relative
+        try:
+            image_path.resolve().relative_to(folder.resolve())
+        except ValueError:
+            continue
+        if image_path.is_file() and image_path.stat().st_size > 0:
+            return True
+    return False
+
+
+def _recipe_output_meets_requirements(folder: Path, options: RecipeJobOptions) -> bool:
+    if not (options.require_llm or options.require_screenshot):
+        return True
+    job = _read_json_object(folder / "job.json")
+    stage_errors = job.get("stage_errors") if isinstance(job.get("stage_errors"), list) else []
+    if options.require_llm:
+        if any(str(error).startswith("extract_recipe_llm:") for error in stage_errors):
+            return False
+        try:
+            recipe = _load_recipe(folder / "recipe.json")
+        except Exception:
+            return False
+        if recipe.extraction_method != "llm":
+            return False
+    else:
+        try:
+            recipe = _load_recipe(folder / "recipe.json")
+        except Exception:
+            return False
+    if options.require_screenshot and not _has_existing_step_images(folder, recipe):
+        return False
+    return True
 
 
 def _key_screenshot_timestamps(recipe: Recipe, duration: float | int | None) -> list[float]:
@@ -485,6 +531,8 @@ def generate_recipe_from_raw(
     try:
         _emit(log, "Extracting recipe structure from saved transcript...")
         recipe: Recipe | None = None
+        if options.require_llm and not _llm_extraction_enabled(options):
+            raise PipelineStageError("extract_recipe_llm", "LLM extraction is required but disabled")
         if _llm_extraction_enabled(options):
             try:
                 recipe = extract_recipe_with_llm(
@@ -501,6 +549,8 @@ def generate_recipe_from_raw(
                 _emit(log, "Structured recipe extraction completed.")
             except Exception as exc:  # noqa: BLE001
                 stage_errors.append(f"extract_recipe_llm: {exc}")
+                if options.require_llm:
+                    raise PipelineStageError("extract_recipe_llm", str(exc)) from exc
                 _emit(log, f"Structured extraction failed, using rule-based fallback: {exc}")
         if recipe is None:
             try:
@@ -508,6 +558,8 @@ def generate_recipe_from_raw(
             except Exception as exc:  # noqa: BLE001
                 raise PipelineStageError("extract_recipe", str(exc)) from exc
 
+        if options.require_screenshot and options.no_screenshot:
+            raise PipelineStageError("screenshot", "step screenshots are required but disabled")
         if not options.no_screenshot and recipe.steps:
             try:
                 _emit(log, "Capturing step screenshots...")
@@ -517,7 +569,11 @@ def generate_recipe_from_raw(
                     _capture_fallback_key_screenshot(video, recipe, folder / "images", metadata.get("duration"))
             except Exception as exc:  # noqa: BLE001
                 stage_errors.append(f"screenshot: {exc}")
+                if options.require_screenshot:
+                    raise PipelineStageError("screenshot", str(exc)) from exc
                 _emit(log, f"Video download/screenshot skipped: {exc}")
+        if options.require_screenshot and not _has_existing_step_images(folder, recipe):
+            raise PipelineStageError("screenshot", "no usable step screenshot was produced")
 
         recipe_path = folder / "recipe.json"
         note_path = folder / "note.md"
@@ -632,6 +688,8 @@ def _recipe_options(options: BatchJobOptions, url: str) -> RecipeJobOptions:
         language=options.language,
         keep_media=options.keep_media,
         no_llm_summary=options.no_llm_summary,
+        require_llm=options.require_llm,
+        require_screenshot=options.require_screenshot,
         llm_provider=options.llm_provider,
         openai_model=options.openai_model,
         local_llm_command=options.local_llm_command,
@@ -658,7 +716,11 @@ def _process_batch_url(
 
     job_options = _recipe_options(options, url)
     complete_existing = find_history_by_url(options.out, url) if options.skip_existing else None
-    if complete_existing and options.target_stage == "recipe":
+    if (
+        complete_existing
+        and options.target_stage == "recipe"
+        and _recipe_output_meets_requirements(complete_existing.output_folder, job_options)
+    ):
         notify("raw", "done", complete_existing.output_folder)
         notify("recipe", "done", complete_existing.output_folder)
         _emit(log, f"Skipped existing recipe output: {complete_existing.output_folder}")
@@ -690,7 +752,11 @@ def _process_batch_url(
             return BatchJobItemResult(url=url, status="raw_ready", output_folder=folder)
 
         complete = find_history_by_url(options.out, url) if options.skip_existing else None
-        if complete and complete.output_folder == folder:
+        if (
+            complete
+            and complete.output_folder == folder
+            and _recipe_output_meets_requirements(folder, job_options)
+        ):
             notify("recipe", "done", folder)
             _emit(log, f"Skipped existing recipe output: {folder}")
             return BatchJobItemResult(url=url, status="skipped", output_folder=folder, note_path=complete.note_path)
@@ -724,6 +790,28 @@ def _run_persistent_batch(options: BatchJobOptions, log: LogCallback | None = No
     stage_options = state.options.setdefault("stage_options", {})
     if isinstance(stage_options, dict):
         stage_options[options.target_stage] = _batch_options_snapshot(options)
+
+    if options.target_stage == "recipe" and (options.require_llm or options.require_screenshot):
+        for item in state.items:
+            if (
+                item.stages["raw"].status != "done"
+                or item.stages["recipe"].status != "done"
+                or not item.output_folder
+            ):
+                continue
+            folder = Path(item.output_folder)
+            job_options = _recipe_options(options, item.url)
+            if _recipe_output_meets_requirements(folder, job_options):
+                continue
+            recipe_stage = item.stages["recipe"]
+            recipe_stage.status = "pending"
+            recipe_stage.error = None
+            recipe_stage.started_at = None
+            recipe_stage.finished_at = None
+            item.status = "raw_ready"
+            item.error = None
+            item.note_path = None
+            item.finished_at = None
     save_batch_state(state)
 
     items_to_process = selectable_items(state, options.resume_mode, options.target_stage)

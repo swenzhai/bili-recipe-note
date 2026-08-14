@@ -534,11 +534,14 @@ def build_recipe_extraction_prompt(transcript: list[TranscriptSegment], metadata
         "- category: 用于归档的主分类，只能从 中餐/汤羹/西餐/糕点/主食/小吃/饮品/其他 中选择一个；\n"
         "- cuisine: 菜系，只能从 中式/西式/日式/韩式/东南亚/其他 中选择一个；\n"
         "- tags: 3–8 个便于检索的短标签数组，优先使用主食材、烹饪技法和菜品特点，不要带 #；\n"
-        "- ingredients/seasonings: 数组，每项包含 name、amount、note、evidence、source_time、confidence；\n"
+        "- ingredients/seasonings: 数组；每项的 name 必须是字符串，amount/note/evidence 必须是单个字符串或 null，"
+        "source_time 必须是数字或 null，confidence 必须是数字或 null；\n"
         "- tools/prep_items/shopping_list: 字符串数组；\n"
         "- steps: 面向日后检索和快速回顾，只保留 6–10 个关键烹饪阶段，最多 10 个；"
         "必须过滤寒暄、广告、食材评价、试吃和成菜后的闲聊，并将连续的小动作合并成一个可执行阶段。"
-        "每项包含 title、start_time、end_time、action、heat、duration、tips、evidence、confidence；\n"
+        "每项的 title/action 必须是字符串，start_time 必须是数字，end_time/confidence 必须是数字或 null，"
+        "heat/duration/tips/evidence 必须是单个字符串或 null；如有多条 tips，必须用中文分号合并成一个字符串，"
+        "绝不能输出数组；\n"
         "- summary_tips/uncertain_points: 字符串数组；\n"
         "- confidence 必须是 0 到 1；无法确认的用量、火候、时长必须写 null 并加入 uncertain_points；\n"
         "- 不得伪造 source_url、video_title 或 uploader。\n\n"
@@ -656,6 +659,13 @@ def _normalize_timestamp(value: Any) -> float | None:
     return None
 
 
+def _normalize_optional_text(value: Any) -> str | None:
+    """Accept occasional LLM string arrays while preserving the scalar schema."""
+    values = value if isinstance(value, list) else [value]
+    cleaned = [str(item).strip() for item in values if item is not None and str(item).strip()]
+    return "；".join(cleaned) or None
+
+
 def _normalize_recipe_payload(data: dict[str, Any], metadata: dict) -> dict[str, Any]:
     payload = dict(data)
     payload["title"] = str(payload.get("title") or metadata.get("recipe_title") or metadata.get("video_title") or "未命名菜谱")
@@ -684,6 +694,8 @@ def _normalize_recipe_payload(data: dict[str, Any], metadata: dict) -> dict[str,
                 continue
             normalized = dict(item)
             normalized["name"] = str(normalized["name"]).strip()
+            for text_key in ("amount", "note", "evidence"):
+                normalized[text_key] = _normalize_optional_text(normalized.get(text_key))
             normalized["confidence"] = _normalize_confidence(normalized.get("confidence"))
             normalized["source_time"] = _normalize_timestamp(normalized.get("source_time"))
             normalized_items.append(normalized)
@@ -706,6 +718,8 @@ def _normalize_recipe_payload(data: dict[str, Any], metadata: dict) -> dict[str,
             normalized_end = _normalize_timestamp(end)
             normalized["end_time"] = max(normalized["start_time"], normalized_end) if normalized_end is not None else None
             normalized["action"] = action
+            for text_key in ("heat", "duration", "tips", "evidence"):
+                normalized[text_key] = _normalize_optional_text(normalized.get(text_key))
             normalized["confidence"] = _normalize_confidence(normalized.get("confidence"))
             normalized_steps.append(normalized)
     payload["steps"] = sorted(normalized_steps, key=lambda item: item["start_time"])

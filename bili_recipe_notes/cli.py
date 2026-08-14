@@ -38,6 +38,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--language", default="zh")
     parser.add_argument("--keep-media", action="store_true")
     parser.add_argument("--no-llm-summary", action="store_true")
+    parser.add_argument(
+        "--require-llm",
+        action="store_true",
+        help="Fail and retry the recipe stage instead of using rule-based fallback when LLM extraction fails",
+    )
+    parser.add_argument(
+        "--require-screenshot",
+        action="store_true",
+        help="Fail and retry the recipe stage when no step screenshot can be produced",
+    )
     parser.add_argument("--llm-provider", choices=["opencode", "codex", "openai", "local", "none"], default="opencode")
     parser.add_argument("--openai-model", default="gpt-5.5")
     parser.add_argument("--local-llm-command", default=None)
@@ -143,6 +153,8 @@ def _single_options(args: argparse.Namespace, url: str, extra_instructions: str 
         language=getattr(args, "language", "zh"),
         keep_media=getattr(args, "keep_media", False),
         no_llm_summary=getattr(args, "no_llm_summary", False),
+        require_llm=getattr(args, "require_llm", False),
+        require_screenshot=getattr(args, "require_screenshot", False),
         llm_provider=getattr(args, "llm_provider", "opencode"),
         openai_model=getattr(args, "openai_model", "gpt-5.5"),
         local_llm_command=getattr(args, "local_llm_command", None),
@@ -171,6 +183,8 @@ def _batch_options(
         language=getattr(args, "language", "zh"),
         keep_media=getattr(args, "keep_media", False),
         no_llm_summary=getattr(args, "no_llm_summary", False),
+        require_llm=getattr(args, "require_llm", False),
+        require_screenshot=getattr(args, "require_screenshot", False),
         llm_provider=getattr(args, "llm_provider", "opencode"),
         openai_model=getattr(args, "openai_model", "gpt-5.5"),
         local_llm_command=getattr(args, "local_llm_command", None),
@@ -369,6 +383,7 @@ def run(args: argparse.Namespace) -> int:
     if batch_requested:
         if getattr(args, "creator_home", False):
             raise ValueError("--creator-home cannot be combined with batch mode")
+        _validate_required_recipe_outputs(args)
         return _run_batch_mode(args, _extra_instructions(args))
 
     if any(
@@ -396,10 +411,20 @@ def run(args: argparse.Namespace) -> int:
         )
         return 0
 
+    _validate_required_recipe_outputs(args)
     options = _single_options(args, str(url), _extra_instructions(args))
     result = generate_recipe_note(options, log=_log)
     console.print(f"[green]Done. Output saved to {result.output_folder}[/green]")
     return 0
+
+
+def _validate_required_recipe_outputs(args: argparse.Namespace) -> None:
+    if getattr(args, "require_llm", False):
+        provider = str(getattr(args, "llm_provider", "opencode") or "").strip().lower()
+        if getattr(args, "no_llm_summary", False) or provider in {"", "none"}:
+            raise ValueError("--require-llm needs an enabled --llm-provider and cannot use --no-llm-summary")
+    if getattr(args, "require_screenshot", False) and getattr(args, "no_screenshot", False):
+        raise ValueError("--require-screenshot cannot be combined with --no-screenshot")
 
 
 def main() -> int:

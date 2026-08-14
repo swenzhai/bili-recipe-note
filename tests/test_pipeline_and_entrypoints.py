@@ -23,8 +23,9 @@ sys.modules.setdefault("rich", rich_module)
 sys.modules.setdefault("rich.console", rich_console_module)
 
 from bili_recipe_notes import cli, pipeline
+from bili_recipe_notes.batch_queue import create_batch_state, save_batch_state
 from bili_recipe_notes.downloader import CreatorCrawlResult, CreatorVideo
-from bili_recipe_notes.pipeline import BatchJobOptions, RecipeJobOptions, RecipeJobResult
+from bili_recipe_notes.pipeline import BatchJobItemResult, BatchJobOptions, RecipeJobOptions, RecipeJobResult
 from bili_recipe_notes.recipe_extractor import TranscriptSegment
 
 
@@ -138,6 +139,81 @@ def test_generate_recipe_note_uses_deterministic_fallback_when_structured_llm_fa
     assert captured == {}
     assert result.stage_errors and "structured output unavailable" in result.stage_errors[0]
     assert "抽取方式" not in note
+
+
+def test_required_llm_failure_marks_recipe_stage_failed(monkeypatch, tmp_path) -> None:
+    folder = tmp_path / "outputs" / "raw"
+    folder.mkdir(parents=True)
+    (folder / "source.json").write_text(
+        json.dumps({"source_url": "https://example.com/video", "video_title": "demo"}),
+        encoding="utf-8",
+    )
+    (folder / "transcript.json").write_text(
+        json.dumps([{"start": 0, "end": 1, "text": "先切菜，然后下锅翻炒"}]),
+        encoding="utf-8",
+    )
+    (folder / "job.json").write_text(
+        json.dumps({"status": "raw_ready", "stages": {"raw": {"status": "done"}, "recipe": {"status": "pending"}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_recipe_with_llm",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("empty output")),
+    )
+
+    with pytest.raises(pipeline.PipelineStageError, match="extract_recipe_llm"):
+        pipeline.generate_recipe_from_raw(
+            folder,
+            RecipeJobOptions(
+                url="https://example.com/video",
+                out=str(tmp_path / "outputs"),
+                no_screenshot=True,
+                llm_provider="codex",
+                require_llm=True,
+            ),
+        )
+
+    job = json.loads((folder / "job.json").read_text(encoding="utf-8"))
+    assert job["status"] == "failed"
+    assert job["stages"]["recipe"]["status"] == "failed"
+
+
+def test_required_screenshot_failure_marks_recipe_stage_failed(monkeypatch, tmp_path) -> None:
+    folder = tmp_path / "outputs" / "raw"
+    folder.mkdir(parents=True)
+    (folder / "source.json").write_text(
+        json.dumps({"source_url": "https://example.com/video", "video_title": "demo"}),
+        encoding="utf-8",
+    )
+    (folder / "transcript.json").write_text(
+        json.dumps([{"start": 0, "end": 1, "text": "先切菜，然后下锅翻炒"}]),
+        encoding="utf-8",
+    )
+    (folder / "job.json").write_text(
+        json.dumps({"status": "raw_ready", "stages": {"raw": {"status": "done"}, "recipe": {"status": "pending"}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "download_lowres_video",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("HTTP 412")),
+    )
+
+    with pytest.raises(pipeline.PipelineStageError, match="screenshot"):
+        pipeline.generate_recipe_from_raw(
+            folder,
+            RecipeJobOptions(
+                url="https://example.com/video",
+                out=str(tmp_path / "outputs"),
+                no_llm_summary=True,
+                require_screenshot=True,
+            ),
+        )
+
+    job = json.loads((folder / "job.json").read_text(encoding="utf-8"))
+    assert job["status"] == "failed"
+    assert job["stages"]["recipe"]["status"] == "failed"
 
 
 def test_generate_recipe_note_captures_fallback_key_image(monkeypatch, tmp_path) -> None:
@@ -429,6 +505,77 @@ def test_batch_skip_requires_done_job_and_complete_artifacts(monkeypatch, tmp_pa
     complete = pipeline.run_batch(BatchJobOptions(urls=[url], out=str(tmp_path / "outputs")))
     assert complete.items[0].status == "skipped"
     assert generated == [url]
+
+
+def test_strict_batch_requeues_degraded_completed_recipe(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    url = "https://example.com/video"
+    folder = tmp_path / "outputs" / "degraded"
+    folder.mkdir(parents=True)
+    (folder / "source.json").write_text(json.dumps({"source_url": url}), encoding="utf-8")
+    (folder / "transcript.json").write_text(
+        json.dumps([{"start": 0, "end": 1, "text": "先切菜，然后下锅"}]),
+        encoding="utf-8",
+    )
+    (folder / "recipe.json").write_text(
+        json.dumps(
+            {
+                "title": "demo",
+                "source_url": url,
+                "ingredients": [],
+                "seasonings": [],
+                "tools": [],
+                "steps": [{"title": "步骤1", "start_time": 0, "action": "切菜"}],
+                "summary_tips": [],
+                "uncertain_points": [],
+                "extraction_method": "rule",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (folder / "note.md").write_text("# demo", encoding="utf-8")
+    (folder / "job.json").write_text(
+        json.dumps(
+            {
+                "status": "done",
+                "source_url": url,
+                "stages": {"raw": {"status": "done"}, "recipe": {"status": "done"}},
+                "stage_errors": ["extract_recipe_llm: empty output", "screenshot: HTTP 412"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = create_batch_state([url], {}, batch_id="strict-repair", project_root=tmp_path)
+    item = state.items[0]
+    item.status = "done"
+    item.output_folder = str(folder)
+    item.note_path = str(folder / "note.md")
+    item.stages["raw"].status = "done"
+    item.stages["recipe"].status = "done"
+    save_batch_state(state, project_root=tmp_path)
+    processed = []
+
+    def _process(options, item_url, log=None, *, output_folder=None, stage_callback=None):
+        processed.append((item_url, output_folder))
+        return BatchJobItemResult(item_url, "failed", output_folder=output_folder, error="test stop")
+
+    monkeypatch.setattr(pipeline, "_process_batch_url", _process)
+
+    pipeline.run_batch(
+        BatchJobOptions(
+            urls=[],
+            out=str(tmp_path / "outputs"),
+            batch_id="strict-repair",
+            resume_mode="resume-unfinished",
+            target_stage="recipe",
+            llm_provider="codex",
+            require_llm=True,
+            require_screenshot=True,
+        )
+    )
+
+    assert processed == [(url, folder)]
 
 
 def test_extract_creator_links_writes_file(monkeypatch, tmp_path) -> None:

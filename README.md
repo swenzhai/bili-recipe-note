@@ -61,6 +61,8 @@ python -m bili_recipe_notes "https://www.bilibili.com/video/BVxxxx"
 - `--language zh`
 - `--keep-media`
 - `--no-llm-summary`
+- `--require-llm`（LLM 失败时不使用规则降级，保留失败状态以便重试）
+- `--require-screenshot`（无法生成步骤截图时保留失败状态以便重试）
 - `--llm-provider opencode|codex|openai|local|none`
 - `--codex-model MODEL` / `--codex-profile PROFILE`
 - `--local-llm-command "COMMAND ..."`
@@ -133,6 +135,8 @@ python -m bili_recipe_notes \
   --resume-batch my-recipes \
   --target-stage recipe \
   --llm-provider codex \
+  --require-llm \
+  --require-screenshot \
   --codex-model gpt-5.5 \
   --max-steps 10 \
   --max-images 4
@@ -429,6 +433,8 @@ UI 中的菜谱预览会把 `note.md` 内的 `images/...` 相对路径解析到�
 
 如果遇到 Bilibili `HTTP Error 412: Precondition Failed`：
 
+- CLI/UI 会自动刷新匿名请求指纹并重试，默认最多尝试 5 次，等待时间依次为 30、60、120、240 秒；前台 CLI 会在终端显示等待和重试进度。
+- 5 次仍失败后才会把当前阶段标记为失败，批处理可以继续处理其他条目，不需要手动终止程序。
 - 先关闭 UI 重新双击启动文件，启动脚本会自动检查并重装项目锁定的 `yt-dlp` 版本。
 - 需要升级时先更新 `requirements.txt` 中的版本号，再执行 `python -m pip install -r requirements.txt`。
 - 如果视频需要登录态，重新从浏览器导出最新 `cookies.txt`，并在 CLI/UI 中传入。

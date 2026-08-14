@@ -69,6 +69,7 @@ def test_cli_runs_new_batch_and_passes_processing_options(monkeypatch, tmp_path:
             "--cookies",
             "cookies.txt",
             "--no-screenshot",
+            "--require-llm",
         ]
     )
 
@@ -80,6 +81,21 @@ def test_cli_runs_new_batch_and_passes_processing_options(monkeypatch, tmp_path:
     assert options.whisper_model == "medium"
     assert options.cookies == "cookies.txt"
     assert options.no_screenshot is True
+    assert options.require_llm is True
+
+
+def test_cli_rejects_conflicting_required_output_flags() -> None:
+    args = cli.build_parser().parse_args(
+        ["https://example.com/BV1", "--require-llm", "--llm-provider", "none"]
+    )
+    with pytest.raises(ValueError, match="--require-llm"):
+        cli.run(args)
+
+    args = cli.build_parser().parse_args(
+        ["https://example.com/BV1", "--require-screenshot", "--no-screenshot"]
+    )
+    with pytest.raises(ValueError, match="--require-screenshot"):
+        cli.run(args)
 
 
 def test_cli_resumes_existing_batch_without_new_urls(monkeypatch, tmp_path: Path) -> None:
