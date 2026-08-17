@@ -15,7 +15,10 @@ from .batch_queue import (
     list_batch_states,
     load_batch_state,
 )
+from .curation import DEFAULT_CURATION_REVIEW_DIR, build_curation_review
+from .deployment import export_deployment_bundle
 from .handoff import HandoffError, export_batch_handoff, import_handoff_bundle
+from .output_folders import apply_output_folder_migration, plan_output_folder_migration
 from .pipeline import BatchJobOptions, RecipeJobOptions, extract_creator_links, generate_recipe_note, run_batch
 from .web_export import DEFAULT_WEB_LIBRARY_NAME, export_web_library
 
@@ -73,6 +76,11 @@ def build_parser() -> argparse.ArgumentParser:
     action_mode.add_argument("--show-batch", metavar="BATCH_ID", help="Show one persisted batch and exit")
     action_mode.add_argument("--list-batches", action="store_true", help="List persisted batches and exit")
     action_mode.add_argument(
+        "--normalize-output-folders",
+        choices=["preview", "apply"],
+        help="Preview or apply concise recipe-title--video-id output folder names",
+    )
+    action_mode.add_argument(
         "--export-handoff",
         metavar="BATCH_ID",
         help="Export one batch and its durable work files as a portable handoff ZIP",
@@ -88,6 +96,20 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         const="",
         help="Export all recipes and step images for the offline web app (default: OUT/bili-recipe-web-library.json)",
+    )
+    action_mode.add_argument(
+        "--export-curation-review",
+        metavar="PATH",
+        nargs="?",
+        const="",
+        help="Export a reviewable CSV/JSON report for duplicate and similar recipe names",
+    )
+    action_mode.add_argument(
+        "--export-deployment-bundle",
+        metavar="PATH",
+        nargs="?",
+        const="",
+        help="Export app source, recipe outputs, images, and curation state as a portable ZIP",
     )
     parser.add_argument(
         "--handoff-destination",
@@ -348,6 +370,66 @@ def _run_handoff_mode(args: argparse.Namespace) -> int:
 
 
 def run(args: argparse.Namespace) -> int:
+    normalize_output_folders = getattr(args, "normalize_output_folders", None)
+    if normalize_output_folders:
+        if any((getattr(args, "url", None), getattr(args, "batch_url", None), getattr(args, "batch_file", None))):
+            raise ValueError("--normalize-output-folders does not accept video URLs or --batch-file")
+        plans = plan_output_folder_migration(getattr(args, "out", "outputs"))
+        console.print(f"Output folder renames: {len(plans)}")
+        for plan in plans[:20]:
+            console.print(f"{plan.source.name} -> {plan.target.name}")
+        if len(plans) > 20:
+            console.print(f"... and {len(plans) - 20} more")
+        if normalize_output_folders == "preview":
+            return 0
+        result = apply_output_folder_migration(plans, project_root=Path.cwd())
+        console.print(
+            f"[green]Output folders normalized:[/green] renamed={result.renamed} "
+            f"| updated={result.updated_documents}"
+        )
+        if result.manifest_path:
+            print(f"MIGRATION_MANIFEST={result.manifest_path}")
+        return 0
+
+    deployment_destination = getattr(args, "export_deployment_bundle", None)
+    if deployment_destination is not None:
+        if any((getattr(args, "url", None), getattr(args, "batch_url", None), getattr(args, "batch_file", None))):
+            raise ValueError("--export-deployment-bundle does not accept video URLs or --batch-file")
+        destination = Path(deployment_destination).expanduser() if deployment_destination else None
+        result = export_deployment_bundle(
+            getattr(args, "out", "outputs"),
+            destination,
+            project_root=Path.cwd(),
+        )
+        console.print(
+            f"[green]Deployment bundle exported:[/green] files={result.file_count} "
+            f"| outputs={result.output_file_count} | size={result.archive_size_bytes} bytes"
+        )
+        print(f"DEPLOYMENT_BUNDLE_PATH={result.path}")
+        print(f"DEPLOYMENT_BUNDLE_SHA256={result.sha256}")
+        print(f"DEPLOYMENT_CHECKSUM_PATH={result.checksum_path}")
+        return 0
+
+    curation_destination = getattr(args, "export_curation_review", None)
+    if curation_destination is not None:
+        if any((getattr(args, "url", None), getattr(args, "batch_url", None), getattr(args, "batch_file", None))):
+            raise ValueError("--export-curation-review does not accept video URLs or --batch-file")
+        out_dir = Path(getattr(args, "out", "outputs")).expanduser()
+        destination = (
+            Path(curation_destination).expanduser()
+            if curation_destination
+            else out_dir / DEFAULT_CURATION_REVIEW_DIR
+        )
+        result = build_curation_review(out_dir, destination)
+        console.print(
+            f"[green]Curation review exported:[/green] groups={result.duplicate_name_groups} "
+            f"| similar_names={result.similar_name_pairs} | items={result.review_item_count} "
+            f"| primary={result.primary_candidate_count}"
+        )
+        print(f"CURATION_REVIEW_CSV={result.csv_path}")
+        print(f"CURATION_REVIEW_JSON={result.json_path}")
+        return 0
+
     web_destination = getattr(args, "export_web_library", None)
     if web_destination is not None:
         if any((getattr(args, "url", None), getattr(args, "batch_url", None), getattr(args, "batch_file", None))):

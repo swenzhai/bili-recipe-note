@@ -8,6 +8,7 @@ from streamlit.testing.v1 import AppTest
 
 from bili_recipe_notes import ui
 from bili_recipe_notes.batch_queue import BatchQueueItem, BatchQueueState, create_batch_state
+from bili_recipe_notes.curation import build_curation_review, load_curation_decisions
 
 
 def _recipe(title: str, *, ingredients: list[dict] | None = None, seasonings: list[dict] | None = None) -> dict:
@@ -174,6 +175,49 @@ def test_backups_are_timestamped_and_navigation_is_conditional(tmp_path: Path) -
     assert not any(button.label == "运行环境检查" for button in at.button)
     assert "zip" in ui.EXPORT_KINDS
     assert ui.EXPORT_MIME_TYPES[".zip"] == "application/zip"
+
+
+def test_curation_page_compares_sources_and_saves_decision(tmp_path: Path) -> None:
+    first_recipe = _recipe(
+        "宫保鸡丁",
+        ingredients=[{"name": "鸡腿肉", "amount": "300克", "note": "切丁"}],
+        seasonings=[{"name": "花椒", "amount": "20粒"}],
+    )
+    first_recipe["video_title"] = "传统宫保鸡丁完整做法"
+    first_recipe["steps"] = [
+        {"title": "上浆", "action": "鸡丁加盐和淀粉上浆", "evidence": "鸡丁先上浆"},
+        {"title": "炒制", "action": "花椒辣椒炒香后下鸡丁", "evidence": "先下花椒"},
+    ]
+    second_recipe = _recipe(
+        "宫保鸡丁",
+        ingredients=[{"name": "鸡腿肉", "amount": "适量"}],
+        seasonings=[{"name": "宫保汁", "amount": "一袋"}],
+    )
+    second_recipe["video_title"] = "一袋宫保酱汁快速出锅"
+    second_recipe["steps"] = [{"title": "炒制", "action": "鸡丁炒熟后倒入酱汁"}]
+    first = _write_record(tmp_path, "宫保鸡丁--BV1full", first_recipe)
+    _write_record(tmp_path, "宫保鸡丁--BV1quick", second_recipe)
+    build_curation_review(tmp_path, tmp_path / "curation-review")
+
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
+    at.selectbox(key="main_page").set_value("最终菜谱整理")
+    at.run()
+
+    assert not at.exception
+    assert any(button.label == "采用本组自动建议" for button in at.button)
+    assert any(box.label == "选择一个来源查看完整内容" for box in at.selectbox)
+    assert any("鸡腿肉" in str(table.value) for table in at.dataframe)
+
+    next(box for box in at.selectbox if box.label == "处理方式").set_value("keep_primary")
+    next(area for area in at.text_area if area.label == "取舍理由").set_value("步骤完整，作为主版本")
+    next(button for button in at.button if button.label == "保存决定").click()
+    at.run()
+
+    assert not at.exception
+    decisions = load_curation_decisions(tmp_path / "curation-review")
+    assert decisions["items"][first.name]["decision"] == "keep_primary"
+    assert decisions["items"][first.name]["review_notes"] == "步骤完整，作为主版本"
 
 
 def test_mobile_cooking_mode_scales_ingredients_and_navigates_steps(tmp_path: Path) -> None:

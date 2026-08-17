@@ -98,6 +98,88 @@ def test_cli_rejects_conflicting_required_output_flags() -> None:
         cli.run(args)
 
 
+def test_cli_previews_and_applies_output_folder_normalization(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    plan = type("Plan", (), {"source": tmp_path / "old", "target": tmp_path / "new"})()
+    captured = {}
+    monkeypatch.setattr(cli, "plan_output_folder_migration", lambda out: [plan])
+
+    preview = cli.build_parser().parse_args(["--normalize-output-folders", "preview"])
+    assert cli.run(preview) == 0
+
+    def _apply(plans, project_root=None):
+        captured.update(plans=plans, project_root=project_root)
+        from bili_recipe_notes.output_folders import OutputFolderMigrationResult
+
+        return OutputFolderMigrationResult(1, 1, 2, tmp_path / "manifest.json")
+
+    monkeypatch.setattr(cli, "apply_output_folder_migration", _apply)
+    apply = cli.build_parser().parse_args(["--normalize-output-folders", "apply"])
+    assert cli.run(apply) == 0
+    assert captured == {"plans": [plan], "project_root": tmp_path}
+
+
+def test_cli_exports_curation_review_to_default_output_path(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    captured = {}
+
+    def fake_build(out_dir, destination):
+        captured.update(out_dir=out_dir, destination=destination)
+        from bili_recipe_notes.curation import CurationReviewResult
+
+        review_dir = tmp_path / "outputs" / "curation-review"
+        return CurationReviewResult(
+            review_dir / "recipe-review.json",
+            review_dir / "recipe-review.csv",
+            2,
+            1,
+            5,
+            2,
+        )
+
+    monkeypatch.setattr(cli, "build_curation_review", fake_build)
+    args = cli.build_parser().parse_args(["--export-curation-review"])
+
+    assert cli.run(args) == 0
+    assert captured == {
+        "out_dir": Path("outputs"),
+        "destination": Path("outputs") / "curation-review",
+    }
+    assert "CURATION_REVIEW_CSV=" in capsys.readouterr().out
+
+
+def test_cli_exports_deployment_bundle(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    captured = {}
+
+    def fake_export(out_dir, destination, project_root=None):
+        captured.update(out_dir=out_dir, destination=destination, project_root=project_root)
+        from bili_recipe_notes.deployment import DeploymentBundleResult
+
+        return DeploymentBundleResult(
+            tmp_path / "bundle.zip",
+            tmp_path / "bundle.zip.sha256",
+            "abc123",
+            10,
+            20,
+            2,
+            33,
+            1000,
+            500,
+        )
+
+    monkeypatch.setattr(cli, "export_deployment_bundle", fake_export)
+    args = cli.build_parser().parse_args(["--export-deployment-bundle", str(tmp_path / "transfer")])
+
+    assert cli.run(args) == 0
+    assert captured == {
+        "out_dir": "outputs",
+        "destination": tmp_path / "transfer",
+        "project_root": tmp_path,
+    }
+    assert "DEPLOYMENT_BUNDLE_PATH=" in capsys.readouterr().out
+
+
 def test_cli_resumes_existing_batch_without_new_urls(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     state = create_batch_state(["https://example.com/BV1"], {}, batch_id="resume-me")

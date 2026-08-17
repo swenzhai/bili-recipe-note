@@ -27,6 +27,7 @@ from .llm import (
     summarize_note,
 )
 from .markdown_writer import render_markdown
+from .output_folders import rename_completed_output_folder
 from .quality import write_quality_report
 from .recipe_extractor import Recipe, TranscriptSegment, extract_recipe_rule_based, extract_recipe_with_llm
 from .recipe_review import create_recipe_review
@@ -386,7 +387,7 @@ def capture_raw_material(
         title = info.get("title") or "untitled"
         bvid, cid, part_id, part_label = _stable_video_identity(info, options.url)
         folder_name = build_output_folder_name(
-            title=title,
+            title="待整理",
             uploader=info.get("uploader"),
             video_id=bvid,
             part_id=part_id,
@@ -603,6 +604,21 @@ def generate_recipe_from_raw(
             }
         )
         job_path = _write_job(folder, job)
+        try:
+            renamed_folder = rename_completed_output_folder(folder)
+        except Exception as exc:  # noqa: BLE001
+            stage_errors.append(f"output_folder: {exc}")
+            job["stage_errors"] = stage_errors
+            job_path = _write_job(folder, job)
+            _emit(log, f"Output folder rename skipped: {exc}")
+        else:
+            if renamed_folder != folder:
+                folder = renamed_folder
+                media_dir = folder / "media"
+                transcript_path = folder / "transcript.json"
+                recipe_path = folder / "recipe.json"
+                note_path = folder / "note.md"
+                job_path = folder / "job.json"
         return RecipeJobResult(folder, note_path, recipe_path, transcript_path, final_note, job_path, stage_errors)
     except Exception as exc:
         _set_job_stage(job, "recipe", "failed", str(exc))
@@ -763,6 +779,7 @@ def _process_batch_url(
 
         notify("recipe", "running", folder)
         result = generate_recipe_from_raw(folder, job_options, log=log)
+        folder = result.output_folder
         notify("recipe", "done", folder)
         return BatchJobItemResult(url=url, status="done", output_folder=folder, note_path=result.note_path)
     except Exception as exc:  # noqa: BLE001

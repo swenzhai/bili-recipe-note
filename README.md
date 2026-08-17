@@ -78,6 +78,9 @@ python -m bili_recipe_notes "https://www.bilibili.com/video/BVxxxx"
 - `--create-only`（只创建 pending 批次，不执行下载、字幕、Whisper 或 LLM）
 - `--resume-batch ID` / `--retry-batch ID`（继续未完成阶段 / 只重试失败阶段）
 - `--list-batches` / `--show-batch ID`（查看批次列表或逐条状态）
+- `--normalize-output-folders preview|apply`（预览或执行旧输出目录规范化）
+- `--export-curation-review [PATH]`（生成同名/近似名菜谱审核表）
+- `--export-deployment-bundle [PATH]`（导出源码、菜谱、图片和整理进度的跨平台部署包）
 - `--export-handoff ID`（把批次和已完成工作导出为跨平台交接包）
 - `--import-handoff PATH`（校验并导入 `.handoff.zip`）
 - `--handoff-destination PATH`（指定交接包导出文件或目录）
@@ -197,6 +200,52 @@ python -m bili_recipe_notes `
 
 批次状态保存在 `.bili-recipe-notes/batches/<批次ID>.json`，输出仍写入 `--out` 指定的目录。每次续跑都会采用当前命令传入的 Whisper、LLM、截图和审核设置；Cookie 不会写入工作产物，换电脑后应传入该电脑自己的 Cookie 文件。批次中只要有条目失败，CLI 会返回退出码 `1`；全部成功或没有待处理条目时返回 `0`。
 
+完整菜谱目录采用 `规范菜名--BVID`，分 P/CID 视频会继续附加稳定分段 ID。原始阶段暂时使用 `待整理--BVID`，菜谱抽取成功后自动改成最终名称；视频宣传标题和 UP 主名称只保存在元数据中，不进入目录名。旧目录可先预览、确认无冲突后再迁移：
+
+```bash
+python -m bili_recipe_notes --normalize-output-folders preview --out outputs
+python -m bili_recipe_notes --normalize-output-folders apply --out outputs
+```
+
+迁移会同步更新 `job.json`、批次状态和移动端索引，并在 `.bili-recipe-notes/migrations/` 保存旧路径到新路径的清单。运行中的后台批次存在时会拒绝迁移。
+
+准备合并最终版菜谱前，可先生成不会修改原始输出的审核表：
+
+```bash
+python -m bili_recipe_notes --export-curation-review --out outputs
+```
+
+默认生成 `outputs/curation-review/recipe-review.csv` 和 `recipe-review.json`。工具会聚合同名菜谱，谨慎提示仅相差一个字的近似名称，并根据步骤完整度、视频时长、质量分、字幕重合和推广信号推荐 `primary_candidate`、`variant_candidate`、`short_clip_candidate`、`exclude_candidate` 或 `name_review_candidate`。也可以在网页的“最终菜谱整理”页面对照全部来源的用料、步骤、字幕证据和原视频，保存主版本、不同做法、短剪合并或排除决定。人工结果独立保存在 `outputs/curation-review/curation-decisions.json`，重新扫描不会覆盖。
+
+### 迁移到另一台电脑
+
+需要把当前源码、全部输出和整理进度一起搬走时，生成跨平台部署包：
+
+```bash
+python -m bili_recipe_notes --export-deployment-bundle --out outputs
+```
+
+默认写入 `deployments/bili-recipe-notes-<时间>.deployment.zip`。包内包含当前应用源码、依赖清单、启动脚本、菜谱 JSON/Markdown、字幕、步骤图片、批次状态、整理报告和人工决定；不会包含 Cookie、`.venv`、Git 历史、缓存、原始音视频、`.bak`、已有 ZIP 或移动端数据库。导出结束前会逐文件校验大小和 SHA-256。
+
+Windows PowerShell 解压后，在包内的 `bili-recipe-notes` 目录运行：
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\start-ui-windows.bat
+```
+
+Linux/macOS 解压后运行：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+ARROW_DEFAULT_MEMORY_POOL=system .venv/bin/python -m streamlit run bili_recipe_notes/ui.py \
+  --server.address=127.0.0.1 --server.port=8501 --server.headless=true
+```
+
+首次进入“最终菜谱整理”后点击“重新扫描输出”，让报告路径适配新电脑。已经保存的人工决定使用稳定目录 ID，不会被重新扫描覆盖。包内另附 `DEPLOYMENT.md`，可离线查看相同步骤。
+
 ### 本地 UI
 
 安装依赖后可启动本地 Web UI。macOS/Linux 直接运行时建议在 PyArrow 导入前选择系统内存池：
@@ -213,6 +262,22 @@ Windows PowerShell：
 $env:ARROW_DEFAULT_MEMORY_POOL = "system"
 python -m streamlit run bili_recipe_notes/ui.py --server.address=127.0.0.1 --browser.serverAddress=127.0.0.1
 ```
+
+代码运行在远程服务器时，仍应只监听服务器回环地址，再从自己的电脑通过 SSH 隧道访问。先在服务器运行：
+
+```bash
+cd /home/swenzhai/work/bili-recipe-note
+ARROW_DEFAULT_MEMORY_POOL=system .venv/bin/python -m streamlit run bili_recipe_notes/ui.py \
+  --server.address=127.0.0.1 --server.port=8501 --server.headless=true
+```
+
+再在自己的电脑保持以下命令运行，并打开 `http://127.0.0.1:8501`：
+
+```bash
+ssh -N -L 8501:127.0.0.1:8501 用户名@服务器地址
+```
+
+如果本机 `8501` 已占用，可改用 `-L 18501:127.0.0.1:8501` 并打开 `http://127.0.0.1:18501`。当前 Streamlit 页面没有账号认证，不应直接监听公网 `0.0.0.0`。
 
 也可以直接双击项目根目录下的快捷启动文件：
 
@@ -242,6 +307,7 @@ UI 会在浏览器中打开，支持：
 - 设置 cookies 文件路径、输出目录、语言、Whisper 模型
 - 开关步骤截图、LLM 重写、临时媒体保留，并设置最终步骤/关键图片上限
 - 可选生成逐项审核版，在“审核确认”中采用、修改后采用或跳过每一项
+- 在“最终菜谱整理”中横向比较同名和近似名来源，确认主版本、不同做法、短剪合并或排除
 - 生成结果先进入“草稿与归档”，可以不修改直接存档，也可以完整编辑或审核后再存档
 - 在编辑页修改分类、菜系、标签、配料、步骤、关键点，或直接手写最终 Markdown
 - 将最终版本归档到现有或新建的 Obsidian vault；同一来源重复归档会更新原笔记
@@ -390,7 +456,7 @@ python -m bili_recipe_notes \
 生成和修复后的质量报告会保存到每个菜谱输出目录：
 
 ```text
-outputs/视频标题/quality.json
+outputs/规范菜名--BVID/quality.json
 ```
 
 ### LLM provider
@@ -442,7 +508,7 @@ UI 中的菜谱预览会把 `note.md` 内的 `images/...` 相对路径解析到�
 ## 输出示例
 
 ```text
-outputs/视频标题/
+outputs/规范菜名--BVID/
 ├── source.json          # 原视频元数据；原始阶段即生成
 ├── recipe.json
 ├── recipe.review.json   # 开启逐项审核时生成

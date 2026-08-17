@@ -781,7 +781,8 @@ def test_generate_recipe_from_raw_does_not_refetch_source(monkeypatch, tmp_path)
 
     assert result.recipe_path.is_file()
     assert result.note_path.is_file()
-    assert json.loads((folder / "job.json").read_text(encoding="utf-8"))["stages"]["recipe"]["status"] == "done"
+    assert result.output_folder.name == "demo--BV1xx411c7mD"
+    assert json.loads((result.output_folder / "job.json").read_text(encoding="utf-8"))["stages"]["recipe"]["status"] == "done"
 
 
 def test_creator_archive_uses_stable_folder_and_keeps_previous_list(monkeypatch, tmp_path) -> None:

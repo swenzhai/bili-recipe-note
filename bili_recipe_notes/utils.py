@@ -32,18 +32,17 @@ def build_output_folder_name(
     part_label: str = "cid",
     source_url: str | None = None,
 ) -> str:
-    """Build a readable folder name with a stable video identity suffix.
+    """Build a concise folder name with a stable video identity suffix.
 
-    Bilibili titles are not unique and can change over time.  Callers that know
-    the BVID/CID should pass them here so two same-title videos (or two parts of
-    one video) never share an output directory.  A URL hash is used only when
-    the extractor did not provide an ID.
+    ``uploader`` remains in the signature for caller compatibility, but it is
+    intentionally excluded from the folder name. Bilibili titles and uploader
+    names can change over time; the stable identity suffix prevents collisions.
     """
-    raw = f"{title} - {uploader or 'unknown'}"
-    safe = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff\- _]", "", raw)
+    del uploader
+    safe = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff（）()·\- _]", "", title)
     safe = re.sub(r"\s+", " ", safe).strip(" ._-")
     if not safe:
-        safe = "untitled - unknown"
+        safe = "untitled"
 
     identity_parts: list[str] = []
     if video_id is not None and str(video_id).strip():
@@ -62,9 +61,9 @@ def build_output_folder_name(
     if not identity_parts:
         return safe[:max_length]
 
-    suffix = f" - {'-'.join(identity_parts)}"
+    suffix = f"--{'-'.join(identity_parts)}"
     if len(suffix) >= max_length:
-        return suffix.lstrip(" -")[:max_length]
+        return suffix.lstrip("-")[:max_length]
     readable_length = max_length - len(suffix)
     readable = safe[:readable_length].rstrip(" ._-") or "video"
     return f"{readable}{suffix}"

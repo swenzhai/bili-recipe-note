@@ -13,5 +13,9 @@ def test_sanitize_filename() -> None:
 
 
 def test_build_output_folder_name() -> None:
-    assert build_output_folder_name("番茄炒蛋!!!", "UP主@厨房") == "番茄炒蛋 - UP主厨房"
-    assert build_output_folder_name("***", None) == "unknown"
+    assert build_output_folder_name("番茄炒蛋!!!", "UP主@厨房") == "番茄炒蛋"
+    assert build_output_folder_name("***", None) == "untitled"
+    assert (
+        build_output_folder_name("红烧肉（腐乳版）", "老饭骨", video_id="BV1demo", part_id=12)
+        == "红烧肉（腐乳版）--BV1demo-cid12"
+    )

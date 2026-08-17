@@ -21,6 +21,17 @@ try:
     from .batch_runner import get_background_batch_status, read_batch_log, start_background_batch
     from .config import UIConfig, load_config, save_config
     from .content_analysis import ContentAnalysisOptions, analyze_video_content
+    from .curation import (
+        CURATION_DECISION_VALUES,
+        DEFAULT_CURATION_REVIEW_DIR,
+        build_curation_review,
+        curation_decision_conflicts,
+        load_curation_decisions,
+        load_curation_review,
+        save_curation_decision,
+        save_curation_decisions,
+        suggested_curation_decision,
+    )
     from .cooking_mode import (
         build_shopping_list,
         parse_servings,
@@ -93,6 +104,17 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
     from bili_recipe_notes.batch_runner import get_background_batch_status, read_batch_log, start_background_batch
     from bili_recipe_notes.config import UIConfig, load_config, save_config
     from bili_recipe_notes.content_analysis import ContentAnalysisOptions, analyze_video_content
+    from bili_recipe_notes.curation import (
+        CURATION_DECISION_VALUES,
+        DEFAULT_CURATION_REVIEW_DIR,
+        build_curation_review,
+        curation_decision_conflicts,
+        load_curation_decisions,
+        load_curation_review,
+        save_curation_decision,
+        save_curation_decisions,
+        suggested_curation_decision,
+    )
     from bili_recipe_notes.cooking_mode import (
         build_shopping_list,
         parse_servings,
@@ -177,6 +199,7 @@ PAGES = [
     "烹饪模式",
     "草稿与归档",
     "审核确认",
+    "最终菜谱整理",
     "批量处理",
     "工作交接",
     "编辑修复",
@@ -206,6 +229,21 @@ STEP_COLUMNS = (
 )
 FLASH_STATE_KEY = "_ui_flash_message"
 LARGE_TABLE_PAGE_SIZE = 50
+CURATION_DECISION_LABELS = {
+    "pending": "未决定",
+    "keep_primary": "保留为主版本",
+    "keep_variant": "保留为不同做法",
+    "merge_clip": "并入长版，不单独保留",
+    "exclude": "排除（推广/非菜谱）",
+    "review": "仍需进一步核对",
+}
+CURATION_ROLE_LABELS = {
+    "primary_candidate": "建议主版本",
+    "variant_candidate": "建议保留变体",
+    "short_clip_candidate": "疑似短剪",
+    "exclude_candidate": "建议排除",
+    "name_review_candidate": "名称待确认",
+}
 
 
 def _optional_text(value: str | None) -> str | None:
@@ -1274,6 +1312,377 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
                     st.rerun()
 
 
+def _curation_item_id(item: dict[str, Any]) -> str:
+    item_id = str(item.get("item_id") or "").strip()
+    if item_id:
+        return item_id
+    return Path(str(item.get("output_folder") or "unknown")).name
+
+
+def _curation_saved_item(decisions: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    saved = decisions.get("items", {}).get(_curation_item_id(item), {})
+    return saved if isinstance(saved, dict) else {}
+
+
+def _curation_decision(item: dict[str, Any], decisions: dict[str, Any]) -> str:
+    value = str(_curation_saved_item(decisions, item).get("decision") or "pending")
+    return value if value in CURATION_DECISION_VALUES else "pending"
+
+
+def _curation_recipe(item: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    folder = Path(str(item.get("output_folder") or ""))
+    recipe_path = folder / "recipe.json"
+    if not recipe_path.is_file():
+        return None, f"找不到 recipe.json：{recipe_path}"
+    return _safe_recipe_to_data(recipe_path)
+
+
+def _curation_material_rows(item: dict[str, Any], recipe: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for field, label in (("ingredients", "主料"), ("seasonings", "调料")):
+        values = recipe.get(field)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            rows.append(
+                {
+                    "来源": item.get("bvid") or _curation_item_id(item),
+                    "规范名": item.get("group_title") or "",
+                    "类型": label,
+                    "名称": value.get("name") or "",
+                    "用量": value.get("amount") or "",
+                    "说明": value.get("note") or "",
+                    "字幕证据": value.get("evidence") or "",
+                }
+            )
+    return rows
+
+
+def _curation_step_rows(item: dict[str, Any], recipe: dict[str, Any]) -> list[dict[str, Any]]:
+    steps = recipe.get("steps") if isinstance(recipe.get("steps"), list) else []
+    return [
+        {
+            "来源": item.get("bvid") or _curation_item_id(item),
+            "规范名": item.get("group_title") or "",
+            "序号": index,
+            "步骤": step.get("title") or step.get("action") or "",
+            "操作": step.get("action") or "",
+            "火候": step.get("heat") or "",
+            "时长": step.get("duration") or "",
+            "提示": step.get("tips") or "",
+        }
+        for index, step in enumerate(steps, start=1)
+        if isinstance(step, dict)
+    ]
+
+
+def _render_curation_review(st, config: UIConfig) -> None:
+    st.subheader("最终菜谱整理")
+    st.caption("按规范菜名对照不同视频的完整用料、步骤和证据，再决定主版本、不同做法、短剪合并或排除。人工决定单独保存，不会修改 outputs 中的原始菜谱。")
+    out_dir = Path(config.out_dir).expanduser()
+    review_dir = out_dir / DEFAULT_CURATION_REVIEW_DIR
+    report_path = review_dir / "recipe-review.json"
+    generate_label = "重新扫描输出" if report_path.is_file() else "生成整理清单"
+    if st.button(generate_label, type="primary", key="curation_generate"):
+        try:
+            result = build_curation_review(out_dir, review_dir)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"生成整理清单失败：{_clean_error(exc)}")
+        else:
+            _rerun_with_notice(
+                st,
+                f"整理清单已更新：{result.duplicate_name_groups} 个同名组，{result.review_item_count} 条待审核来源。",
+                clear_prefix="curation_",
+            )
+    if not report_path.is_file():
+        st.info("尚未生成同名菜谱整理清单。点击“生成整理清单”后即可开始。")
+        return
+    try:
+        report = load_curation_review(review_dir)
+        decisions = load_curation_decisions(review_dir)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"整理数据无法读取：{_clean_error(exc)}")
+        return
+
+    groups = [group for group in report.get("groups", []) if isinstance(group, dict)]
+    all_items = [
+        item
+        for group in groups
+        for item in group.get("items", [])
+        if isinstance(item, dict)
+    ]
+    resolved_values = {"keep_primary", "keep_variant", "merge_clip", "exclude"}
+    resolved_count = sum(_curation_decision(item, decisions) in resolved_values for item in all_items)
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("审核来源", len(all_items))
+    metric_columns[1].metric("已确认", resolved_count)
+    metric_columns[2].metric("待确认", len(all_items) - resolved_count)
+    metric_columns[3].metric("菜名组", len(groups))
+    st.progress(
+        resolved_count / len(all_items) if all_items else 1.0,
+        text=f"整体进度 {resolved_count}/{len(all_items)}",
+    )
+
+    conflicts = curation_decision_conflicts(report, decisions)
+    for conflict in conflicts:
+        st.warning(conflict)
+
+    download_columns = st.columns([1, 1, 3])
+    csv_path = review_dir / "recipe-review.csv"
+    if csv_path.is_file():
+        download_columns[0].download_button(
+            "下载审核清单 CSV",
+            data=csv_path.read_bytes(),
+            file_name="recipe-review.csv",
+            mime="text/csv",
+            key="curation_download_csv",
+        )
+    download_columns[1].download_button(
+        "下载人工决定 JSON",
+        data=(json.dumps(decisions, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        file_name="curation-decisions.json",
+        mime="application/json",
+        key="curation_download_decisions",
+    )
+
+    filter_columns = st.columns([1, 2])
+    status_filter = filter_columns[0].selectbox(
+        "审核状态",
+        ["待处理", "全部", "已确认", "推广或短剪建议", "名称待确认"],
+        key="curation_status_filter",
+    )
+    query = filter_columns[1].text_input(
+        "搜索菜名、视频标题或 BVID",
+        key="curation_query",
+    ).strip().casefold()
+
+    def group_visible(group: dict[str, Any]) -> bool:
+        items = [item for item in group.get("items", []) if isinstance(item, dict)]
+        decisions_for_group = [_curation_decision(item, decisions) for item in items]
+        if status_filter == "待处理" and all(value in resolved_values for value in decisions_for_group):
+            return False
+        if status_filter == "已确认" and not all(value in resolved_values for value in decisions_for_group):
+            return False
+        roles = {str(item.get("suggested_role") or "") for item in items}
+        if status_filter == "推广或短剪建议" and not roles.intersection({"exclude_candidate", "short_clip_candidate"}):
+            return False
+        if status_filter == "名称待确认" and "name_review_candidate" not in roles and not group.get("similar_titles"):
+            return False
+        if not query:
+            return True
+        searchable = " ".join(
+            [
+                str(group.get("title") or ""),
+                " ".join(str(value) for value in group.get("similar_titles", [])),
+                *[
+                    " ".join(
+                        (
+                            str(item.get("bvid") or ""),
+                            str(item.get("video_title") or ""),
+                        )
+                    )
+                    for item in items
+                ],
+            ]
+        ).casefold()
+        return query in searchable
+
+    visible_groups = [group for group in groups if group_visible(group)]
+    if not visible_groups:
+        st.info("当前筛选条件下没有菜名组。")
+        return
+
+    group_map = {str(group.get("title") or "未命名"): group for group in visible_groups}
+
+    def group_label(title: str) -> str:
+        group = group_map[title]
+        items = [item for item in group.get("items", []) if isinstance(item, dict)]
+        completed = sum(_curation_decision(item, decisions) in resolved_values for item in items)
+        similar = "、".join(str(value) for value in group.get("similar_titles", []))
+        suffix = f" | 近似名：{similar}" if similar else ""
+        return f"{title} | {completed}/{len(items)} 已确认{suffix}"
+
+    selected_title = st.selectbox(
+        "选择菜名组",
+        list(group_map),
+        format_func=group_label,
+        key="curation_group",
+    )
+    selected_group = group_map[selected_title]
+    group_items = [item for item in selected_group.get("items", []) if isinstance(item, dict)]
+    similar_titles = [str(value) for value in selected_group.get("similar_titles", [])]
+    all_group_map = {str(group.get("title") or ""): group for group in groups}
+    comparison_items = list(group_items)
+    comparison_item_ids = {_curation_item_id(item) for item in comparison_items}
+    for similar_title in similar_titles:
+        similar_group = all_group_map.get(similar_title, {})
+        for item in similar_group.get("items", []):
+            if not isinstance(item, dict) or _curation_item_id(item) in comparison_item_ids:
+                continue
+            comparison_items.append(item)
+            comparison_item_ids.add(_curation_item_id(item))
+    if similar_titles:
+        st.info(f"规范名核对：当前“{selected_title}”与 {'、'.join(similar_titles)} 仅差一个字。下方已同时载入这些名称的来源，请结合做法判断是错字、别名还是不同菜。")
+
+    summary_rows = []
+    for item in comparison_items:
+        decision = _curation_decision(item, decisions)
+        summary_rows.append(
+            {
+                "人工决定": CURATION_DECISION_LABELS[decision],
+                "当前规范名": item.get("group_title") or "",
+                "自动建议": CURATION_ROLE_LABELS.get(str(item.get("suggested_role") or ""), item.get("suggested_role") or ""),
+                "BVID": item.get("bvid") or "",
+                "视频标题": item.get("video_title") or "",
+                "时长(秒)": item.get("duration_seconds") or 0,
+                "步骤": item.get("step_count") or 0,
+                "用料": item.get("ingredient_count") or 0,
+                "质量分": item.get("quality_score"),
+                "字幕重合": item.get("transcript_overlap") or 0,
+            }
+        )
+    st.dataframe(summary_rows, width="stretch", hide_index=True)
+    if st.button("采用本组自动建议", key=f"curation_accept_group_{_record_key(selected_title)}"):
+        updates = []
+        for item in group_items:
+            saved = _curation_saved_item(decisions, item)
+            updates.append(
+                {
+                    "item_id": _curation_item_id(item),
+                    "decision": suggested_curation_decision(str(item.get("suggested_role") or "")),
+                    "final_title": saved.get("final_title") or selected_title,
+                    "variant_name": saved.get("variant_name") or "",
+                    "review_notes": saved.get("review_notes") or "",
+                }
+            )
+        try:
+            save_curation_decisions(review_dir, updates)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"保存本组建议失败：{_clean_error(exc)}")
+        else:
+            _rerun_with_notice(st, f"已采用“{selected_title}”的自动建议；仍需核对名称待确认项。")
+
+    item_map = {_curation_item_id(item): item for item in comparison_items}
+    selected_item_id = st.selectbox(
+        "选择一个来源查看完整内容",
+        list(item_map),
+        format_func=lambda item_id: (
+            f"{CURATION_ROLE_LABELS.get(str(item_map[item_id].get('suggested_role') or ''), '')} | "
+            f"{item_map[item_id].get('bvid') or item_id} | {item_map[item_id].get('video_title') or ''}"
+        ),
+        key=f"curation_item_{_record_key(selected_title)}",
+    )
+    selected_item = item_map[selected_item_id]
+    saved_item = _curation_saved_item(decisions, selected_item)
+    role = str(selected_item.get("suggested_role") or "")
+    st.markdown(f"**自动判断：{CURATION_ROLE_LABELS.get(role, role)}**")
+    st.caption(str(selected_item.get("review_reasons") or ""))
+    metadata_columns = st.columns(5)
+    metadata_columns[0].metric("时长", f"{float(selected_item.get('duration_seconds') or 0):.0f} 秒")
+    metadata_columns[1].metric("步骤", int(selected_item.get("step_count") or 0))
+    metadata_columns[2].metric("用料", int(selected_item.get("ingredient_count") or 0))
+    metadata_columns[3].metric("质量分", selected_item.get("quality_score") if selected_item.get("quality_score") is not None else "-")
+    metadata_columns[4].metric("字幕重合", f"{float(selected_item.get('transcript_overlap') or 0) * 100:.0f}%")
+    source_url = str(selected_item.get("source_url") or "").strip()
+    if source_url:
+        st.link_button("打开原视频核对", source_url)
+    related_bvid = str(selected_item.get("related_bvid") or "").strip()
+    if related_bvid:
+        st.caption(f"最相关来源：{related_bvid}；用于判断当前视频是否为长版节选。")
+
+    recipe, recipe_error = _curation_recipe(selected_item)
+    if recipe_error:
+        st.error(recipe_error)
+    elif recipe is not None:
+        uncertain_points = recipe.get("uncertain_points") if isinstance(recipe.get("uncertain_points"), list) else []
+        if uncertain_points:
+            st.warning("待核对信息：" + "；".join(str(value) for value in uncertain_points if value))
+        with st.expander("选中来源：完整用料", expanded=True):
+            material_rows = _curation_material_rows(selected_item, recipe)
+            if material_rows:
+                st.dataframe(material_rows, width="stretch", hide_index=True)
+            else:
+                st.info("没有提取到用料。")
+        with st.expander("选中来源：完整步骤、证据和图片", expanded=True):
+            steps = recipe.get("steps") if isinstance(recipe.get("steps"), list) else []
+            folder = Path(str(selected_item.get("output_folder") or ""))
+            for index, step in enumerate(steps, start=1):
+                if not isinstance(step, dict):
+                    continue
+                st.markdown(f"**{index}. {step.get('title') or step.get('action') or '步骤'}**")
+                if step.get("action"):
+                    st.write(step["action"])
+                details = " · ".join(
+                    str(value)
+                    for value in (step.get("heat"), step.get("duration"), step.get("tips"))
+                    if value
+                )
+                if details:
+                    st.caption(details)
+                if step.get("evidence"):
+                    st.code(str(step["evidence"]), language="text")
+                screenshot = str(step.get("screenshot_path") or "").strip()
+                screenshot_path = folder / screenshot if screenshot else None
+                if screenshot_path and screenshot_path.is_file():
+                    st.image(str(screenshot_path), width=360)
+
+    comparison_materials: list[dict[str, Any]] = []
+    comparison_steps: list[dict[str, Any]] = []
+    for item in comparison_items:
+        group_recipe, _ = _curation_recipe(item)
+        if group_recipe is None:
+            continue
+        comparison_materials.extend(_curation_material_rows(item, group_recipe))
+        comparison_steps.extend(_curation_step_rows(item, group_recipe))
+    with st.expander("同组横向对比：全部用料"):
+        st.dataframe(comparison_materials, width="stretch", hide_index=True)
+    with st.expander("同组横向对比：全部步骤"):
+        st.dataframe(comparison_steps, width="stretch", hide_index=True)
+
+    st.markdown("#### 保存人工决定")
+    decision_values = ["pending", "keep_primary", "keep_variant", "merge_clip", "exclude", "review"]
+    current_decision = _curation_decision(selected_item, decisions)
+    with st.form(f"curation_decision_form_{_record_key(selected_item_id)}"):
+        decision = st.selectbox(
+            "处理方式",
+            decision_values,
+            index=decision_values.index(current_decision),
+            format_func=CURATION_DECISION_LABELS.get,
+        )
+        final_title = st.text_input(
+            "最终规范菜名",
+            value=str(saved_item.get("final_title") or selected_item.get("group_title") or selected_title),
+            help="确认是同一道菜时，相关来源应填写相同的最终菜名。",
+        )
+        variant_name = st.text_input(
+            "做法版本名",
+            value=str(saved_item.get("variant_name") or ""),
+            placeholder="例如：传统版、家常版、简化版、无香料版",
+        )
+        review_notes = st.text_area(
+            "取舍理由",
+            value=str(saved_item.get("review_notes") or ""),
+            placeholder="例如：步骤最完整；短视频与长版字幕重合；仅展示成品没有关键火候。",
+        )
+        save_clicked = st.form_submit_button("保存决定", type="primary")
+    if save_clicked:
+        try:
+            save_curation_decision(
+                review_dir,
+                selected_item_id,
+                decision=decision,
+                final_title=final_title,
+                variant_name=variant_name,
+                review_notes=review_notes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"保存人工决定失败：{_clean_error(exc)}")
+        else:
+            _rerun_with_notice(st, f"已保存 {selected_item.get('bvid') or selected_item_id} 的整理决定。")
+
+
 def main() -> None:
     import streamlit as st
 
@@ -1700,6 +2109,9 @@ def main() -> None:
                                     st,
                                     f"审核结果已应用：{result.note_path}{_backup_summary(backups)}",
                                 )
+
+    if active_page == "最终菜谱整理":
+        _render_curation_review(st, config)
 
     if active_page == "批量处理":
         st.subheader("批量处理")
