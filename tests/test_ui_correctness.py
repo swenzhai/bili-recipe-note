@@ -429,13 +429,72 @@ def test_batch_results_keep_per_item_edit_review_and_archive_actions(monkeypatch
     at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
     at.selectbox(key="main_page").set_value("批量处理")
     at.run()
-    next(widget for widget in at.selectbox if widget.label == "已有批次").set_value(
-        "ui-batch | 2026-01-01T00:00:00+00:00 | 1 条"
-    )
+    assert at.selectbox(key="batch_select").value == "ui-batch"
+    at.button(key="refresh_batch_ui-batch").click()
     at.run()
 
     labels = {button.label for button in at.button}
     assert {"编辑这条", "审核这条", "直接归档这条", "归档本批次全部已完成草稿"} <= labels
+    assert at.selectbox(key="batch_select").value == "ui-batch"
+
+
+def test_batch_refresh_uses_cached_state_after_transient_read_failure(monkeypatch) -> None:
+    state = BatchQueueState(
+        batch_id="cached-batch",
+        created_at="2026-01-01T00:00:00+00:00",
+        updated_at="2026-01-01T00:00:00+00:00",
+        options={},
+        items=[BatchQueueItem(url="https://example.com/a", status="running")],
+    )
+    call_count = 0
+
+    def flaky_list():
+        nonlocal call_count
+        call_count += 1
+        if call_count > 1:
+            raise OSError("temporary read failure")
+        return [state]
+
+    monkeypatch.setattr("bili_recipe_notes.batch_queue.list_batch_states", flaky_list)
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at.selectbox(key="main_page").set_value("批量处理")
+    at.run()
+    assert at.selectbox(key="batch_select").value == "cached-batch"
+
+    at.button(key="refresh_batch_cached-batch").click()
+    at.run()
+
+    assert not at.exception
+    assert at.selectbox(key="batch_select").value == "cached-batch"
+    assert any("暂时显示上次成功读取的数据" in warning.value for warning in at.warning)
+
+
+def test_preferred_batch_preserves_selection_then_falls_back_to_running() -> None:
+    first = BatchQueueState("latest", "", "", {}, [])
+    second = BatchQueueState("running", "", "", {}, [])
+    runtime = {"running": type("Runtime", (), {"status": "running"})()}
+
+    assert ui._preferred_batch_id([first, second], runtime, None, "latest") == "latest"
+    assert ui._preferred_batch_id([first, second], runtime, None, "missing") == "running"
+
+
+def test_running_batch_overlap_blocks_duplicate_work() -> None:
+    state = BatchQueueState(
+        "active",
+        "",
+        "",
+        {},
+        [
+            BatchQueueItem(url="https://example.com/a"),
+            BatchQueueItem(url="https://example.com/b"),
+        ],
+    )
+
+    assert ui._running_batch_overlaps(
+        ["https://example.com/b", "https://example.com/c"],
+        ["active"],
+        {"active": state},
+    ) == [("active", 1)]
 
 
 def test_large_batch_remains_paged_while_switching_pages(monkeypatch, tmp_path: Path) -> None:

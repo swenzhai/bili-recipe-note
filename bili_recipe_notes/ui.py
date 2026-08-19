@@ -525,6 +525,67 @@ def _batch_item_row(item: Any) -> dict[str, Any]:
     }
 
 
+def _batch_progress_summary(state: Any) -> dict[str, int]:
+    completed = failed = running = 0
+    for item in state.items:
+        status = str(getattr(item, "status", "pending") or "pending")
+        if status in {"done", "skipped"}:
+            completed += 1
+        elif status == "failed":
+            failed += 1
+        elif status.endswith("_running") or status == "running":
+            running += 1
+    total = len(state.items)
+    return {
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "running": running,
+        "pending": max(0, total - completed - failed - running),
+    }
+
+
+def _preferred_batch_id(
+    batch_states: list[Any],
+    runtime_statuses: dict[str, Any],
+    requested: str | None,
+    current: str | None,
+) -> str | None:
+    available = {str(state.batch_id) for state in batch_states}
+    for value in (requested, current):
+        normalized = str(value or "").split(" | ", 1)[0]
+        if normalized in available:
+            return normalized
+    running = sorted(
+        (
+            str(state.batch_id)
+            for state in batch_states
+            if runtime_statuses.get(str(state.batch_id))
+            and runtime_statuses[str(state.batch_id)].status == "running"
+        ),
+        key=lambda batch_id: str(getattr(runtime_statuses[batch_id], "started_at", "")),
+        reverse=True,
+    )
+    return running[0] if running else (str(batch_states[0].batch_id) if batch_states else None)
+
+
+def _running_batch_overlaps(
+    urls: list[str],
+    running_batch_ids: list[str],
+    batch_by_id: dict[str, Any],
+) -> list[tuple[str, int]]:
+    requested = {url.strip() for url in urls if url.strip()}
+    overlaps = []
+    for batch_id in running_batch_ids:
+        state = batch_by_id.get(batch_id)
+        if not state:
+            continue
+        overlap_count = len(requested.intersection(item.url for item in state.items))
+        if overlap_count:
+            overlaps.append((batch_id, overlap_count))
+    return overlaps
+
+
 def _backup_files(paths: Iterable[Path | None], action: str) -> list[Path]:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     safe_action = re.sub(r"[^a-zA-Z0-9_-]+", "-", action).strip("-") or "change"
@@ -2331,32 +2392,86 @@ def main() -> None:
         )
         target_stage = "raw" if target_label == "仅形成原始版" else "recipe"
         skip_existing = st.checkbox("已生成则跳过", value=True)
-        st.caption("批量任务会在后台运行并自动保存进度，关闭当前页面后仍可在本次 UI 进程中继续。")
+        st.caption("批量任务在独立后台进程中运行并持续保存进度；刷新页面、关闭浏览器或重启 UI 后仍可恢复查看。")
         try:
             batch_states = list_batch_states()
         except Exception as exc:  # noqa: BLE001
-            batch_states = []
-            st.error(f"读取批次状态失败：{_clean_error(exc)}")
+            cached_states = st.session_state.get("_batch_states_cache")
+            batch_states = cached_states if isinstance(cached_states, list) else []
+            if batch_states:
+                st.warning(f"本次读取批次状态失败，暂时显示上次成功读取的数据：{_clean_error(exc)}")
+            else:
+                st.error(f"读取批次状态失败：{_clean_error(exc)}")
+        else:
+            st.session_state["_batch_states_cache"] = batch_states
         batch_by_id = {state.batch_id: state for state in batch_states}
+        runtime_by_id = {
+            state.batch_id: get_background_batch_status(state.batch_id)
+            for state in batch_states
+        }
+        running_batch_ids = [
+            state.batch_id
+            for state in batch_states
+            if runtime_by_id.get(state.batch_id) and runtime_by_id[state.batch_id].status == "running"
+        ]
+        if running_batch_ids:
+            st.success("正在运行的批次：" + "、".join(running_batch_ids))
+        overlapping_running_pairs = []
+        for index, batch_id in enumerate(running_batch_ids):
+            left = batch_by_id[batch_id]
+            left_urls = {item.url for item in left.items}
+            for other_id in running_batch_ids[index + 1 :]:
+                right = batch_by_id[other_id]
+                overlap = len(left_urls.intersection(item.url for item in right.items))
+                if overlap:
+                    overlapping_running_pairs.append(f"{batch_id} 与 {other_id} 重复 {overlap} 条")
+        if overlapping_running_pairs:
+            st.warning(
+                "检测到同时运行的批次包含重复链接，可能争用同一输出目录："
+                + "；".join(overlapping_running_pairs)
+                + "。请先观察现有任务，不要再次启动相同批次。"
+            )
         next_batch_select = st.session_state.pop("_next_batch_select", None)
-        if next_batch_select in batch_by_id:
-            st.session_state["batch_select"] = next_batch_select
+        preferred_batch_id = _preferred_batch_id(
+            batch_states,
+            runtime_by_id,
+            str(next_batch_select) if next_batch_select else None,
+            str(st.session_state.get("batch_select") or ""),
+        )
+        if preferred_batch_id:
+            st.session_state["batch_select"] = preferred_batch_id
+        else:
+            st.session_state.pop("batch_select", None)
 
         def batch_label(value: str) -> str:
-            if not value:
-                return ""
             state = batch_by_id.get(value)
             if state:
-                return f"{value} | {state.updated_at} | {len(state.items)} 条"
+                summary = _batch_progress_summary(state)
+                runtime = runtime_by_id.get(value)
+                runtime_label = {
+                    "running": "运行中",
+                    "done": "已完成",
+                    "done_with_errors": "完成但有失败",
+                    "failed": "后台失败",
+                    "stopped": "已停止（可继续）",
+                }.get(runtime.status, runtime.status) if runtime else "历史批次"
+                return (
+                    f"{value} | {runtime_label} | {summary['completed']}/{summary['total']} 已完成"
+                    f" | {summary['failed']} 失败"
+                )
             return value
 
-        selected_batch_value = st.selectbox(
-            "已有批次",
-            [""] + list(batch_by_id),
-            format_func=batch_label,
-            key="batch_select",
-        ) or None
-        selected_batch_id = selected_batch_value.split(" | ", 1)[0] if selected_batch_value else None
+        if batch_by_id:
+            selected_batch_value = st.selectbox(
+                "已有批次",
+                list(batch_by_id),
+                format_func=batch_label,
+                key="batch_select",
+            )
+            selected_batch_id = str(selected_batch_value).split(" | ", 1)[0]
+        else:
+            selected_batch_id = None
+            st.info("还没有持久化批次。创建后即使刷新或重启网页，也会自动显示最新运行状态。")
 
         col_new, col_resume, col_retry = st.columns(3)
         run_mode = None
@@ -2381,6 +2496,14 @@ def main() -> None:
                     urls = _load_batch_urls(links_text, links_file, selected_saved_links)
                 if not urls and run_mode not in {"resume-unfinished", "retry-failed"}:
                     raise ValueError("请先输入 URL 或提供有效的链接文件。")
+                if run_mode in {"new-queue", "new-direct"}:
+                    overlaps = _running_batch_overlaps(urls, running_batch_ids, batch_by_id)
+                    if overlaps:
+                        details = "；".join(f"{batch_id} 重复 {count} 条" for batch_id, count in overlaps)
+                        raise ValueError(
+                            "检测到相同链接正在后台处理，已阻止重复启动："
+                            f"{details}。请直接查看现有批次进度。"
+                        )
 
                 save_config(config)
                 batch_id: str | None = None
@@ -2441,16 +2564,31 @@ def main() -> None:
             selected_state = batch_by_id.get(selected_batch_id)
             if selected_state:
                 st.markdown("#### 批次状态")
-                background = get_background_batch_status(selected_batch_id)
+                background = runtime_by_id.get(selected_batch_id)
                 if background:
                     status_text = {
                         "running": "后台运行中",
                         "done": "后台运行完成",
                         "done_with_errors": "后台运行完成（有失败项）",
                         "failed": "后台运行失败",
+                        "stopped": "后台已停止（可继续未完成项）",
                     }.get(background.status, background.status)
                     st.info(f"{status_text}；启动时间：{background.started_at}")
+                    if background.error:
+                        st.error(f"后台状态：{background.error}")
+                summary = _batch_progress_summary(selected_state)
+                progress_columns = st.columns(5)
+                progress_columns[0].metric("总数", summary["total"])
+                progress_columns[1].metric("已完成", summary["completed"])
+                progress_columns[2].metric("执行中", summary["running"])
+                progress_columns[3].metric("待处理", summary["pending"])
+                progress_columns[4].metric("失败", summary["failed"])
+                st.progress(
+                    summary["completed"] / summary["total"] if summary["total"] else 1.0,
+                    text=f"完成进度 {summary['completed']}/{summary['total']}",
+                )
                 if st.button("刷新批次进度", key=f"refresh_batch_{selected_batch_id}"):
+                    st.session_state["_next_batch_select"] = selected_batch_id
                     st.rerun()
                 visible_batch_items, _ = _paged_values(
                     st,
