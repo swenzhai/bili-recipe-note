@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -263,6 +264,138 @@ def test_mobile_cooking_mode_scales_ingredients_and_navigates_steps(tmp_path: Pa
     assert "2. 混合" in "\n".join(markdown.value for markdown in at.markdown)
 
 
+def test_recipe_detail_shows_complete_recipe_and_opens_same_cooking_record(tmp_path: Path) -> None:
+    recipe = _recipe(
+        "完整番茄炒蛋",
+        ingredients=[{"name": "鸡蛋", "amount": "3个", "note": "打散"}],
+        seasonings=[{"name": "盐", "amount": "少许"}],
+    )
+    recipe.update(
+        {
+            "category": "家常菜",
+            "cuisine": "中式",
+            "tags": ["快手", "下饭"],
+            "servings": "2人份",
+            "total_time": "15分钟",
+            "difficulty": "简单",
+            "tools": ["炒锅"],
+            "prep_items": ["番茄切块"],
+            "shopping_list": ["购买新鲜番茄"],
+            "steps": [
+                {
+                    "title": "炒制",
+                    "start_time": 12,
+                    "action": "先炒鸡蛋，再加入番茄。",
+                    "heat": "中火",
+                    "duration": "3分钟",
+                    "tips": "番茄出汁后再调味。",
+                }
+            ],
+            "summary_tips": ["鸡蛋不要炒老。"],
+            "uncertain_points": ["盐量需要按口味确认。"],
+        }
+    )
+    folder = _write_record(tmp_path, "detail", recipe)
+    record_key = ui._record_key(folder)
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
+    at.selectbox(key="main_page").set_value("菜谱详情")
+    at.run()
+
+    assert not at.exception
+    rendered = "\n".join(markdown.value for markdown in at.markdown)
+    assert "完整番茄炒蛋" in rendered
+    assert "**鸡蛋**：3个（打散）" in rendered
+    assert "番茄切块" in rendered
+    assert "炒锅" in rendered
+    assert "1. 炒制" in rendered
+    assert any("番茄出汁后再调味" in warning.value for warning in at.warning)
+    assert any("鸡蛋不要炒老" in info.value for info in at.info)
+    assert any("盐量需要按口味确认" in warning.value for warning in at.warning)
+    assert at.button(key=f"detail_{record_key}_cook") is not None
+
+    at.button(key=f"detail_{record_key}_cook").click()
+    at.run()
+
+    assert not at.exception
+    assert at.selectbox(key="main_page").value == "烹饪模式"
+    assert "完整番茄炒蛋" in str(at.selectbox(key="cook_select").value)
+
+
+def test_recipe_detail_picker_searches_and_switches_with_quick_buttons(tmp_path: Path) -> None:
+    first_recipe = _recipe("宫保鸡丁")
+    first_recipe.update({"category": "家常菜", "cuisine": "川菜", "tags": ["下饭"]})
+    first_folder = _write_record(tmp_path, "kung-pao", first_recipe)
+    second_recipe = _recipe("清炒时蔬")
+    second_recipe.update({"category": "素菜", "cuisine": "中式", "tags": ["清淡"]})
+    second_folder = _write_record(tmp_path, "vegetables", second_recipe)
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
+    at.selectbox(key="main_page").set_value("菜谱详情")
+    at.run()
+
+    at.text_input(key="detail_search").set_value("川菜")
+    at.run()
+
+    assert not at.exception
+    assert "宫保鸡丁" in str(at.selectbox(key="detail_select").value)
+    assert at.button(key=f"detail_pick_{ui._record_key(first_folder)}") is not None
+
+    at.text_input(key="detail_search").set_value("")
+    at.run()
+    at.button(key=f"detail_pick_{ui._record_key(second_folder)}").click()
+    at.run()
+
+    assert not at.exception
+    assert "清炒时蔬" in str(at.selectbox(key="detail_select").value)
+    assert at.button(key="detail_previous") is not None
+    assert at.button(key="detail_next") is not None
+
+
+def test_library_count_rows_orders_counts_and_uses_recipe_share() -> None:
+    assert ui._library_count_rows(
+        ["汤羹", "主食", "汤羹", ""],
+        "分类",
+        recipe_total=4,
+    ) == [
+        {"分类": "汤羹", "数量": 2, "占菜谱": "50.0%"},
+        {"分类": "主食", "数量": 1, "占菜谱": "25.0%"},
+        {"分类": "未分类", "数量": 1, "占菜谱": "25.0%"},
+    ]
+
+
+def test_library_overview_renders_charts_counts_and_filters(tmp_path: Path) -> None:
+    recipes = [
+        ("番茄蛋汤", "汤羹", "中式", ["快手", "家常"]),
+        ("冬瓜排骨汤", "汤羹", "中式", ["炖煮", "家常"]),
+        ("黄油吐司", "烘焙", "西式", ["早餐"]),
+    ]
+    for index, (title, category, cuisine, tags) in enumerate(recipes):
+        recipe = _recipe(title)
+        recipe.update({"category": category, "cuisine": cuisine, "tags": tags})
+        _write_record(tmp_path, f"overview-{index}", recipe)
+
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
+    at.selectbox(key="main_page").set_value("菜谱库全览")
+    at.run()
+
+    assert not at.exception
+    metrics = {metric.label: metric.value for metric in at.metric}
+    assert metrics["菜谱总数"] == "3"
+    assert metrics["分类数"] == "2"
+    assert metrics["菜系数"] == "2"
+    assert metrics["标签数"] == "4"
+    assert len(at.get("vega_lite_chart")) == 3
+    assert at.button(key="overview_open_detail") is not None
+
+    at.selectbox(key="overview_category_filter").set_value("汤羹")
+    at.run()
+
+    assert not at.exception
+    assert any("当前显示 2 / 3 道菜谱" in caption.value for caption in at.caption)
+
+
 def test_history_zip_export_stays_available_for_download(tmp_path: Path) -> None:
     folder = _write_record(tmp_path, "bundle", _recipe("打包菜谱"))
     at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
@@ -434,7 +567,7 @@ def test_batch_results_keep_per_item_edit_review_and_archive_actions(monkeypatch
     at.run()
 
     labels = {button.label for button in at.button}
-    assert {"编辑这条", "审核这条", "直接归档这条", "归档本批次全部已完成草稿"} <= labels
+    assert {"查看这条", "编辑这条", "审核这条", "直接归档这条", "归档本批次全部已完成草稿"} <= labels
     assert at.selectbox(key="batch_select").value == "ui-batch"
 
 
@@ -495,6 +628,81 @@ def test_running_batch_overlap_blocks_duplicate_work() -> None:
         ["active"],
         {"active": state},
     ) == [("active", 1)]
+
+
+def test_batch_dashboard_summary_estimates_speed_and_finish_time() -> None:
+    items = [
+        *[BatchQueueItem(url=f"https://example.com/done-{index}", status="done") for index in range(4)],
+        BatchQueueItem(url="https://example.com/failed", status="failed"),
+        BatchQueueItem(url="https://example.com/running", status="raw_running"),
+        *[BatchQueueItem(url=f"https://example.com/pending-{index}") for index in range(4)],
+    ]
+    state = BatchQueueState("dashboard", "", "", {}, items)
+    runtime = type(
+        "Runtime",
+        (),
+        {
+            "status": "running",
+            "started_at": "2026-08-19T03:00:00+00:00",
+            "finished_at": None,
+        },
+    )()
+
+    summary = ui._batch_dashboard_summary(
+        state,
+        runtime,
+        now=datetime(2026, 8, 19, 4, 0, tzinfo=timezone.utc),
+    )
+
+    assert summary["processed"] == 5
+    assert summary["remaining"] == 5
+    assert summary["progress"] == 0.5
+    assert summary["elapsed_seconds"] == 3600
+    assert summary["speed_per_hour"] == 5
+    assert summary["eta_seconds"] == 3600
+    assert summary["estimated_finish"] == datetime(2026, 8, 19, 5, 0, tzinfo=timezone.utc)
+    assert ui._format_duration(summary["eta_seconds"]) == "1 小时"
+
+
+def test_background_dashboard_renders_running_batch(monkeypatch) -> None:
+    state = BatchQueueState(
+        "dashboard-running",
+        "2026-08-19T03:00:00+00:00",
+        "2026-08-19T03:30:00+00:00",
+        {},
+        [
+            BatchQueueItem(url="https://example.com/done", status="done"),
+            BatchQueueItem(url="https://example.com/current", status="raw_running"),
+            BatchQueueItem(url="https://example.com/pending"),
+        ],
+    )
+    runtime = type(
+        "Runtime",
+        (),
+        {
+            "status": "running",
+            "started_at": "2026-08-19T03:00:00+00:00",
+            "finished_at": None,
+            "error": None,
+        },
+    )()
+    monkeypatch.setattr("bili_recipe_notes.batch_queue.list_batch_states", lambda: [state])
+    monkeypatch.setattr("bili_recipe_notes.batch_runner.get_background_batch_status", lambda _batch_id: runtime)
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at.selectbox(key="main_page").set_value("任务仪表盘")
+    at.run()
+
+    assert not at.exception
+    metrics = {metric.label: metric.value for metric in at.metric}
+    assert metrics["总数"] == "3"
+    assert metrics["已处理"] == "1"
+    assert metrics["成功"] == "1"
+    assert metrics["剩余"] == "2"
+    assert at.selectbox(key="dashboard_refresh_seconds").value == 10
+    assert at.button(key="dashboard_refresh_now") is not None
+    assert at.button(key="dashboard_open_dashboard-running") is not None
+    assert any("当前处理" in info.value and "current" in info.value for info in at.info)
+    assert len(at.dataframe) == 1
 
 
 def test_large_batch_remains_paged_while_switching_pages(monkeypatch, tmp_path: Path) -> None:

@@ -10,7 +10,8 @@ import socket
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote
@@ -204,6 +205,9 @@ CLI_PROMPT_PRESETS = {
 }
 PAGES = [
     "单视频生成",
+    "任务仪表盘",
+    "菜谱库全览",
+    "菜谱详情",
     "烹饪模式",
     "草稿与归档",
     "审核确认",
@@ -218,9 +222,9 @@ PAGES = [
     "UP 主链接",
 ]
 PAGE_GROUPS = {
-    "采集与生成": ["单视频生成", "批量处理", "UP 主链接"],
+    "采集与生成": ["任务仪表盘", "单视频生成", "批量处理", "UP 主链接"],
     "审阅与成稿": ["草稿与归档", "审核确认", "编辑修复", "最终菜谱整理"],
-    "使用与知识": ["烹饪模式", "知识库", "二次分析", "手机客户端"],
+    "使用与知识": ["菜谱库全览", "菜谱详情", "烹饪模式", "知识库", "二次分析", "手机客户端"],
     "系统与迁移": ["工作交接", "环境检查"],
 }
 PAGE_GROUP_BY_PAGE = {
@@ -545,6 +549,76 @@ def _batch_progress_summary(state: Any) -> dict[str, int]:
     }
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
+def _format_duration(seconds: float | int | None) -> str:
+    if seconds is None:
+        return "暂无法估算"
+    total_minutes = max(0, math.ceil(float(seconds) / 60))
+    if total_minutes < 1:
+        return "不到 1 分钟"
+    hours, minutes = divmod(total_minutes, 60)
+    if hours >= 24:
+        days, hours = divmod(hours, 24)
+        return f"{days} 天 {hours} 小时" if hours else f"{days} 天"
+    if hours:
+        return f"{hours} 小时 {minutes} 分钟" if minutes else f"{hours} 小时"
+    return f"{minutes} 分钟"
+
+
+def _batch_dashboard_summary(
+    state: Any,
+    runtime: Any | None,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    counts = _batch_progress_summary(state)
+    processed = counts["completed"] + counts["failed"]
+    remaining = counts["total"] - processed
+    status = str(getattr(runtime, "status", "history") or "history")
+    started_at = _parse_timestamp(getattr(runtime, "started_at", None))
+    finished_at = _parse_timestamp(getattr(runtime, "finished_at", None))
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    elapsed_end = finished_at or current_time
+    elapsed_seconds = (
+        max(0.0, (elapsed_end - started_at).total_seconds())
+        if started_at is not None
+        else None
+    )
+    speed_per_hour = (
+        processed / elapsed_seconds * 3600
+        if elapsed_seconds and processed
+        else None
+    )
+    eta_seconds = None
+    estimated_finish = None
+    if status == "running" and elapsed_seconds and processed and remaining > 0:
+        eta_seconds = elapsed_seconds / processed * remaining
+        estimated_finish = current_time + timedelta(seconds=eta_seconds)
+    return {
+        **counts,
+        "processed": processed,
+        "remaining": remaining,
+        "progress": processed / counts["total"] if counts["total"] else 1.0,
+        "status": status,
+        "elapsed_seconds": elapsed_seconds,
+        "speed_per_hour": speed_per_hour,
+        "eta_seconds": eta_seconds,
+        "estimated_finish": estimated_finish,
+    }
+
+
 def _preferred_batch_id(
     batch_states: list[Any],
     runtime_statuses: dict[str, Any],
@@ -827,6 +901,112 @@ def _select_history_item(st, label: str, options: dict[str, HistoryItem], key: s
             st.session_state[key] = focused_label
             st.session_state.pop("_focus_output_folder", None)
     return options[st.selectbox(label, list(options), key=key)]
+
+
+def _select_detail_history_item(st, items: list[HistoryItem]) -> HistoryItem:
+    options = _history_options(items)
+    focus = st.session_state.get("_focus_output_folder")
+    if focus:
+        focused_label = next(
+            (
+                name
+                for name, item in options.items()
+                if str(item.output_folder.resolve()) == str(Path(focus).resolve())
+            ),
+            None,
+        )
+        if focused_label:
+            st.session_state["detail_select"] = focused_label
+            st.session_state.pop("_focus_output_folder", None)
+
+    current_label = str(st.session_state.get("detail_select") or "")
+    if current_label not in options:
+        current_label = next(iter(options))
+        st.session_state["detail_select"] = current_label
+
+    def choose(label: str) -> None:
+        st.session_state["detail_select"] = label
+
+    with st.container(border=True):
+        st.markdown("### 选择要查看的菜谱")
+        st.caption("可搜索菜名、分类、UP 主或标签；常用菜谱可直接点击下方按钮。")
+        query = st.text_input(
+            "搜索菜谱",
+            placeholder="例如：番茄、川菜、UP 主名称……",
+            key="detail_search",
+        ).strip().lower()
+        matched_labels = [
+            label
+            for label, item in options.items()
+            if not query
+            or query
+            in " ".join(
+                [
+                    item.title,
+                    item.uploader or "",
+                    item.category,
+                    item.cuisine,
+                    *(item.tags or []),
+                    item.output_folder.name,
+                ]
+            ).lower()
+        ]
+        if not matched_labels:
+            st.warning("没有找到匹配的菜谱，已保留当前菜谱。")
+            matched_labels = [current_label]
+        elif current_label not in matched_labels:
+            current_label = matched_labels[0]
+            st.session_state["detail_select"] = current_label
+
+        st.caption(f"找到 {len(matched_labels)} 道；下面显示前 {min(6, len(matched_labels))} 道快捷入口。")
+        quick_columns = st.columns(2)
+        for index, label in enumerate(matched_labels[:6]):
+            item = options[label]
+            metadata = " · ".join(
+                value for value in (item.category, item.cuisine) if value and value != "未分类"
+            )
+            button_label = item.title if not metadata else f"{item.title} · {metadata}"
+            quick_columns[index % 2].button(
+                button_label,
+                key=f"detail_pick_{_record_key(item.output_folder)}",
+                type="primary" if label == current_label else "secondary",
+                use_container_width=True,
+                on_click=choose,
+                args=(label,),
+            )
+
+        selected_label = st.selectbox(
+            "当前查看的菜谱",
+            matched_labels,
+            key="detail_select",
+            format_func=lambda label: (
+                f"{options[label].title} · {options[label].output_folder.name}"
+            ),
+            help="候选较多时可直接输入文字继续筛选。",
+        )
+        selected_index = matched_labels.index(selected_label)
+        previous_column, position_column, next_column = st.columns([1, 1.2, 1])
+        previous_column.button(
+            "← 上一道",
+            disabled=selected_index == 0,
+            key="detail_previous",
+            use_container_width=True,
+            on_click=choose,
+            args=(matched_labels[max(0, selected_index - 1)],),
+        )
+        position_column.markdown(
+            f"<p style='text-align:center;margin:.55rem 0'>第 {selected_index + 1} / {len(matched_labels)} 道</p>",
+            unsafe_allow_html=True,
+        )
+        next_column.button(
+            "下一道 →",
+            disabled=selected_index == len(matched_labels) - 1,
+            key="detail_next",
+            use_container_width=True,
+            on_click=choose,
+            args=(matched_labels[min(len(matched_labels) - 1, selected_index + 1)],),
+        )
+    return options[selected_label]
 
 
 def _navigate_to_record(st, page: str, output_folder: Path) -> None:
@@ -1132,6 +1312,465 @@ def _log_box(st, height: int = 220):
     return log
 
 
+def _render_recipe_text_list(st, values: Iterable[Any], empty_message: str) -> None:
+    items = [str(value).strip() for value in values if str(value).strip()]
+    if not items:
+        st.caption(empty_message)
+        return
+    for item in items:
+        st.markdown(f"- {item}")
+
+
+def _render_recipe_ingredients(st, values: Iterable[Any], empty_message: str) -> None:
+    ingredients = list(values)
+    if not ingredients:
+        st.caption(empty_message)
+        return
+    for ingredient in ingredients:
+        name = str(getattr(ingredient, "name", "") or "未命名").strip()
+        amount = str(getattr(ingredient, "amount", "") or "未注明").strip()
+        note = str(getattr(ingredient, "note", "") or "").strip()
+        suffix = f"（{note}）" if note else ""
+        st.markdown(f"- **{name}**：{amount}{suffix}")
+
+
+def _render_background_dashboard(st) -> None:
+    st.subheader("后台任务仪表盘")
+    st.caption("集中查看所有批处理任务；预计时间会根据本次运行的实际平均速度持续调整。")
+    refresh_seconds = st.selectbox(
+        "自动刷新频率",
+        [10, 30, 60, 0],
+        format_func=lambda value: "关闭自动刷新" if value == 0 else f"每 {value} 秒",
+        key="dashboard_refresh_seconds",
+    )
+
+    @st.fragment(run_every=f"{refresh_seconds}s" if refresh_seconds else None)
+    def render_live_dashboard() -> None:
+        st.button("立即刷新", key="dashboard_refresh_now")
+        st.caption(f"最近刷新：{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
+        try:
+            states = list_batch_states()
+        except Exception as exc:  # noqa: BLE001
+            cached_states = st.session_state.get("_dashboard_batch_states_cache")
+            states = cached_states if isinstance(cached_states, list) else []
+            if states:
+                st.warning(f"本次读取失败，暂时显示上次数据：{_clean_error(exc)}")
+            else:
+                st.error(f"读取批次状态失败：{_clean_error(exc)}")
+                return
+        else:
+            st.session_state["_dashboard_batch_states_cache"] = states
+        if not states:
+            st.info("还没有后台批处理任务。可在“批量处理”中创建任务。")
+            return
+
+        runtime_by_id = {
+            state.batch_id: get_background_batch_status(state.batch_id)
+            for state in states
+        }
+        runtime_labels = {
+            "running": "运行中",
+            "done": "已完成",
+            "done_with_errors": "完成但有失败",
+            "failed": "后台失败",
+            "stopped": "已停止（可继续）",
+            "history": "历史任务",
+        }
+        running_states = [
+            state
+            for state in states
+            if runtime_by_id.get(state.batch_id)
+            and runtime_by_id[state.batch_id].status == "running"
+        ]
+
+        if running_states:
+            st.success(f"当前有 {len(running_states)} 个后台任务正在运行。")
+            for state in running_states:
+                runtime = runtime_by_id[state.batch_id]
+                summary = _batch_dashboard_summary(state, runtime)
+                with st.container(border=True):
+                    st.markdown(f"### {state.batch_id}")
+                    output_roots = sorted(
+                        {
+                            str(Path(item.output_folder).parent)
+                            for item in state.items
+                            if item.output_folder
+                        }
+                    )
+                    if output_roots:
+                        st.caption("输出目录：" + "、".join(output_roots))
+                    metric_columns = st.columns(5)
+                    metric_columns[0].metric("总数", summary["total"])
+                    metric_columns[1].metric("已处理", summary["processed"])
+                    metric_columns[2].metric("成功", summary["completed"])
+                    metric_columns[3].metric("失败", summary["failed"])
+                    metric_columns[4].metric("剩余", summary["remaining"])
+                    st.progress(
+                        summary["progress"],
+                        text=f"任务进度 {summary['processed']}/{summary['total']}（包含失败项）",
+                    )
+                    timing_columns = st.columns(4)
+                    timing_columns[0].metric("已运行", _format_duration(summary["elapsed_seconds"]))
+                    timing_columns[1].metric(
+                        "平均速度",
+                        f"{summary['speed_per_hour']:.1f} 条/小时"
+                        if summary["speed_per_hour"] is not None
+                        else "正在收集数据",
+                    )
+                    timing_columns[2].metric("预计剩余", _format_duration(summary["eta_seconds"]))
+                    estimated_finish = summary["estimated_finish"]
+                    timing_columns[3].metric(
+                        "预计完成",
+                        estimated_finish.astimezone().strftime("%m-%d %H:%M")
+                        if estimated_finish is not None
+                        else "暂无法估算",
+                    )
+                    active_items = [
+                        item
+                        for item in state.items
+                        if str(getattr(item, "status", "")) == "running"
+                        or str(getattr(item, "status", "")).endswith("_running")
+                    ]
+                    for item in active_items:
+                        raw_status = str(getattr(item, "status", "running"))
+                        st.info(
+                            f"当前处理：{BATCH_STATUS_LABELS.get(raw_status, raw_status)} · {item.url}"
+                        )
+                    if runtime.error:
+                        st.warning(f"后台提示：{runtime.error}")
+                    if st.button("查看批次详情", key=f"dashboard_open_{state.batch_id}"):
+                        st.session_state["_next_batch_select"] = state.batch_id
+                        st.session_state["_next_page"] = "批量处理"
+                        st.rerun()
+        else:
+            st.info("当前没有正在运行的后台任务。")
+
+        st.markdown("### 全部任务")
+        dashboard_rows = []
+        for state in states:
+            runtime = runtime_by_id.get(state.batch_id)
+            summary = _batch_dashboard_summary(state, runtime)
+            estimated_finish = summary["estimated_finish"]
+            dashboard_rows.append(
+                {
+                    "批次": state.batch_id,
+                    "状态": runtime_labels.get(summary["status"], summary["status"]),
+                    "进度": f"{summary['processed']}/{summary['total']}",
+                    "成功": summary["completed"],
+                    "失败": summary["failed"],
+                    "剩余": summary["remaining"],
+                    "平均速度": (
+                        f"{summary['speed_per_hour']:.1f} 条/小时"
+                        if summary["speed_per_hour"] is not None
+                        else "-"
+                    ),
+                    "预计剩余": _format_duration(summary["eta_seconds"]),
+                    "预计完成": (
+                        estimated_finish.astimezone().strftime("%Y-%m-%d %H:%M")
+                        if estimated_finish is not None
+                        else "-"
+                    ),
+                    "最近更新": state.updated_at,
+                }
+            )
+        st.dataframe(dashboard_rows, width="stretch", hide_index=True)
+        st.caption("预计时间基于本次运行的平均处理速度；视频长度、字幕质量和 LLM 速度会使估算发生变化。")
+
+    render_live_dashboard()
+
+
+def _library_count_rows(
+    values: Iterable[Any],
+    column_name: str,
+    *,
+    recipe_total: int,
+) -> list[dict[str, Any]]:
+    normalized = [str(value or "未分类").strip() or "未分类" for value in values]
+    counts = Counter(normalized)
+    return [
+        {
+            column_name: name,
+            "数量": count,
+            "占菜谱": f"{count / recipe_total:.1%}" if recipe_total else "0.0%",
+        }
+        for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    ]
+
+
+def _render_library_overview(st, config: UIConfig) -> None:
+    st.subheader("菜谱库全览")
+    st.caption("查看当前菜谱库的规模、分类、菜系和标签分布；统计只读取现有菜谱，不会修改文件。")
+    items = [item for item in scan_history(config.out_dir) if item.recipe_path]
+    if not items:
+        st.info("菜谱库还是空的。生成或导入菜谱后，这里会自动形成统计图表。")
+        return
+
+    total = len(items)
+    category_rows = _library_count_rows(
+        (item.category for item in items),
+        "分类",
+        recipe_total=total,
+    )
+    cuisine_rows = _library_count_rows(
+        (item.cuisine for item in items),
+        "菜系",
+        recipe_total=total,
+    )
+    tag_rows = _library_count_rows(
+        (
+            tag
+            for item in items
+            for tag in dict.fromkeys(item.tags or [])
+            if str(tag).strip()
+        ),
+        "标签",
+        recipe_total=total,
+    )
+    quality_values = [item.quality_score for item in items if item.quality_score is not None]
+    overview_columns = st.columns(5)
+    overview_columns[0].metric("菜谱总数", total)
+    overview_columns[1].metric("分类数", len(category_rows))
+    overview_columns[2].metric("菜系数", len(cuisine_rows))
+    overview_columns[3].metric("标签数", len(tag_rows))
+    overview_columns[4].metric(
+        "平均完整度",
+        f"{sum(quality_values) / len(quality_values):.0f}" if quality_values else "未统计",
+    )
+    archived_count = sum(item.workflow_status == "archived" for item in items)
+    st.caption(f"已归档 {archived_count} 道；待整理或归档后有修改 {total - archived_count} 道。")
+
+    category_column, cuisine_column = st.columns(2, gap="large")
+    with category_column:
+        st.markdown("### 归档分类分布")
+        st.bar_chart(
+            category_rows,
+            x="分类",
+            y="数量",
+            x_label="分类",
+            y_label="菜谱数量",
+            horizontal=True,
+            height=max(280, min(520, len(category_rows) * 38 + 100)),
+        )
+        st.dataframe(category_rows, width="stretch", hide_index=True)
+    with cuisine_column:
+        st.markdown("### 菜系分布")
+        st.bar_chart(
+            cuisine_rows,
+            x="菜系",
+            y="数量",
+            x_label="菜系",
+            y_label="菜谱数量",
+            horizontal=True,
+            height=max(280, min(520, len(cuisine_rows) * 38 + 100)),
+        )
+        st.dataframe(cuisine_rows, width="stretch", hide_index=True)
+
+    st.markdown("### 热门标签")
+    if tag_rows:
+        visible_tag_rows = tag_rows[:15]
+        st.bar_chart(
+            visible_tag_rows,
+            x="标签",
+            y="数量",
+            x_label="标签（前 15 项）",
+            y_label="菜谱数量",
+            height=320,
+        )
+        with st.expander("查看全部标签计数"):
+            st.dataframe(tag_rows, width="stretch", hide_index=True)
+    else:
+        st.info("当前菜谱还没有标签。可在“编辑修复”中补充，之后会自动纳入统计。")
+
+    st.markdown("### 菜谱明细")
+    filter_query = st.text_input(
+        "筛选菜谱明细",
+        placeholder="输入菜名、UP 主或标签",
+        key="overview_filter_query",
+    ).strip().lower()
+    filter_column, cuisine_filter_column = st.columns(2)
+    with filter_column:
+        selected_category = st.selectbox(
+            "按分类筛选",
+            ["全部分类", *[str(row["分类"]) for row in category_rows]],
+            key="overview_category_filter",
+        )
+    with cuisine_filter_column:
+        selected_cuisine = st.selectbox(
+            "按菜系筛选",
+            ["全部菜系", *[str(row["菜系"]) for row in cuisine_rows]],
+            key="overview_cuisine_filter",
+        )
+    filtered_items = [
+        item
+        for item in items
+        if (selected_category == "全部分类" or item.category == selected_category)
+        and (selected_cuisine == "全部菜系" or item.cuisine == selected_cuisine)
+        and (
+            not filter_query
+            or filter_query
+            in " ".join(
+                [item.title, item.uploader or "", item.category, item.cuisine, *(item.tags or [])]
+            ).lower()
+        )
+    ]
+    st.caption(f"当前显示 {len(filtered_items)} / {total} 道菜谱。")
+    visible_items, _ = _paged_values(st, filtered_items, key="overview_table_page")
+    st.dataframe(
+        [
+            {
+                "菜名": item.title,
+                "分类": item.category,
+                "菜系": item.cuisine,
+                "标签": "、".join(item.tags or []),
+                "UP 主": item.uploader or "",
+                "完整度": item.quality_score if item.quality_score is not None else "",
+                "状态": {
+                    "archived": "已归档",
+                    "stale": "归档后有修改",
+                    "archive_error": "归档异常",
+                }.get(item.workflow_status, "待整理"),
+            }
+            for item in visible_items
+        ],
+        width="stretch",
+        hide_index=True,
+    )
+
+    with st.expander("选择并打开具体菜谱"):
+        selected = _select_detail_history_item(st, items)
+        if st.button("打开选中的完整菜谱", type="primary", key="overview_open_detail"):
+            _navigate_to_record(st, "菜谱详情", selected.output_folder)
+
+
+def _render_recipe_detail(st, config: UIConfig) -> None:
+    st.subheader("菜谱详情")
+    st.caption("完整只读查看一条菜谱；用料、备菜、全部步骤和关键提示集中在同一页。")
+    available = [item for item in scan_history(config.out_dir) if item.recipe_path]
+    if not available:
+        st.info("还没有可查看的菜谱。请先生成或导入一条菜谱。")
+        return
+
+    selected = _select_detail_history_item(st, available)
+    recipe_data, recipe_error = _safe_recipe_to_data(selected.recipe_path)  # type: ignore[arg-type]
+    if recipe_error or recipe_data is None:
+        st.error(f"当前 recipe.json 已损坏：{recipe_error}")
+        return
+    try:
+        recipe = normalize_recipe_taxonomy(_validate_recipe(recipe_data))
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"当前菜谱结构不可用：{_clean_error(exc)}")
+        return
+
+    record_key = _record_key(selected.output_folder)
+    content_column, action_column = st.columns([2.2, 1], gap="large")
+    with action_column:
+        _action_rail_marker(st)
+        st.markdown("#### 快捷操作")
+        st.caption("阅读位置保留在左侧，可随时切换到同一道菜的其他工作区。")
+        if st.button(
+            "进入烹饪模式",
+            type="primary",
+            key=f"detail_{record_key}_cook",
+            use_container_width=True,
+        ):
+            _navigate_to_record(st, "烹饪模式", selected.output_folder)
+        if st.button(
+            "编辑完整菜谱",
+            key=f"detail_{record_key}_edit",
+            use_container_width=True,
+        ):
+            _navigate_to_record(st, "编辑修复", selected.output_folder)
+        if st.button(
+            "逐项审核",
+            key=f"detail_{record_key}_review",
+            use_container_width=True,
+        ):
+            _navigate_to_record(st, "审核确认", selected.output_folder)
+        if st.button(
+            "返回草稿与归档",
+            key=f"detail_{record_key}_draft",
+            use_container_width=True,
+        ):
+            _navigate_to_record(st, "草稿与归档", selected.output_folder)
+        if recipe.source_url:
+            st.link_button("打开原视频", recipe.source_url, use_container_width=True)
+
+    with content_column:
+        st.markdown(f"## {recipe.title}")
+        metadata = [recipe.category, recipe.cuisine, *(recipe.tags or [])]
+        st.caption(" · ".join(value for value in metadata if value and value != "未分类"))
+        overview_columns = st.columns(4)
+        overview_columns[0].metric("份量", recipe.servings or "未注明")
+        overview_columns[1].metric("总耗时", recipe.total_time or "未注明")
+        overview_columns[2].metric("难度", recipe.difficulty or "未注明")
+        overview_columns[3].metric("步骤", len(recipe.steps))
+        if recipe.video_title or recipe.uploader:
+            st.caption(
+                "来源："
+                + " · ".join(value for value in (recipe.uploader, recipe.video_title) if value)
+            )
+
+        st.markdown("### 用料")
+        ingredient_column, seasoning_column = st.columns(2, gap="large")
+        with ingredient_column:
+            st.markdown("#### 主料")
+            _render_recipe_ingredients(st, recipe.ingredients, "未记录主料。")
+        with seasoning_column:
+            st.markdown("#### 调料")
+            _render_recipe_ingredients(st, recipe.seasonings, "未记录调料。")
+
+        preparation_column, tools_column = st.columns(2, gap="large")
+        with preparation_column:
+            st.markdown("### 开始前备菜")
+            _render_recipe_text_list(st, recipe.prep_items, "未记录单独的备菜事项。")
+        with tools_column:
+            st.markdown("### 工具")
+            _render_recipe_text_list(st, recipe.tools, "未记录特殊工具。")
+
+        if recipe.shopping_list:
+            with st.expander("查看原始购物清单"):
+                _render_recipe_text_list(st, recipe.shopping_list, "未记录购物清单。")
+
+        st.markdown("### 完整步骤")
+        if not recipe.steps:
+            st.info("这条菜谱还没有烹饪步骤。")
+        for index, step in enumerate(recipe.steps, start=1):
+            with st.container(border=True):
+                st.markdown(f"#### {index}. {step.title}")
+                image_path = _local_markdown_image(selected.output_folder, step.screenshot_path or "")
+                if image_path and image_path.is_file():
+                    st.image(str(image_path), caption=step.title, width=360)
+                st.markdown(step.action)
+                details = " · ".join(
+                    value
+                    for value in (
+                        f"火候：{step.heat}" if step.heat else "",
+                        f"时长：{step.duration}" if step.duration else "",
+                    )
+                    if value
+                )
+                if details:
+                    st.caption(details)
+                if step.tips:
+                    st.warning(f"提示：{step.tips}")
+                if recipe.source_url:
+                    separator = "&" if "?" in recipe.source_url else "?"
+                    st.link_button(
+                        "从本步骤时间点打开原视频",
+                        f"{recipe.source_url}{separator}t={max(0, int(step.start_time))}",
+                        key=f"detail_{record_key}_source_{index}",
+                    )
+
+        if recipe.summary_tips:
+            st.markdown("### 关键点速查")
+            for tip in recipe.summary_tips:
+                st.info(str(tip))
+        if recipe.uncertain_points:
+            st.markdown("### 烹饪前请确认")
+            for point in recipe.uncertain_points:
+                st.warning(str(point))
+
+
 def _render_cooking_mode(st, config: UIConfig) -> None:
     st.subheader("移动烹饪模式")
     st.caption("按目标份量生成临时用量与购物清单，并逐步显示操作；不会改写 recipe.json。")
@@ -1166,7 +1805,16 @@ def _render_cooking_mode(st, config: UIConfig) -> None:
         return
 
     record_key = _record_key(selected.output_folder)
-    st.markdown(f"## {recipe.title}")
+    title_column, detail_column = st.columns([3, 1])
+    with title_column:
+        st.markdown(f"## {recipe.title}")
+    with detail_column:
+        if st.button(
+            "查看完整菜谱",
+            key=f"cook_{record_key}_detail",
+            use_container_width=True,
+        ):
+            _navigate_to_record(st, "菜谱详情", selected.output_folder)
     info_columns = st.columns(3)
     info_columns[0].metric("原份量", recipe.servings or "未注明")
     info_columns[1].metric("总耗时", recipe.total_time or "未注明")
@@ -2098,7 +2746,10 @@ def main() -> None:
         if last_generated and (last_generated / "recipe.json").is_file():
             st.markdown("#### 下一步")
             st.caption("当前结果已进入草稿箱；可以先完整编辑、逐项审核，也可以不修改直接归档。")
-            col_edit, col_review, col_drafts = st.columns(3)
+            col_detail, col_edit, col_review, col_drafts = st.columns(4)
+            with col_detail:
+                if st.button("查看完整菜谱", key="generated_go_detail"):
+                    _navigate_to_record(st, "菜谱详情", last_generated)
             with col_edit:
                 if st.button("编辑完整菜谱", key="generated_go_edit"):
                     _navigate_to_record(st, "编辑修复", last_generated)
@@ -2108,6 +2759,15 @@ def main() -> None:
             with col_drafts:
                 if st.button("查看草稿与归档", key="generated_go_drafts"):
                     _navigate_to_record(st, "草稿与归档", last_generated)
+
+    if active_page == "任务仪表盘":
+        _render_background_dashboard(st)
+
+    if active_page == "菜谱库全览":
+        _render_library_overview(st, config)
+
+    if active_page == "菜谱详情":
+        _render_recipe_detail(st, config)
 
     if active_page == "烹饪模式":
         _render_cooking_mode(st, config)
@@ -2178,6 +2838,8 @@ def main() -> None:
                 }
                 st.metric("当前状态", workflow_labels.get(selected.workflow_status, "待整理"))
                 st.caption("正文固定在左侧；从这里直接进入对应工作区，不必先翻到页面底部。")
+                if st.button("查看完整菜谱", key=f"history_{history_key}_rail_detail", use_container_width=True):
+                    _navigate_to_record(st, "菜谱详情", selected.output_folder)
                 if st.button("编辑完整菜谱", key=f"history_{history_key}_rail_edit", use_container_width=True):
                     _navigate_to_record(st, "编辑修复", selected.output_folder)
                 if st.button("逐项审核", key=f"history_{history_key}_rail_review", use_container_width=True):
@@ -2365,6 +3027,9 @@ def main() -> None:
 
     if active_page == "批量处理":
         st.subheader("批量处理")
+        if st.button("打开后台任务仪表盘", type="primary", key="batch_open_dashboard"):
+            st.session_state["_next_page"] = "任务仪表盘"
+            st.rerun()
         saved_link_documents = _saved_creator_link_documents(config.out_dir)
         saved_link_options = [""] + [str(path) for path in saved_link_documents]
         if st.session_state.get("batch_saved_creator_links") not in saved_link_options:
@@ -2625,7 +3290,10 @@ def main() -> None:
                         batch_folder / "recipe.json",
                         key_prefix=f"batch_{selected_state.batch_id}_{_record_key(batch_folder)}_rating_",
                     )
-                    col_edit, col_review, col_archive = st.columns(3)
+                    col_detail, col_edit, col_review, col_archive = st.columns(4)
+                    with col_detail:
+                        if st.button("查看这条", key=f"batch_detail_{selected_state.batch_id}"):
+                            _navigate_to_record(st, "菜谱详情", batch_folder)
                     with col_edit:
                         if st.button("编辑这条", key=f"batch_edit_{selected_state.batch_id}"):
                             _navigate_to_record(st, "编辑修复", batch_folder)
