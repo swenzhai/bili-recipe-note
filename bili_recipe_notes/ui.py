@@ -79,6 +79,10 @@ try:
         recapture_step_screenshot,
         regenerate_note_from_recipe,
         regenerate_recipe_from_transcript,
+        save_step_screenshot_candidate,
+        save_uploaded_step_screenshot,
+        clear_step_screenshot,
+        suggest_step_screenshots,
     )
     from .quality import analyze_recipe_quality
     from .recipe_extractor import (
@@ -162,6 +166,10 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
         recapture_step_screenshot,
         regenerate_note_from_recipe,
         regenerate_recipe_from_transcript,
+        save_step_screenshot_candidate,
+        save_uploaded_step_screenshot,
+        clear_step_screenshot,
+        suggest_step_screenshots,
     )
     from bili_recipe_notes.quality import analyze_recipe_quality
     from bili_recipe_notes.recipe_extractor import (
@@ -209,6 +217,17 @@ PAGES = [
     "手机客户端",
     "UP 主链接",
 ]
+PAGE_GROUPS = {
+    "采集与生成": ["单视频生成", "批量处理", "UP 主链接"],
+    "审阅与成稿": ["草稿与归档", "审核确认", "编辑修复", "最终菜谱整理"],
+    "使用与知识": ["烹饪模式", "知识库", "二次分析", "手机客户端"],
+    "系统与迁移": ["工作交接", "环境检查"],
+}
+PAGE_GROUP_BY_PAGE = {
+    page: group
+    for group, pages in PAGE_GROUPS.items()
+    for page in pages
+}
 EXPORT_KINDS = ["obsidian", "pdf", "docx", "zip"]
 EXPORT_MIME_TYPES = {
     ".md": "text/markdown",
@@ -584,7 +603,12 @@ def _recipe_with_inferred_ratings(recipe_path: Path) -> Recipe:
     return normalize_recipe_taxonomy(recipe)
 
 
-def _render_rating_controls(st, recipe_path: Path, *, key_prefix: str) -> dict[str, int | None] | None:
+def _render_rating_controls(
+    st,
+    recipe_path: Path,
+    *,
+    key_prefix: str,
+) -> dict[str, int | None] | None:
     try:
         recipe = _recipe_with_inferred_ratings(recipe_path)
     except Exception as exc:  # noqa: BLE001
@@ -626,6 +650,75 @@ def _render_rating_controls(st, recipe_path: Path, *, key_prefix: str) -> dict[s
         "difficulty_rating": int(difficulty),
         "time_rating": int(time_rating),
     }
+
+
+def _inject_workspace_styles(st) -> None:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] [data-testid="stExpander"] {
+          border-color: color-mix(in srgb, currentColor 18%, transparent);
+        }
+        .brn-action-rail-marker { display: none; }
+        @media (min-width: 900px) {
+          div[data-testid="stColumn"]:has(.brn-action-rail-marker) {
+            position: sticky;
+            top: 3.75rem;
+            align-self: flex-start;
+            max-height: calc(100vh - 4.5rem);
+            overflow-y: auto;
+            padding: 0.2rem 0.75rem 0.75rem;
+            border-left: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+            scrollbar-width: thin;
+          }
+        }
+        @media (max-width: 899px) {
+          div[data-testid="stColumn"]:has(.brn-action-rail-marker) {
+            border-top: 1px solid color-mix(in srgb, currentColor 16%, transparent);
+            padding-top: 1rem;
+          }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _action_rail_marker(st) -> None:
+    st.markdown('<span class="brn-action-rail-marker"></span>', unsafe_allow_html=True)
+
+
+def _render_navigation(st) -> str:
+    if st.session_state.get("main_page") not in PAGES:
+        st.session_state["main_page"] = PAGES[0]
+
+    st.sidebar.header("工作区")
+    st.sidebar.caption("按实际流程分区；当前页面所在分区会自动展开。")
+    current_page = str(st.session_state["main_page"])
+
+    def select_page(page: str) -> None:
+        st.session_state["main_page"] = page
+
+    for group, pages in PAGE_GROUPS.items():
+        with st.sidebar.expander(group, expanded=current_page in pages):
+            for page in pages:
+                st.button(
+                    page,
+                    key=f"nav_{page}",
+                    type="primary" if page == current_page else "secondary",
+                    use_container_width=True,
+                    on_click=select_page,
+                    args=(page,),
+                )
+
+    st.sidebar.divider()
+    with st.sidebar.expander("全部功能快速切换", expanded=False):
+        return st.selectbox(
+            "当前功能",
+            PAGES,
+            key="main_page",
+            format_func=lambda page: f"{PAGE_GROUP_BY_PAGE[page]} · {page}",
+        )
 
 
 def _save_recipe_ratings(output_folder: Path, ratings: dict[str, int | None] | None = None) -> Recipe:
@@ -833,9 +926,10 @@ def _display_quality(st, output_folder: Path) -> None:
 
 
 def _render_sidebar(st, config: UIConfig) -> UIConfig:
-    st.sidebar.header("默认配置")
-    config.out_dir = st.sidebar.text_input("输出目录", value=config.out_dir)
-    with st.sidebar.expander("Bilibili 登录", expanded=not bool(config.cookies)):
+    st.sidebar.subheader("运行配置")
+    with st.sidebar.expander("文件与登录", expanded=False):
+        config.out_dir = st.text_input("输出目录", value=config.out_dir)
+        st.markdown("##### Bilibili 登录")
         config.cookies = _optional_text(st.text_input("cookies 文件路径", value=config.cookies or ""))
         st.caption("可从已登录的 Edge 导入，仅在本机保存 Bilibili 域 Cookie。")
         cookie_import, cookie_validate, cookie_remove = st.columns(3)
@@ -867,23 +961,31 @@ def _render_sidebar(st, config: UIConfig) -> UIConfig:
             config.cookies = None
             save_config(config)
             _rerun_with_notice(st, "已删除本地导入的 Bilibili 登录文件。", level="info")
-    config.language = st.sidebar.text_input("字幕/转写语言", value=config.language)
-    config.whisper_model = st.sidebar.selectbox(
-        "Whisper 模型",
-        WHISPER_MODELS,
-        index=WHISPER_MODELS.index(config.whisper_model)
-        if config.whisper_model in WHISPER_MODELS
-        else 2,
-    )
-    config.enable_screenshot = st.sidebar.checkbox("生成步骤截图", value=config.enable_screenshot)
-    config.enable_llm_summary = st.sidebar.checkbox("使用 LLM 结构化抽取 / 重写", value=config.enable_llm_summary)
-    config.keep_media = st.sidebar.checkbox("保留临时媒体文件", value=config.keep_media)
+    with st.sidebar.expander("生成与转写", expanded=False):
+        config.language = st.text_input("字幕/转写语言", value=config.language)
+        config.whisper_model = st.selectbox(
+            "Whisper 模型",
+            WHISPER_MODELS,
+            index=WHISPER_MODELS.index(config.whisper_model)
+            if config.whisper_model in WHISPER_MODELS
+            else 2,
+        )
+        config.enable_screenshot = st.checkbox("生成步骤截图", value=config.enable_screenshot)
+        config.enable_llm_summary = st.checkbox("使用 LLM 结构化抽取 / 重写", value=config.enable_llm_summary)
+        config.keep_media = st.checkbox("保留临时媒体文件", value=config.keep_media)
     with st.sidebar.expander("成品精简与审核", expanded=False):
         config.max_recipe_steps = int(
             st.number_input("最终版最多步骤", min_value=4, max_value=12, value=config.max_recipe_steps, step=1)
         )
         config.max_step_images = int(
-            st.number_input("最多关键图片", min_value=1, max_value=6, value=config.max_step_images, step=1)
+            st.number_input(
+                "最多关键图片",
+                min_value=1,
+                max_value=4,
+                value=min(4, max(1, config.max_step_images)),
+                step=1,
+                help="默认 3 张，硬上限 4 张；候选图不会长期保存。",
+            )
         )
         config.enable_recipe_review = st.checkbox(
             "同时生成逐项审核版",
@@ -906,22 +1008,23 @@ def _render_sidebar(st, config: UIConfig) -> UIConfig:
             value=config.archive_knowledge_with_recipe,
             help="把已经提炼的通用烹饪技巧同步到笔记本的技巧目录。",
         )
-    config.llm_provider = st.sidebar.selectbox(
-        "LLM provider",
-        LLM_PROVIDERS,
-        index=LLM_PROVIDERS.index(config.llm_provider)
-        if config.llm_provider in LLM_PROVIDERS
-        else 0,
-    )
-    if config.llm_provider == "codex":
-        config.codex_model = _optional_text(st.sidebar.text_input("Codex 模型", value=config.codex_model or ""))
-        config.codex_profile = _optional_text(st.sidebar.text_input("Codex profile", value=config.codex_profile or ""))
-    if config.llm_provider == "openai":
-        config.openai_model = st.sidebar.text_input("OpenAI 模型", value=config.openai_model)
-    if config.llm_provider == "local":
-        config.local_llm_command = _optional_text(
-            st.sidebar.text_input("本地 LLM 命令", value=config.local_llm_command or "")
+    with st.sidebar.expander("AI 模型", expanded=False):
+        config.llm_provider = st.selectbox(
+            "LLM provider",
+            LLM_PROVIDERS,
+            index=LLM_PROVIDERS.index(config.llm_provider)
+            if config.llm_provider in LLM_PROVIDERS
+            else 0,
         )
+        if config.llm_provider == "codex":
+            config.codex_model = _optional_text(st.text_input("Codex 模型", value=config.codex_model or ""))
+            config.codex_profile = _optional_text(st.text_input("Codex profile", value=config.codex_profile or ""))
+        if config.llm_provider == "openai":
+            config.openai_model = st.text_input("OpenAI 模型", value=config.openai_model)
+        if config.llm_provider == "local":
+            config.local_llm_command = _optional_text(
+                st.text_input("本地 LLM 命令", value=config.local_llm_command or "")
+            )
     if config.llm_provider in {"opencode", "codex", "local"}:
         with st.sidebar.expander("LLM CLI 高级提示词", expanded=False):
             st.caption("附加到结构化抽取、笔记优化、二次分析和知识提取；不会替换内置格式与安全约束。")
@@ -1166,11 +1269,25 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
 
     st.markdown("#### 网页离线版（推荐个人使用）")
     st.caption("不需要 Apple 开发者账号。先在 iPhone 的 Safari 打开网页版并添加到主屏幕，再把下面的菜谱包导入一次。")
+    image_mode_labels = {
+        "all": "全部步骤图",
+        "first": "每道菜仅一张（推荐）",
+        "none": "只导出文字",
+    }
+    image_mode = st.radio(
+        "图片导出方式",
+        ["first", "none", "all"],
+        format_func=image_mode_labels.get,
+        horizontal=True,
+        key="web_library_image_mode",
+        help="“每道菜仅一张”会保留该菜第一张有效步骤图；“只导出文字”会移除图片数据和图片引用。",
+    )
     try:
-        web_payload = build_web_library_payload(store)
+        web_payload = build_web_library_payload(store, image_mode=image_mode)
+        web_content = web_library_bytes(web_payload)
         st.download_button(
             "下载网页版菜谱包",
-            data=web_library_bytes(web_payload),
+            data=web_content,
             file_name="bili-recipe-web-library.json",
             mime="application/json",
             type="primary",
@@ -1178,7 +1295,8 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
         )
         st.caption(
             f"包含 {len(web_payload['recipes'])} 道菜谱、{len(web_payload['assets'])} 张步骤图；"
-            "菜谱包只在 Mac 与 iPhone 之间传递，不会上传到网页版服务器。"
+            f"文件约 {len(web_content) / (1024 * 1024):.1f} MB。"
+            "菜谱包只在电脑与手机之间传递，不会上传到网页版服务器。"
         )
     except Exception as exc:  # noqa: BLE001
         st.warning(f"网页版菜谱包生成失败：{_clean_error(exc)}")
@@ -1686,6 +1804,181 @@ def _render_curation_review(st, config: UIConfig) -> None:
             _rerun_with_notice(st, f"已保存 {selected_item.get('bvid') or selected_item_id} 的整理决定。")
 
 
+def _render_recipe_review(st, config: UIConfig) -> None:
+    st.subheader("菜谱逐项审核")
+    st.caption("中间持续显示完整草稿，右侧集中处理当前条目；长菜谱无需在正文和按钮之间来回滚动。")
+    reviewable = [item for item in scan_history(config.out_dir) if item.recipe_path]
+    if not reviewable:
+        st.info("还没有可以审核的菜谱。")
+        return
+
+    options = _history_options(reviewable)
+    selected = _select_history_item(st, "选择菜谱", options, "review_select")
+    record_key = _record_key(selected.output_folder)
+    current_review_path = review_path(selected.output_folder)
+    if not current_review_path.exists():
+        document_column, action_column = st.columns([2.15, 1], gap="large")
+        with document_column:
+            st.markdown("#### 草稿正文")
+            note = _read_text(selected.note_path)
+            if note:
+                _render_note_preview(st, note, selected.output_folder)
+            else:
+                st.info("当前记录没有可预览的 note.md。")
+        with action_column:
+            _action_rail_marker(st)
+            st.markdown("#### 开始审核")
+            st.info("这份菜谱还没有审核版。原 recipe.json 不会立即改变。")
+            if st.button("创建逐项审核版", type="primary", key=f"review_{record_key}_create", use_container_width=True):
+                try:
+                    data = _recipe_to_data(selected.recipe_path)  # type: ignore[arg-type]
+                    recipe = condense_recipe_steps(_validate_recipe(data), config.max_recipe_steps)
+                    path = create_recipe_review(recipe, selected.output_folder)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"创建审核版失败：{_clean_error(exc)}")
+                else:
+                    _rerun_with_notice(st, f"已创建审核版：{path}")
+        return
+
+    try:
+        review = load_recipe_review(selected.output_folder)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"审核文件无法读取：{_clean_error(exc)}")
+        return
+
+    items = review["items"]
+    pending_items = [item for item in items if item.get("decision") == "pending"]
+    resolved = len(items) - len(pending_items)
+    progress_column, reset_column, accept_all_column = st.columns([3, 1, 1])
+    with progress_column:
+        st.progress(resolved / len(items) if items else 1.0, text=f"已解决 {resolved}/{len(items)} 项")
+    with reset_column:
+        if st.button("重新创建审核版", key=f"review_{record_key}_reset", use_container_width=True):
+            recipe = condense_recipe_steps(
+                _validate_recipe(_recipe_to_data(selected.recipe_path)),  # type: ignore[arg-type]
+                config.max_recipe_steps,
+            )
+            create_recipe_review(recipe, selected.output_folder)
+            _rerun_with_notice(st, "已重新创建审核版，所有决定已重置。")
+    with accept_all_column:
+        if st.button(
+            "全部采用剩余项",
+            disabled=not pending_items,
+            key=f"review_{record_key}_accept_all",
+            use_container_width=True,
+        ):
+            accept_all_pending_review_items(selected.output_folder)
+            _rerun_with_notice(st, "已采用全部剩余审核项。")
+
+    document_column, action_column = st.columns([2.15, 1], gap="large")
+    with document_column:
+        st.markdown("#### 草稿正文")
+        note = _read_text(selected.note_path)
+        if note:
+            _render_note_preview(st, note, selected.output_folder)
+        else:
+            st.info("当前记录没有可预览的 note.md。")
+
+    with action_column:
+        _action_rail_marker(st)
+        st.markdown("#### 审核操作")
+        if items:
+            ordered = [*pending_items, *[item for item in items if item.get("decision") != "pending"]]
+            labels = {_review_item_label(item): item for item in ordered}
+            selected_label = st.selectbox(
+                "当前审核项（待处理项优先）",
+                list(labels),
+                key=f"review_{record_key}_item",
+            )
+            current = labels[selected_label]
+            original = current.get("original") or {}
+            confidence = original.get("confidence")
+            evidence = original.get("evidence")
+            source_time = original.get("source_time", original.get("start_time"))
+            meta = []
+            if confidence is not None:
+                meta.append(f"置信度 {round(float(confidence) * 100)}%")
+            if source_time is not None:
+                meta.append(f"视频位置约 {float(source_time):.1f} 秒")
+            if meta:
+                st.caption(" · ".join(meta))
+            if evidence:
+                st.markdown("**字幕证据**")
+                st.code(str(evidence), language="text")
+            editor_key = f"review_{record_key}_{current['id']}_json"
+            edited_json = st.text_area(
+                "采用内容（需要时可直接修改 JSON）",
+                value=json.dumps(current.get("value") or original, ensure_ascii=False, indent=2),
+                height=220,
+                key=editor_key,
+            )
+            comment = st.text_input(
+                "审核备注（可选）",
+                value=str(current.get("comment") or ""),
+                key=f"review_{record_key}_{current['id']}_comment",
+            )
+            decision: str | None = None
+            if st.button(
+                "采用并下一项",
+                type="primary",
+                key=f"review_{record_key}_accept",
+                use_container_width=True,
+            ):
+                decision = "accepted"
+            edit_column, skip_column = st.columns(2)
+            with edit_column:
+                if st.button("修改后采用", key=f"review_{record_key}_edit", use_container_width=True):
+                    decision = "edited"
+            with skip_column:
+                if st.button("跳过此项", key=f"review_{record_key}_skip", use_container_width=True):
+                    decision = "skipped"
+            if decision:
+                try:
+                    edited_value = json.loads(edited_json) if decision == "edited" else None
+                    decide_review_item(
+                        selected.output_folder,
+                        str(current["id"]),
+                        decision,
+                        value=edited_value,
+                        comment=comment,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"保存审核决定失败：{_clean_error(exc)}")
+                else:
+                    _rerun_with_notice(st, "审核决定已保存，已切换到下一项。")
+
+        st.divider()
+        st.markdown("#### 完成审核")
+        if pending_items:
+            st.caption(f"还有 {len(pending_items)} 项待处理，完成后才能写回最终菜谱。")
+        else:
+            st.success("所有审核项已解决，可以应用到最终菜谱。")
+            if st.button(
+                "应用审核结果并生成最终版",
+                type="primary",
+                key=f"review_{record_key}_apply",
+                use_container_width=True,
+            ):
+                try:
+                    backups = _backup_files(
+                        [selected.recipe_path, selected.note_path, current_review_path],
+                        "review-apply",
+                    )
+                    recipe = recipe_from_completed_review(selected.output_folder)
+                    atomic_write_json(selected.recipe_path, _dump_model(recipe))  # type: ignore[arg-type]
+                    result = regenerate_note_from_recipe(
+                        selected.output_folder,
+                        **_regenerate_note_kwargs(config),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"应用审核结果失败：{_clean_error(exc)}")
+                else:
+                    _rerun_with_notice(
+                        st,
+                        f"审核结果已应用：{result.note_path}{_backup_summary(backups)}",
+                    )
+
+
 def main() -> None:
     import streamlit as st
 
@@ -1697,10 +1990,10 @@ def main() -> None:
     next_page = st.session_state.pop("_next_page", None)
     if next_page in PAGES:
         st.session_state["main_page"] = next_page
-    st.sidebar.header("功能导航")
-    active_page = st.sidebar.selectbox("当前功能", PAGES, key="main_page")
+    _inject_workspace_styles(st)
+    active_page = _render_navigation(st)
     config = _render_sidebar(st, load_config())
-    st.caption(f"当前功能：{active_page}")
+    st.caption(f"当前工作区：{PAGE_GROUP_BY_PAGE[active_page]} / {active_page}")
 
     if active_page == "单视频生成":
         st.subheader("生成菜谱笔记")
@@ -1806,6 +2099,31 @@ def main() -> None:
             options = _history_options(filtered)
             selected = _select_history_item(st, "选择记录", options, "history_select")
             history_key = _record_key(selected.output_folder)
+            note = _read_text(selected.note_path)
+            preview_column, action_column = st.columns([2.15, 1], gap="large")
+            with preview_column:
+                st.markdown("#### 草稿正文")
+                if note:
+                    _render_note_preview(st, note, selected.output_folder)
+                else:
+                    st.info("当前记录没有可预览的 note.md。")
+            with action_column:
+                _action_rail_marker(st)
+                st.markdown("#### 下一步")
+                workflow_labels = {
+                    "archived": "已归档",
+                    "stale": "归档后有修改",
+                    "archive_error": "归档异常",
+                }
+                st.metric("当前状态", workflow_labels.get(selected.workflow_status, "待整理"))
+                st.caption("正文固定在左侧；从这里直接进入对应工作区，不必先翻到页面底部。")
+                if st.button("编辑完整菜谱", key=f"history_{history_key}_rail_edit", use_container_width=True):
+                    _navigate_to_record(st, "编辑修复", selected.output_folder)
+                if st.button("逐项审核", key=f"history_{history_key}_rail_review", use_container_width=True):
+                    _navigate_to_record(st, "审核确认", selected.output_folder)
+                if st.button("最终菜谱整理", key=f"history_{history_key}_rail_curation", use_container_width=True):
+                    st.session_state["_next_page"] = "最终菜谱整理"
+                    st.rerun()
             if selected.workflow_status == "archived":
                 st.success(f"已归档：{selected.archive_note_path or 'Obsidian 笔记本'}")
                 if selected.archived_at:
@@ -1973,145 +2291,13 @@ def main() -> None:
                         f"{_backup_summary(backups)}",
                         clear_prefix=f"history_{history_key}_confirm_",
                     )
-            note = _read_text(selected.note_path)
             if note:
-                st.markdown("#### note.md 预览")
-                _render_note_preview(st, note, selected.output_folder)
+                st.caption("正文预览已固定在上方工作区；下方保留质量报告供归档前复核。")
         else:
             st.info("还没有历史记录，或搜索没有匹配结果。")
 
     if active_page == "审核确认":
-        st.subheader("菜谱逐项审核")
-        st.caption("证据、置信度和不确定信息只在这里展示；全部解决后再应用为简洁的最终菜谱。")
-        reviewable = [item for item in scan_history(config.out_dir) if item.recipe_path]
-        if not reviewable:
-            st.info("还没有可以审核的菜谱。")
-        else:
-            options = _history_options(reviewable)
-            selected = _select_history_item(st, "选择菜谱", options, "review_select")
-            record_key = _record_key(selected.output_folder)
-            current_review_path = review_path(selected.output_folder)
-            if not current_review_path.exists():
-                st.info("这份菜谱还没有审核版。可以先按当前精简设置创建，原 recipe.json 不会立即改变。")
-                if st.button("创建逐项审核版", type="primary", key=f"review_{record_key}_create"):
-                    try:
-                        data = _recipe_to_data(selected.recipe_path)  # type: ignore[arg-type]
-                        recipe = condense_recipe_steps(_validate_recipe(data), config.max_recipe_steps)
-                        path = create_recipe_review(recipe, selected.output_folder)
-                    except Exception as exc:  # noqa: BLE001
-                        st.error(f"创建审核版失败：{_clean_error(exc)}")
-                    else:
-                        _rerun_with_notice(st, f"已创建审核版：{path}")
-            else:
-                try:
-                    review = load_recipe_review(selected.output_folder)
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"审核文件无法读取：{_clean_error(exc)}")
-                else:
-                    items = review["items"]
-                    pending_items = [item for item in items if item.get("decision") == "pending"]
-                    resolved = len(items) - len(pending_items)
-                    st.progress(resolved / len(items) if items else 1.0, text=f"已解决 {resolved}/{len(items)} 项")
-                    col_reset, col_accept_all = st.columns(2)
-                    with col_reset:
-                        if st.button("重新创建审核版", key=f"review_{record_key}_reset"):
-                            recipe = condense_recipe_steps(
-                                _validate_recipe(_recipe_to_data(selected.recipe_path)),  # type: ignore[arg-type]
-                                config.max_recipe_steps,
-                            )
-                            create_recipe_review(recipe, selected.output_folder)
-                            _rerun_with_notice(st, "已重新创建审核版，所有决定已重置。")
-                    with col_accept_all:
-                        if st.button(
-                            "全部采用剩余项",
-                            disabled=not pending_items,
-                            key=f"review_{record_key}_accept_all",
-                        ):
-                            accept_all_pending_review_items(selected.output_folder)
-                            _rerun_with_notice(st, "已采用全部剩余审核项。")
-
-                    if items:
-                        ordered = [*pending_items, *[item for item in items if item.get("decision") != "pending"]]
-                        labels = {_review_item_label(item): item for item in ordered}
-                        selected_label = st.selectbox(
-                            "当前审核项（待处理项优先）",
-                            list(labels),
-                            key=f"review_{record_key}_item",
-                        )
-                        current = labels[selected_label]
-                        original = current.get("original") or {}
-                        confidence = original.get("confidence")
-                        evidence = original.get("evidence")
-                        source_time = original.get("source_time", original.get("start_time"))
-                        meta = []
-                        if confidence is not None:
-                            meta.append(f"置信度 {round(float(confidence) * 100)}%")
-                        if source_time is not None:
-                            meta.append(f"视频位置约 {float(source_time):.1f} 秒")
-                        if meta:
-                            st.caption(" · ".join(meta))
-                        if evidence:
-                            st.markdown("**字幕证据**")
-                            st.code(str(evidence), language="text")
-                        editor_key = f"review_{record_key}_{current['id']}_json"
-                        edited_json = st.text_area(
-                            "采用内容（需要时可直接修改 JSON）",
-                            value=json.dumps(current.get("value") or original, ensure_ascii=False, indent=2),
-                            height=260,
-                            key=editor_key,
-                        )
-                        comment = st.text_input(
-                            "审核备注（可选）",
-                            value=str(current.get("comment") or ""),
-                            key=f"review_{record_key}_{current['id']}_comment",
-                        )
-                        col_accept, col_edit, col_skip = st.columns(3)
-                        decision: str | None = None
-                        with col_accept:
-                            if st.button("采用并下一项", type="primary", key=f"review_{record_key}_accept"):
-                                decision = "accepted"
-                        with col_edit:
-                            if st.button("修改后采用", key=f"review_{record_key}_edit"):
-                                decision = "edited"
-                        with col_skip:
-                            if st.button("跳过此项", key=f"review_{record_key}_skip"):
-                                decision = "skipped"
-                        if decision:
-                            try:
-                                edited_value = json.loads(edited_json) if decision == "edited" else None
-                                decide_review_item(
-                                    selected.output_folder,
-                                    str(current["id"]),
-                                    decision,
-                                    value=edited_value,
-                                    comment=comment,
-                                )
-                            except Exception as exc:  # noqa: BLE001
-                                st.error(f"保存审核决定失败：{_clean_error(exc)}")
-                            else:
-                                _rerun_with_notice(st, "审核决定已保存，已切换到下一项。")
-
-                    if not pending_items:
-                        st.success("所有审核项已解决，可以应用到最终菜谱。")
-                        if st.button("应用审核结果并生成最终版", type="primary", key=f"review_{record_key}_apply"):
-                            try:
-                                backups = _backup_files(
-                                    [selected.recipe_path, selected.note_path, current_review_path],
-                                    "review-apply",
-                                )
-                                recipe = recipe_from_completed_review(selected.output_folder)
-                                atomic_write_json(selected.recipe_path, _dump_model(recipe))  # type: ignore[arg-type]
-                                result = regenerate_note_from_recipe(
-                                    selected.output_folder,
-                                    **_regenerate_note_kwargs(config),
-                                )
-                            except Exception as exc:  # noqa: BLE001
-                                st.error(f"应用审核结果失败：{_clean_error(exc)}")
-                            else:
-                                _rerun_with_notice(
-                                    st,
-                                    f"审核结果已应用：{result.note_path}{_backup_summary(backups)}",
-                                )
+        _render_recipe_review(st, config)
 
     if active_page == "最终菜谱整理":
         _render_curation_review(st, config)
@@ -2809,20 +2995,48 @@ def main() -> None:
                         clear_prefix=state_prefix,
                     )
 
-            st.markdown("#### 截图重截")
+            st.markdown("#### 步骤图片")
+            st.caption("自动截图会比较多个时间点；候选图只临时保存在当前会话，最终每道菜最多保留 4 张压缩图片。")
             steps = recipe_data.get("steps", []) if recipe_data else []
             if not isinstance(steps, list) or not steps:
                 st.info("当前菜谱没有可重截的步骤。")
             else:
+                pending_image_count = sum(
+                    isinstance(step, dict) and step.get("screenshot_status") == "needs_review"
+                    for step in steps
+                )
+                if pending_image_count:
+                    st.warning(f"有 {pending_image_count} 个步骤的自动候选质量不足，建议人工确认；也可以明确选择不配图。")
                 step_indexes = list(range(1, len(steps) + 1))
+
+                def screenshot_step_label(index: int) -> str:
+                    step = steps[index - 1]
+                    status = str(step.get("screenshot_status") or "")
+                    marker = "待选图" if status == "needs_review" else "已有图" if step.get("screenshot_path") else "无图"
+                    return f"{index}. {step.get('title') or '未命名步骤'} · {marker}"
+
                 step_index = st.selectbox(
                     "选择步骤",
                     step_indexes,
-                    format_func=lambda index: f"{index}. {steps[index - 1].get('title') or '未命名步骤'}",
+                    format_func=screenshot_step_label,
                     key=f"{state_prefix}screenshot_step",
                 )
                 current_step = steps[int(step_index) - 1]
                 initial_timestamp = _nonnegative_float(current_step.get("start_time"))
+                current_image = _local_markdown_image(
+                    selected.output_folder,
+                    str(current_step.get("screenshot_path") or ""),
+                )
+                screenshot_status = str(current_step.get("screenshot_status") or "")
+                screenshot_score = current_step.get("screenshot_score")
+                if current_image and current_image.is_file():
+                    st.image(str(current_image), caption="当前保存图片", width=420)
+                if screenshot_status == "needs_review":
+                    st.warning("自动候选质量不足，因此没有强行配图。可以查看候选、精确重截、上传图片或选择不配图。")
+                elif screenshot_status == "none":
+                    st.info("此步骤已明确设置为不配图。")
+                elif screenshot_score is not None:
+                    st.caption(f"当前图片质量评分：{float(screenshot_score) * 100:.0f}%")
                 duration = _transcript_duration(selected.transcript_path)
                 known_times = [
                     _nonnegative_float(value)
@@ -2860,6 +3074,125 @@ def main() -> None:
                     )
                 else:
                     st.caption(f"当前步骤从 {initial_timestamp:.1f} 秒开始；{available_range}。")
+
+                candidate_key = f"{state_prefix}screenshot_candidates_{step_index}"
+                candidate_action, clear_action = st.columns(2)
+                with candidate_action:
+                    if st.button(
+                        "自动查找候选图",
+                        key=f"{state_prefix}suggest_screenshots_{step_index}",
+                        use_container_width=True,
+                    ):
+                        try:
+                            with st.spinner("正在截取并比较多个候选画面..."):
+                                for session_key in list(st.session_state):
+                                    if str(session_key).startswith(f"{state_prefix}screenshot_candidates_"):
+                                        st.session_state.pop(session_key, None)
+                                st.session_state[candidate_key] = suggest_step_screenshots(
+                                    selected.output_folder,
+                                    int(step_index),
+                                    cookies=_optional_text(config.cookies),
+                                    video_path=_optional_text(video_path),
+                                    keep_video=config.keep_media,
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            st.error(f"候选图生成失败：{_clean_error(exc)}")
+                with clear_action:
+                    if st.button(
+                        "此步骤不配图",
+                        disabled=not confirm_overwrite,
+                        key=f"{state_prefix}clear_screenshot_{step_index}",
+                        use_container_width=True,
+                    ):
+                        try:
+                            backups = _backup_files(
+                                [current_image, selected.recipe_path, selected.note_path],
+                                "remove-screenshot",
+                            )
+                            clear_step_screenshot(selected.output_folder, int(step_index))
+                        except Exception as exc:  # noqa: BLE001
+                            st.error(f"移除图片失败：{_clean_error(exc)}")
+                        else:
+                            _rerun_with_notice(
+                                st,
+                                f"此步骤已设为不配图{_backup_summary(backups)}",
+                                clear_prefix=state_prefix,
+                            )
+
+                candidates = st.session_state.get(candidate_key, [])
+                if candidates:
+                    st.markdown("##### 候选图片（质量较高者优先）")
+                    candidate_columns = st.columns(3)
+                    for candidate_index, candidate in enumerate(candidates):
+                        with candidate_columns[candidate_index % len(candidate_columns)]:
+                            st.image(candidate.content, width="stretch")
+                            timestamp_label = (
+                                f"{candidate.timestamp:.1f} 秒" if candidate.timestamp is not None else "本地图片"
+                            )
+                            st.caption(f"{timestamp_label} · 质量 {candidate.score * 100:.0f}%")
+                            if st.button(
+                                "采用这张",
+                                disabled=not confirm_overwrite,
+                                key=f"{state_prefix}use_candidate_{step_index}_{candidate_index}",
+                                use_container_width=True,
+                            ):
+                                try:
+                                    target_image = selected.output_folder / "images" / f"step_{int(step_index):02d}.jpg"
+                                    backups = _backup_files(
+                                        [target_image, selected.recipe_path, selected.note_path],
+                                        "choose-screenshot",
+                                    )
+                                    image_path = save_step_screenshot_candidate(
+                                        selected.output_folder,
+                                        int(step_index),
+                                        candidate,
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    st.error(f"保存候选图失败：{_clean_error(exc)}")
+                                else:
+                                    _rerun_with_notice(
+                                        st,
+                                        f"已采用：{image_path}{_backup_summary(backups)}",
+                                        clear_prefix=state_prefix,
+                                    )
+                elif candidate_key in st.session_state:
+                    st.warning("这个步骤范围内没有截到可读取的候选画面，可以扩大时间点精确重截、上传图片或不配图。")
+
+                uploaded_image = st.file_uploader(
+                    "上传替代图片",
+                    type=["jpg", "jpeg", "png", "webp"],
+                    key=f"{state_prefix}uploaded_screenshot_{step_index}",
+                    help="图片会转成压缩 JPEG 后保存，原文件不会复制进菜谱目录。",
+                )
+                if st.button(
+                    "采用上传图片",
+                    disabled=uploaded_image is None or not confirm_overwrite,
+                    key=f"{state_prefix}use_uploaded_screenshot_{step_index}",
+                ):
+                    try:
+                        uploaded_content = uploaded_image.getvalue()
+                        if len(uploaded_content) > 10 * 1024 * 1024:
+                            raise ValueError("上传图片不能超过 10 MB")
+                        target_image = selected.output_folder / "images" / f"step_{int(step_index):02d}.jpg"
+                        backups = _backup_files(
+                            [target_image, selected.recipe_path, selected.note_path],
+                            "upload-screenshot",
+                        )
+                        image_path = save_uploaded_step_screenshot(
+                            selected.output_folder,
+                            int(step_index),
+                            uploaded_content,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"上传图片保存失败：{_clean_error(exc)}")
+                    else:
+                        _rerun_with_notice(
+                            st,
+                            f"已采用上传图片：{image_path}{_backup_summary(backups)}",
+                            clear_prefix=state_prefix,
+                        )
+
+                st.markdown("##### 按时间点精确重截")
                 if st.button(
                     "重新截图",
                     disabled=not confirm_overwrite,
@@ -2877,6 +3210,7 @@ def main() -> None:
                             float(timestamp),
                             cookies=_optional_text(config.cookies),
                             video_path=_optional_text(video_path),
+                            keep_video=config.keep_media,
                         )
                     except Exception as exc:  # noqa: BLE001
                         st.error(f"截图失败：{_clean_error(exc)}")

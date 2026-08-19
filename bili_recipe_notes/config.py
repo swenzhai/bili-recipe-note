@@ -26,7 +26,7 @@ class UIConfig:
     codex_profile: str | None = None
     llm_cli_extra_instructions: str | None = None
     max_recipe_steps: int = 10
-    max_step_images: int = 4
+    max_step_images: int = 3
     enable_recipe_review: bool = False
     obsidian_vault_dir: str = "obsidian-vault"
     auto_archive_after_generation: bool = False

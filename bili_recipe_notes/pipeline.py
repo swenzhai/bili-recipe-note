@@ -31,8 +31,18 @@ from .output_folders import rename_completed_output_folder
 from .quality import write_quality_report
 from .recipe_extractor import Recipe, TranscriptSegment, extract_recipe_rule_based, extract_recipe_with_llm
 from .recipe_review import create_recipe_review
-from .screenshot import capture_screenshot_at, capture_step_screenshots
-from .storage import atomic_write_json, atomic_write_text
+from .screenshot import (
+    MAX_SAVED_STEP_IMAGES,
+    ScreenshotCandidate,
+    capture_screenshot_at,
+    capture_step_screenshots,
+    generate_screenshot_candidates,
+    optimize_screenshot,
+    optimize_screenshot_content,
+    score_screenshot,
+    step_candidate_timestamps,
+)
+from .storage import atomic_write_bytes, atomic_write_json, atomic_write_text
 from .subtitle import parse_subtitle_file
 from .transcriber import transcribe_audio
 from .utils import build_output_folder_name, ensure_dir, sanitize_filename
@@ -59,7 +69,7 @@ class RecipeJobOptions:
     codex_profile: str | None = None
     llm_cli_extra_instructions: str | None = None
     max_recipe_steps: int = 10
-    max_step_images: int = 4
+    max_step_images: int = 3
     enable_recipe_review: bool = False
 
 
@@ -105,7 +115,7 @@ class BatchJobOptions:
     codex_profile: str | None = None
     llm_cli_extra_instructions: str | None = None
     max_recipe_steps: int = 10
-    max_step_images: int = 4
+    max_step_images: int = 3
     enable_recipe_review: bool = False
     skip_existing: bool = True
     batch_id: str | None = None
@@ -280,47 +290,6 @@ def _recipe_output_meets_requirements(folder: Path, options: RecipeJobOptions) -
     if options.require_screenshot and not _has_existing_step_images(folder, recipe):
         return False
     return True
-
-
-def _key_screenshot_timestamps(recipe: Recipe, duration: float | int | None) -> list[float]:
-    candidates: list[float] = []
-    for step in recipe.steps:
-        candidates.append(max(0.0, step.start_time + 1.5))
-    if isinstance(duration, (int, float)) and duration > 0:
-        candidates.extend([max(0.0, duration * 0.3), max(0.0, duration * 0.5)])
-    candidates.append(1.5)
-
-    seen: set[float] = set()
-    unique: list[float] = []
-    for timestamp in candidates:
-        rounded = round(timestamp, 1)
-        if rounded in seen:
-            continue
-        seen.add(rounded)
-        unique.append(timestamp)
-    return unique
-
-
-def _capture_fallback_key_screenshot(
-    video_path: Path,
-    recipe: Recipe,
-    images_dir: Path,
-    duration: float | int | None,
-) -> Path:
-    if not recipe.steps:
-        raise ValueError("recipe has no steps")
-
-    images_dir.mkdir(parents=True, exist_ok=True)
-    output_path = images_dir / "key_01.jpg"
-    last_error: Exception | None = None
-    for timestamp in _key_screenshot_timestamps(recipe, duration):
-        try:
-            capture_screenshot_at(video_path, timestamp, output_path)
-            recipe.steps[0].screenshot_path = f"images/{output_path.name}"
-            return output_path
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-    raise RuntimeError(f"fallback key screenshot failed: {last_error}")
 
 
 def _read_json_object(path: Path) -> dict:
@@ -567,7 +536,7 @@ def generate_recipe_from_raw(
                 video = download_lowres_video(source_url, media_dir, cookies=options.cookies)
                 capture_step_screenshots(video, recipe.steps, folder / "images", max_images=options.max_step_images)
                 if not _has_step_images(recipe):
-                    _capture_fallback_key_screenshot(video, recipe, folder / "images", metadata.get("duration"))
+                    _emit(log, "No screenshot candidate met the quality threshold; leaving steps unillustrated.")
             except Exception as exc:  # noqa: BLE001
                 stage_errors.append(f"screenshot: {exc}")
                 if options.require_screenshot:
@@ -959,12 +928,140 @@ def regenerate_recipe_from_transcript(output_folder: str | Path) -> RecipeJobRes
     return RecipeJobResult(folder, note_path, recipe_path, transcript_path, final_note)
 
 
+def _resolve_screenshot_video(
+    folder: Path,
+    recipe: Recipe,
+    *,
+    cookies: str | None,
+    video_path: str | Path | None,
+) -> tuple[Path, bool]:
+    media_dir = ensure_dir(folder / "media")
+    if video_path:
+        video = Path(video_path).expanduser()
+        if not video.is_file():
+            raise FileNotFoundError(f"Video file does not exist: {video}")
+        return video, False
+    existing = next(iter(sorted(media_dir.glob("video.*"))), None)
+    if existing:
+        return existing, False
+    if recipe.source_url:
+        return download_lowres_video(recipe.source_url, media_dir, cookies=cookies), True
+    raise FileNotFoundError("No source video is available for recapturing screenshots")
+
+
+def _cleanup_temporary_screenshot_video(video: Path, downloaded: bool, keep_video: bool) -> None:
+    if not downloaded or keep_video:
+        return
+    video.unlink(missing_ok=True)
+    try:
+        video.parent.rmdir()
+    except OSError:
+        pass
+
+
+def _ensure_screenshot_slot(recipe: Recipe, step_index: int) -> None:
+    selected = recipe.steps[step_index - 1]
+    if selected.screenshot_path:
+        return
+    saved_count = sum(bool(step.screenshot_path) for step in recipe.steps)
+    if saved_count >= MAX_SAVED_STEP_IMAGES:
+        raise ValueError(f"每道菜最多保留 {MAX_SAVED_STEP_IMAGES} 张步骤图，请先移除一张再添加。")
+
+
+def _remove_unreferenced_recipe_image(folder: Path, old_path: Path | None, recipe: Recipe) -> None:
+    if not old_path or not old_path.is_file():
+        return
+    try:
+        old_path.relative_to((folder / "images").resolve())
+    except ValueError:
+        return
+    if not any(step.screenshot_path and (folder / step.screenshot_path).resolve() == old_path for step in recipe.steps):
+        old_path.unlink(missing_ok=True)
+
+
+def suggest_step_screenshots(
+    output_folder: str | Path,
+    step_index: int,
+    *,
+    cookies: str | None = None,
+    video_path: str | Path | None = None,
+    keep_video: bool = False,
+) -> list[ScreenshotCandidate]:
+    folder = Path(output_folder)
+    recipe = _load_recipe(folder / "recipe.json")
+    if step_index < 1 or step_index > len(recipe.steps):
+        raise IndexError("step_index is out of range")
+    video, downloaded = _resolve_screenshot_video(folder, recipe, cookies=cookies, video_path=video_path)
+    step = recipe.steps[step_index - 1]
+    next_start = recipe.steps[step_index].start_time if step_index < len(recipe.steps) else None
+    try:
+        return generate_screenshot_candidates(video, step_candidate_timestamps(step, next_start))
+    finally:
+        _cleanup_temporary_screenshot_video(video, downloaded, keep_video)
+
+
+def save_step_screenshot_candidate(
+    output_folder: str | Path,
+    step_index: int,
+    candidate: ScreenshotCandidate,
+) -> Path:
+    folder = Path(output_folder)
+    recipe_path = folder / "recipe.json"
+    recipe = _load_recipe(recipe_path)
+    if step_index < 1 or step_index > len(recipe.steps):
+        raise IndexError("step_index is out of range")
+    _ensure_screenshot_slot(recipe, step_index)
+    image_path = folder / "images" / f"step_{step_index:02d}.jpg"
+    atomic_write_bytes(image_path, optimize_screenshot_content(candidate.content), backup=False)
+    step = recipe.steps[step_index - 1]
+    old_path = (folder / step.screenshot_path).resolve() if step.screenshot_path else None
+    step.screenshot_path = f"images/{image_path.name}"
+    step.screenshot_time = candidate.timestamp
+    step.screenshot_status = "manual"
+    step.screenshot_score = candidate.score
+    atomic_write_json(recipe_path, _model_dump(recipe))
+    regenerate_note_from_recipe(folder)
+    _remove_unreferenced_recipe_image(folder, old_path, recipe)
+    return image_path
+
+
+def save_uploaded_step_screenshot(
+    output_folder: str | Path,
+    step_index: int,
+    content: bytes,
+) -> Path:
+    normalized = optimize_screenshot_content(content)
+    return save_step_screenshot_candidate(
+        output_folder,
+        step_index,
+        ScreenshotCandidate(timestamp=None, score=score_screenshot(normalized), content=normalized),
+    )
+
+
+def clear_step_screenshot(output_folder: str | Path, step_index: int) -> None:
+    folder = Path(output_folder)
+    recipe_path = folder / "recipe.json"
+    recipe = _load_recipe(recipe_path)
+    if step_index < 1 or step_index > len(recipe.steps):
+        raise IndexError("step_index is out of range")
+    step = recipe.steps[step_index - 1]
+    old_path = (folder / step.screenshot_path).resolve() if step.screenshot_path else None
+    step.screenshot_path = None
+    step.screenshot_time = None
+    step.screenshot_status = "none"
+    step.screenshot_score = None
+    atomic_write_json(recipe_path, _model_dump(recipe))
+    regenerate_note_from_recipe(folder)
+    _remove_unreferenced_recipe_image(folder, old_path, recipe)
+
+
 def recapture_step_screenshot(
     output_folder: str | Path,
     step_index: int,
     timestamp: float,
     cookies: str | None = None,
     video_path: str | Path | None = None,
+    keep_video: bool = False,
 ) -> Path:
     folder = Path(output_folder)
     recipe_path = folder / "recipe.json"
@@ -972,23 +1069,26 @@ def recapture_step_screenshot(
     if step_index < 1 or step_index > len(recipe.steps):
         raise IndexError("step_index is out of range")
 
-    media_dir = ensure_dir(folder / "media")
-    if video_path:
-        video = Path(video_path)
-    else:
-        existing = next(iter(sorted(media_dir.glob("video.*"))), None)
-        if existing:
-            video = existing
-        elif recipe.source_url:
-            video = download_lowres_video(recipe.source_url, media_dir, cookies=cookies)
-        else:
-            raise FileNotFoundError("No source video is available for recapturing screenshots")
-
-    image_path = folder / "images" / f"step_{step_index:02d}.jpg"
-    capture_screenshot_at(video, timestamp, image_path)
-    step = recipe.steps[step_index - 1]
-    step.start_time = timestamp
-    step.screenshot_path = f"images/{image_path.name}"
-    atomic_write_json(recipe_path, _model_dump(recipe))
-    regenerate_note_from_recipe(folder)
-    return image_path
+    _ensure_screenshot_slot(recipe, step_index)
+    video, downloaded = _resolve_screenshot_video(folder, recipe, cookies=cookies, video_path=video_path)
+    try:
+        image_path = folder / "images" / f"step_{step_index:02d}.jpg"
+        temporary_image = image_path.with_name(f".{image_path.stem}.capture.jpg")
+        try:
+            capture_screenshot_at(video, timestamp, temporary_image)
+            normalized = optimize_screenshot(temporary_image)
+        finally:
+            temporary_image.unlink(missing_ok=True)
+        atomic_write_bytes(image_path, normalized, backup=False)
+        step = recipe.steps[step_index - 1]
+        old_path = (folder / step.screenshot_path).resolve() if step.screenshot_path else None
+        step.screenshot_path = f"images/{image_path.name}"
+        step.screenshot_time = timestamp
+        step.screenshot_status = "manual"
+        step.screenshot_score = score_screenshot(image_path.read_bytes())
+        atomic_write_json(recipe_path, _model_dump(recipe))
+        regenerate_note_from_recipe(folder)
+        _remove_unreferenced_recipe_image(folder, old_path, recipe)
+        return image_path
+    finally:
+        _cleanup_temporary_screenshot_video(video, downloaded, keep_video)

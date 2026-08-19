@@ -306,8 +306,13 @@ def test_cli_exports_web_library_to_default_output_path(monkeypatch, tmp_path: P
     monkeypatch.chdir(tmp_path)
     captured = {}
 
-    def fake_export(project_root, out_dir, destination):
-        captured.update(project_root=project_root, out_dir=out_dir, destination=destination)
+    def fake_export(project_root, out_dir, destination, *, image_mode="all"):
+        captured.update(
+            project_root=project_root,
+            out_dir=out_dir,
+            destination=destination,
+            image_mode=image_mode,
+        )
         from bili_recipe_notes.web_export import WebLibraryExportResult
 
         return WebLibraryExportResult(
@@ -319,12 +324,13 @@ def test_cli_exports_web_library_to_default_output_path(monkeypatch, tmp_path: P
         )
 
     monkeypatch.setattr(cli, "export_web_library", fake_export)
-    args = cli.build_parser().parse_args(["--export-web-library"])
+    args = cli.build_parser().parse_args(["--export-web-library", "--web-library-images", "first"])
 
     assert cli.run(args) == 0
     assert captured["project_root"] == tmp_path
     assert captured["out_dir"] == Path("outputs")
     assert captured["destination"] == Path("outputs/bili-recipe-web-library.json")
+    assert captured["image_mode"] == "first"
     assert capsys.readouterr().out.rstrip().endswith(
         f"WEB_LIBRARY_PATH={(tmp_path / 'outputs' / 'bili-recipe-web-library.json').resolve()}"
     )

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from bili_recipe_notes import content_analysis, knowledge_base, pipeline
 from bili_recipe_notes.config import UIConfig, load_config, save_config
@@ -33,10 +35,13 @@ from bili_recipe_notes.knowledge_base import (
 from bili_recipe_notes.pipeline import (
     BatchJobOptions,
     RecipeJobResult,
+    clear_step_screenshot,
     recapture_step_screenshot,
     regenerate_note_from_recipe,
     regenerate_recipe_from_transcript,
     run_batch,
+    save_uploaded_step_screenshot,
+    suggest_step_screenshots,
 )
 from bili_recipe_notes.recipe_extractor import Recipe, RecipeIngredient, RecipeStep, TranscriptSegment
 from bili_recipe_notes.storage import CorruptDataError
@@ -219,7 +224,7 @@ def test_recapture_step_screenshot_updates_recipe(monkeypatch, tmp_path) -> None
 
     def _capture(video_path, timestamp, output_path):
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(f"{video_path}:{timestamp}", encoding="utf-8")
+        Image.effect_noise((640, 360), 80).convert("RGB").save(output_path, format="JPEG")
         return output_path
 
     monkeypatch.setattr(pipeline, "capture_screenshot_at", _capture)
@@ -228,8 +233,65 @@ def test_recapture_step_screenshot_updates_recipe(monkeypatch, tmp_path) -> None
 
     assert image_path.exists()
     recipe = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
-    assert recipe["steps"][0]["start_time"] == 12.5
+    assert recipe["steps"][0]["start_time"] == 1.0
     assert recipe["steps"][0]["screenshot_path"] == "images/step_01.jpg"
+    assert recipe["steps"][0]["screenshot_time"] == 12.5
+    assert recipe["steps"][0]["screenshot_status"] == "manual"
+
+
+def test_manual_step_images_enforce_count_limit_and_remove_unused_file(tmp_path: Path) -> None:
+    folder = tmp_path / "outputs" / "demo"
+    folder.mkdir(parents=True)
+    images = folder / "images"
+    images.mkdir()
+    steps = []
+    for index in range(5):
+        screenshot_path = f"images/step_{index + 1:02d}.jpg" if index < 4 else None
+        if screenshot_path:
+            Image.effect_noise((320, 180), 60).convert("RGB").save(folder / screenshot_path, format="JPEG")
+        steps.append(
+            RecipeStep(
+                title=f"步骤{index + 1}",
+                start_time=float(index),
+                action="操作",
+                screenshot_path=screenshot_path,
+            )
+        )
+    recipe = _recipe()
+    recipe.steps = steps
+    (folder / "recipe.json").write_text(recipe.model_dump_json(indent=2), encoding="utf-8")
+    (folder / "note.md").write_text("# Demo\n", encoding="utf-8")
+    upload = io.BytesIO()
+    Image.effect_noise((1200, 800), 80).convert("RGB").save(upload, format="PNG")
+
+    with pytest.raises(ValueError, match="最多保留 4 张"):
+        save_uploaded_step_screenshot(folder, 5, upload.getvalue())
+
+    removed = folder / "images" / "step_01.jpg"
+    clear_step_screenshot(folder, 1)
+    assert not removed.exists()
+    saved = save_uploaded_step_screenshot(folder, 5, upload.getvalue())
+    updated = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
+    assert saved.stat().st_size <= 450 * 1024
+    assert sum(bool(step.get("screenshot_path")) for step in updated["steps"]) == 4
+
+
+def test_screenshot_candidate_download_is_removed_after_use(monkeypatch, tmp_path: Path) -> None:
+    folder = tmp_path / "outputs" / "demo"
+    _write_recipe_folder(folder)
+
+    def _download(url, output_dir, cookies=None):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        video = output_dir / "video.mp4"
+        video.write_bytes(b"temporary-video")
+        return video
+
+    monkeypatch.setattr(pipeline, "download_lowres_video", _download)
+    monkeypatch.setattr(pipeline, "generate_screenshot_candidates", lambda *args, **kwargs: [])
+
+    assert suggest_step_screenshots(folder, 1) == []
+    assert not (folder / "media" / "video.mp4").exists()
+    assert not (folder / "media").exists()
 
 
 def test_analyze_video_content_writes_markdown_and_metadata(monkeypatch, tmp_path) -> None:

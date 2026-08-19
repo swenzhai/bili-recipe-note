@@ -216,7 +216,7 @@ def test_required_screenshot_failure_marks_recipe_stage_failed(monkeypatch, tmp_
     assert job["stages"]["recipe"]["status"] == "failed"
 
 
-def test_generate_recipe_note_captures_fallback_key_image(monkeypatch, tmp_path) -> None:
+def test_generate_recipe_note_does_not_force_an_unrelated_fallback_image(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         pipeline,
         "fetch_video_info",
@@ -234,14 +234,12 @@ def test_generate_recipe_note_captures_fallback_key_image(monkeypatch, tmp_path)
         video.write_text("fake video", encoding="utf-8")
         return video
 
-    def _capture_key(video_path, timestamp, output_path):
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(f"{timestamp}", encoding="utf-8")
-        return output_path
+    def _reject_candidates(video_path, steps, images_dir, max_images=3):
+        for step in steps:
+            step.screenshot_status = "needs_review"
 
     monkeypatch.setattr(pipeline, "download_lowres_video", _download_video)
-    monkeypatch.setattr(pipeline, "capture_step_screenshots", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pipeline, "capture_screenshot_at", _capture_key)
+    monkeypatch.setattr(pipeline, "capture_step_screenshots", _reject_candidates)
 
     result = pipeline.generate_recipe_note(
         RecipeJobOptions(
@@ -253,9 +251,10 @@ def test_generate_recipe_note_captures_fallback_key_image(monkeypatch, tmp_path)
         )
     )
 
-    assert (result.output_folder / "images" / "key_01.jpg").exists()
-    assert "(images/key_01.jpg)" in result.note_path.read_text(encoding="utf-8")
-    assert "images/key_01.jpg" in result.recipe_path.read_text(encoding="utf-8")
+    assert not list((result.output_folder / "images").glob("*.jpg"))
+    assert "(images/" not in result.note_path.read_text(encoding="utf-8")
+    recipe = json.loads(result.recipe_path.read_text(encoding="utf-8"))
+    assert recipe["steps"][0]["screenshot_status"] == "needs_review"
 
 
 def test_generate_recipe_note_keeps_image_inline_on_deterministic_fallback(monkeypatch, tmp_path) -> None:

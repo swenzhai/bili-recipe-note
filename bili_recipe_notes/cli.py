@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", default="outputs")
     parser.add_argument("--no-screenshot", action="store_true")
     parser.add_argument("--max-steps", type=int, default=10, choices=range(4, 13), metavar="4-12")
-    parser.add_argument("--max-images", type=int, default=4, choices=range(1, 7), metavar="1-6")
+    parser.add_argument("--max-images", type=int, default=3, choices=range(1, 5), metavar="1-4")
     parser.add_argument("--review", action="store_true", help="Create recipe.review.json for item-by-item approval")
     parser.add_argument("--whisper-model", default="small")
     parser.add_argument("--language", default="zh")
@@ -95,7 +95,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         nargs="?",
         const="",
-        help="Export all recipes and step images for the offline web app (default: OUT/bili-recipe-web-library.json)",
+        help="Export recipes for the offline web app (default: OUT/bili-recipe-web-library.json)",
+    )
+    parser.add_argument(
+        "--web-library-images",
+        choices=["all", "first", "none"],
+        default="all",
+        help="Images included in web library exports: all, first image per recipe, or none",
     )
     action_mode.add_argument(
         "--export-curation-review",
@@ -184,7 +190,7 @@ def _single_options(args: argparse.Namespace, url: str, extra_instructions: str 
         codex_profile=getattr(args, "codex_profile", None),
         llm_cli_extra_instructions=extra_instructions,
         max_recipe_steps=getattr(args, "max_steps", 10),
-        max_step_images=getattr(args, "max_images", 4),
+        max_step_images=getattr(args, "max_images", 3),
         enable_recipe_review=getattr(args, "review", False),
     )
 
@@ -214,7 +220,7 @@ def _batch_options(
         codex_profile=getattr(args, "codex_profile", None),
         llm_cli_extra_instructions=extra_instructions,
         max_recipe_steps=getattr(args, "max_steps", 10),
-        max_step_images=getattr(args, "max_images", 4),
+        max_step_images=getattr(args, "max_images", 3),
         enable_recipe_review=getattr(args, "review", False),
         skip_existing=not getattr(args, "no_skip_existing", False),
         batch_id=batch_id,
@@ -436,7 +442,12 @@ def run(args: argparse.Namespace) -> int:
             raise ValueError("--export-web-library does not accept video URLs or --batch-file")
         out_dir = Path(getattr(args, "out", "outputs")).expanduser()
         destination = Path(web_destination).expanduser() if web_destination else out_dir / DEFAULT_WEB_LIBRARY_NAME
-        result = export_web_library(Path.cwd(), out_dir, destination)
+        result = export_web_library(
+            Path.cwd(),
+            out_dir,
+            destination,
+            image_mode=getattr(args, "web_library_images", "all"),
+        )
         console.print(
             f"[green]Web library exported:[/green] recipes={result.recipe_count} "
             f"| images={result.asset_count} | logs={result.practice_log_count} "

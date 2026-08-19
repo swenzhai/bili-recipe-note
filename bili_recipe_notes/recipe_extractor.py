@@ -48,6 +48,9 @@ class RecipeStep(BaseModel):
     duration: str | None = None
     tips: str | None = None
     screenshot_path: str | None = None
+    screenshot_time: float | None = None
+    screenshot_status: str | None = None
+    screenshot_score: float | None = None
     evidence: str | None = None
     confidence: float | None = None
 

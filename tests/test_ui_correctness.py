@@ -172,6 +172,12 @@ def test_backups_are_timestamped_and_navigation_is_conditional(tmp_path: Path) -
     assert not at.exception
     assert not at.tabs
     assert at.selectbox(key="main_page").value == "单视频生成"
+    assert [expander.label for expander in at.expander[:4]] == [
+        "采集与生成",
+        "审阅与成稿",
+        "使用与知识",
+        "系统与迁移",
+    ]
     assert not any(button.label == "运行环境检查" for button in at.button)
     assert "zip" in ui.EXPORT_KINDS
     assert ui.EXPORT_MIME_TYPES[".zip"] == "application/zip"
@@ -317,10 +323,20 @@ def test_cli_advanced_prompt_is_available_and_propagated() -> None:
     config = ui.UIConfig(llm_provider="codex", llm_cli_extra_instructions="严格提取温度")
     assert ui._job_options("https://example.com", config).llm_cli_extra_instructions == "严格提取温度"
     assert ui._job_options("https://example.com", config).max_recipe_steps == 10
-    assert ui._job_options("https://example.com", config).max_step_images == 4
+    assert ui._job_options("https://example.com", config).max_step_images == 3
     assert ui._optimize_options(config).llm_cli_extra_instructions == "严格提取温度"
     assert ui._content_analysis_options(config, "tips.md").llm_cli_extra_instructions == "严格提取温度"
     assert ui._knowledge_extraction_options(config).llm_cli_extra_instructions == "严格提取温度"
+
+
+def test_mobile_web_export_exposes_image_size_options() -> None:
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at.selectbox(key="main_page").set_value("手机客户端")
+    at.run()
+
+    image_mode = at.radio(key="web_library_image_mode")
+    assert image_mode.value == "first"
+    assert image_mode.options == ["每道菜仅一张（推荐）", "只导出文字", "全部步骤图"]
 
 
 def test_review_page_can_create_item_by_item_review(tmp_path: Path) -> None:
@@ -340,6 +356,9 @@ def test_review_page_can_create_item_by_item_review(tmp_path: Path) -> None:
     assert (folder / "recipe.review.json").is_file()
     assert any(button.label == "采用并下一项" for button in at.button)
     assert any("置信度" in caption.value for caption in at.caption)
+    rendered_markdown = "\n".join(markdown.value for markdown in at.markdown)
+    assert "#### 草稿正文" in rendered_markdown
+    assert "#### 审核操作" in rendered_markdown
 
 
 def test_draft_can_be_archived_directly_to_obsidian(tmp_path: Path) -> None:
@@ -371,7 +390,9 @@ def test_draft_can_be_archived_directly_to_obsidian(tmp_path: Path) -> None:
 
 
 def test_edit_page_exposes_taxonomy_and_final_markdown_archive(tmp_path: Path) -> None:
-    folder = _write_record(tmp_path, "editable", _recipe("完整编辑菜谱"))
+    recipe = _recipe("完整编辑菜谱")
+    recipe["steps"] = [{"title": "翻炒", "start_time": 10, "end_time": 20, "action": "翻炒至熟"}]
+    folder = _write_record(tmp_path, "editable", recipe)
     at = _open_edit_page(tmp_path)
     record_key = ui._record_key(folder)
 
@@ -383,6 +404,9 @@ def test_edit_page_exposes_taxonomy_and_final_markdown_archive(tmp_path: Path) -
     assert at.text_input(key=f"edit_{record_key}_tags") is not None
     assert at.text_area(key=f"edit_{record_key}_final_markdown") is not None
     assert at.button(key=f"edit_{record_key}_save_and_archive") is not None
+    assert any(button.label == "自动查找候选图" for button in at.button)
+    assert any(button.label == "此步骤不配图" for button in at.button)
+    assert any(button.label == "采用上传图片" for button in at.button)
 
 
 def test_batch_results_keep_per_item_edit_review_and_archive_actions(monkeypatch, tmp_path: Path) -> None:

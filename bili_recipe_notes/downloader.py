@@ -463,9 +463,9 @@ def download_lowres_video(url: str, output_dir: Path, cookies: str | None = None
     def operation() -> Path:
         opts = _base_ydl_opts(cookies)
         opts.update({
-            # Screenshots do not need an audio stream.  Prefer a video-only stream,
-            # while retaining a combined-stream fallback for sites without DASH.
-            "format": "worstvideo/bestvideo/worst",
+            # Keep enough detail for useful cooking screenshots without retaining
+            # a full-resolution source video solely for frame extraction.
+            "format": "bestvideo[height<=720]/best[height<=720]/bestvideo/best",
             "quiet": True,
         })
         try:

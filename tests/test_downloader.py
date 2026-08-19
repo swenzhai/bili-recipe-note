@@ -144,7 +144,7 @@ def test_failed_download_does_not_reuse_stale_audio(monkeypatch, tmp_path) -> No
     assert old_audio.read_bytes() == b"old"
 
 
-def test_lowres_video_prefers_video_only_and_atomically_replaces_old_file(monkeypatch, tmp_path) -> None:
+def test_screenshot_video_prefers_up_to_720p_and_atomically_replaces_old_file(monkeypatch, tmp_path) -> None:
     old_video = tmp_path / "video.webm"
     old_video.write_bytes(b"old")
     captured = {}
@@ -170,7 +170,7 @@ def test_lowres_video_prefers_video_only_and_atomically_replaces_old_file(monkey
     assert result == tmp_path / "video.mp4"
     assert result.read_bytes() == b"new-video"
     assert not old_video.exists()
-    assert captured["format"].startswith("worstvideo/")
+    assert captured["format"].startswith("bestvideo[height<=720]/best[height<=720]")
     assert "+" not in captured["format"]
 
 
