@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import math
 import os
@@ -12,6 +14,7 @@ import sys
 import tempfile
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote
@@ -64,6 +67,16 @@ try:
     )
     from .llm import apply_cli_extra_instructions
     from .mobile_sync import MobileSyncStore
+    from .meal_order_component import render_meal_order_component
+    from .meal_plans import (
+        MealCandidate,
+        MealPlanItem,
+        delete_meal_plan,
+        load_meal_plans,
+        meal_candidate_kind,
+        record_meal_plan_practice,
+        save_meal_plan,
+    )
     from .markdown_writer import upsert_rating_block
     from .optimizer import OptimizeOptions, optimize_existing_note
     from .obsidian_archive import (
@@ -151,6 +164,16 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
     )
     from bili_recipe_notes.llm import apply_cli_extra_instructions
     from bili_recipe_notes.mobile_sync import MobileSyncStore
+    from bili_recipe_notes.meal_order_component import render_meal_order_component
+    from bili_recipe_notes.meal_plans import (
+        MealCandidate,
+        MealPlanItem,
+        delete_meal_plan,
+        load_meal_plans,
+        meal_candidate_kind,
+        record_meal_plan_practice,
+        save_meal_plan,
+    )
     from bili_recipe_notes.markdown_writer import upsert_rating_block
     from bili_recipe_notes.optimizer import OptimizeOptions, optimize_existing_note
     from bili_recipe_notes.obsidian_archive import (
@@ -208,6 +231,7 @@ PAGES = [
     "任务仪表盘",
     "菜谱库全览",
     "菜谱详情",
+    "本餐点菜",
     "烹饪模式",
     "草稿与归档",
     "审核确认",
@@ -224,7 +248,7 @@ PAGES = [
 PAGE_GROUPS = {
     "采集与生成": ["任务仪表盘", "单视频生成", "批量处理", "UP 主链接"],
     "审阅与成稿": ["草稿与归档", "审核确认", "编辑修复", "最终菜谱整理"],
-    "使用与知识": ["菜谱库全览", "菜谱详情", "烹饪模式", "知识库", "二次分析", "手机客户端"],
+    "使用与知识": ["菜谱库全览", "菜谱详情", "本餐点菜", "烹饪模式", "知识库", "二次分析", "手机客户端"],
     "系统与迁移": ["工作交接", "环境检查"],
 }
 PAGE_GROUP_BY_PAGE = {
@@ -1668,6 +1692,16 @@ def _render_recipe_detail(st, config: UIConfig) -> None:
         st.markdown("#### 快捷操作")
         st.caption("阅读位置保留在左侧，可随时切换到同一道菜的其他工作区。")
         if st.button(
+            "加入本餐",
+            key=f"detail_{record_key}_meal",
+            use_container_width=True,
+        ):
+            recipe_ids = list(st.session_state.get("meal_recipe_ids", []))
+            if selected.output_folder.name not in recipe_ids:
+                recipe_ids.append(selected.output_folder.name)
+            st.session_state["meal_recipe_ids"] = recipe_ids
+            _open_meal_mode(st, config)
+        if st.button(
             "进入烹饪模式",
             type="primary",
             key=f"detail_{record_key}_cook",
@@ -1769,6 +1803,520 @@ def _render_recipe_detail(st, config: UIConfig) -> None:
             st.markdown("### 烹饪前请确认")
             for point in recipe.uncertain_points:
                 st.warning(str(point))
+
+
+MEAL_OCCASIONS = ["日常家宴", "朋友聚餐", "带小孩", "清淡家宴", "节日聚餐", "自定义"]
+
+
+def _meal_mode_requested(st) -> bool:
+    query_mode = st.query_params.get("mode")
+    if isinstance(query_mode, list):
+        query_mode = query_mode[-1] if query_mode else None
+    return query_mode == "meal"
+
+
+def _open_meal_mode(st, config: UIConfig) -> None:
+    st.session_state["_meal_out_dir"] = str(config.out_dir)
+    st.query_params["mode"] = "meal"
+    st.rerun()
+
+
+def _close_meal_mode(st) -> None:
+    if "mode" in st.query_params:
+        del st.query_params["mode"]
+    st.rerun()
+
+
+@lru_cache(maxsize=512)
+def _cached_meal_card_image_data_uri(path_value: str, modified_ns: int) -> str | None:
+    path = Path(path_value)
+    if not path.is_file():
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            image.thumbnail((240, 165))
+            if image.mode not in {"RGB", "L"}:
+                background = Image.new("RGB", image.size, "#f7f1e7")
+                if "A" in image.getbands():
+                    background.paste(image, mask=image.getchannel("A"))
+                else:
+                    background.paste(image)
+                image = background
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=52, optimize=True)
+    except Exception:
+        return None
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _meal_card_image_data_uri(path: Path | None) -> str | None:
+    if path is None or not path.is_file():
+        return None
+    try:
+        modified_ns = path.stat().st_mtime_ns
+    except OSError:
+        return None
+    return _cached_meal_card_image_data_uri(str(path.resolve()), modified_ns)
+
+
+def _render_meal_planner(st, config: UIConfig) -> None:
+    st.subheader("餐厅式点餐")
+    st.caption("点餐在独立界面中完成，主工作区不会再混入菜单、采购和套餐表单。")
+    selected_count = len(st.session_state.get("meal_recipe_ids", []))
+    try:
+        saved_count = len(load_meal_plans())
+    except Exception:
+        saved_count = 0
+    with st.container(border=True):
+        st.markdown("### 🍽️ 打开点餐台")
+        st.write("像手机 App 一样浏览菜谱并直接加菜，再统一调整份量、备注和采购清单。")
+        summary_columns = st.columns(3)
+        summary_columns[0].metric("本餐已点", f"{selected_count} 道")
+        summary_columns[1].metric("已存套餐", f"{saved_count} 个")
+        summary_columns[2].metric("界面", "独立点餐页")
+        if st.button(
+            "进入餐厅点餐界面 →",
+            type="primary",
+            key="meal_open_restaurant",
+            use_container_width=True,
+        ):
+            _open_meal_mode(st, config)
+
+
+def _render_restaurant_meal_ui(st, config: UIConfig) -> None:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stMainBlockContainer"] { max-width: 1440px; padding-top: 1.25rem; }
+        .brn-meal-checkout-marker { display: none; }
+        div[data-testid="stVerticalBlockBorderWrapper"]:has(.brn-meal-checkout-marker) {
+          background: color-mix(in srgb, var(--background-color) 96%, #c85c43 4%);
+          border-radius: 1rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    if st.button("← 返回管理界面", key="meal_return_main"):
+        _close_meal_mode(st)
+
+    available = [item for item in scan_history(config.out_dir) if item.recipe_path]
+    if not available:
+        st.info("菜谱库还是空的。请先生成或导入菜谱。")
+        return
+    history_by_id = {item.output_folder.name: item for item in available}
+    recipe_cache: dict[str, Recipe | None] = {}
+
+    def recipe_for(recipe_id: str) -> Recipe | None:
+        if recipe_id in recipe_cache:
+            return recipe_cache[recipe_id]
+        item = history_by_id.get(recipe_id)
+        if item is None or item.recipe_path is None:
+            recipe_cache[recipe_id] = None
+            return None
+        recipe_data, error = _safe_recipe_to_data(item.recipe_path)
+        if error or recipe_data is None:
+            recipe_cache[recipe_id] = None
+            return None
+        try:
+            recipe_cache[recipe_id] = normalize_recipe_taxonomy(_validate_recipe(recipe_data))
+        except Exception:
+            recipe_cache[recipe_id] = None
+        return recipe_cache[recipe_id]
+
+    def suggested_multiplier(recipe_id: str, guest_count: int) -> float:
+        recipe = recipe_for(recipe_id)
+        baseline = parse_servings(recipe.servings) if recipe else None
+        if baseline is None:
+            return 1.0
+        return min(10.0, max(0.25, round(guest_count / baseline * 4) / 4))
+
+    if "meal_recipe_ids" not in st.session_state:
+        st.session_state["meal_recipe_ids"] = []
+    if "meal_multipliers" not in st.session_state:
+        st.session_state["meal_multipliers"] = {}
+    if "meal_item_notes" not in st.session_state:
+        st.session_state["meal_item_notes"] = {}
+    if "meal_guest_count" not in st.session_state:
+        st.session_state["meal_guest_count"] = 4
+    if "meal_child_count" not in st.session_state:
+        st.session_state["meal_child_count"] = 0
+
+    def apply_component_order(raw_order: Any) -> None:
+        if not isinstance(raw_order, dict):
+            return
+        selected_ids = [
+            str(recipe_id)
+            for recipe_id in raw_order.get("selected_ids", [])
+            if str(recipe_id) in history_by_id
+        ]
+        raw_multipliers = raw_order.get("multipliers", {})
+        raw_notes = raw_order.get("notes", {})
+        if not isinstance(raw_multipliers, dict):
+            raw_multipliers = {}
+        if not isinstance(raw_notes, dict):
+            raw_notes = {}
+        guest_count = min(50, max(1, int(raw_order.get("guest_count", 4))))
+        child_count = min(guest_count, max(0, int(raw_order.get("child_count", 0))))
+        occasion = str(raw_order.get("occasion") or MEAL_OCCASIONS[0])
+        st.session_state["meal_recipe_ids"] = selected_ids
+        st.session_state["meal_multipliers"] = {
+            recipe_id: min(10.0, max(0.25, float(raw_multipliers.get(recipe_id, 1.0))))
+            for recipe_id in selected_ids
+        }
+        st.session_state["meal_item_notes"] = {
+            recipe_id: str(raw_notes.get(recipe_id, ""))[:200]
+            for recipe_id in selected_ids
+        }
+        st.session_state["meal_guest_count"] = guest_count
+        st.session_state["meal_child_count"] = child_count
+        st.session_state["meal_occasion"] = occasion
+
+    component_state = st.session_state.get("meal_order_component")
+    if isinstance(component_state, dict):
+        apply_component_order(component_state.get("order"))
+
+    def card_image(recipe_id: str) -> Path | None:
+        recipe = recipe_for(recipe_id)
+        if recipe is None:
+            return None
+        for step in recipe.steps:
+            path = _local_markdown_image(
+                history_by_id[recipe_id].output_folder,
+                step.screenshot_path or "",
+            )
+            if path and path.is_file():
+                return path
+        return None
+
+    def load_saved_plan(plan: Any) -> None:
+        valid_items = [item for item in plan.items if item.recipe_id in history_by_id]
+        st.session_state["meal_recipe_ids"] = [item.recipe_id for item in valid_items]
+        st.session_state["meal_multipliers"] = {
+            item.recipe_id: item.servings_multiplier for item in valid_items
+        }
+        st.session_state["meal_item_notes"] = {item.recipe_id: item.note for item in valid_items}
+        for item in valid_items:
+            key = f"meal_factor_{_record_key(history_by_id[item.recipe_id].output_folder)}"
+            st.session_state[key] = item.servings_multiplier
+            st.session_state[f"meal_note_{_record_key(history_by_id[item.recipe_id].output_folder)}"] = item.note
+        st.session_state["meal_guest_count"] = plan.guest_count
+        st.session_state["meal_child_count"] = plan.child_count
+        st.session_state["meal_occasion"] = (
+            plan.occasion if plan.occasion in MEAL_OCCASIONS else "自定义"
+        )
+        st.session_state["meal_plan_name"] = plan.name
+        st.session_state["meal_plan_notes"] = plan.notes
+        st.session_state["meal_loaded_plan_id"] = plan.id
+        loaded_order = {
+            "selected_ids": [item.recipe_id for item in valid_items],
+            "multipliers": {
+                item.recipe_id: item.servings_multiplier for item in valid_items
+            },
+            "notes": {item.recipe_id: item.note for item in valid_items},
+            "guest_count": plan.guest_count,
+            "child_count": plan.child_count,
+            "occasion": plan.occasion if plan.occasion in MEAL_OCCASIONS else "自定义",
+        }
+        current_component_state = st.session_state.get("meal_order_component")
+        if isinstance(current_component_state, dict):
+            current_component_state["order"] = loaded_order
+
+    try:
+        saved_plans = load_meal_plans()
+    except Exception as exc:  # noqa: BLE001
+        saved_plans = []
+        st.error(f"读取套餐库失败：{_clean_error(exc)}")
+
+    order_tab, saved_tab = st.tabs(["🍽️ 菜单与本餐", f"📚 套餐库（{len(saved_plans)}）"])
+    with order_tab:
+        valid_current_ids = [
+            recipe_id
+            for recipe_id in st.session_state.get("meal_recipe_ids", [])
+            if recipe_id in history_by_id
+        ]
+        if valid_current_ids != st.session_state.get("meal_recipe_ids"):
+            st.session_state["meal_recipe_ids"] = valid_current_ids
+        default_order = {
+            "selected_ids": valid_current_ids,
+            "multipliers": dict(st.session_state.get("meal_multipliers", {})),
+            "notes": dict(st.session_state.get("meal_item_notes", {})),
+            "guest_count": int(st.session_state.get("meal_guest_count", 4)),
+            "child_count": int(st.session_state.get("meal_child_count", 0)),
+            "occasion": str(st.session_state.get("meal_occasion", MEAL_OCCASIONS[0])),
+        }
+        component_recipes = []
+        for item in available:
+            recipe_id = item.output_folder.name
+            recipe = recipe_for(recipe_id)
+            if recipe is None:
+                continue
+            candidate = MealCandidate(
+                recipe_id=recipe_id,
+                title=item.title,
+                category=item.category,
+                cuisine=item.cuisine,
+                tags=tuple(item.tags or []),
+                quality_score=item.quality_score,
+            )
+            component_recipes.append(
+                {
+                    "id": recipe_id,
+                    "title": item.title,
+                    "category": item.category or "未分类",
+                    "cuisine": item.cuisine or "",
+                    "tags": list(item.tags or []),
+                    "servings": recipe.servings or "",
+                    "quality_score": item.quality_score,
+                    "kind": meal_candidate_kind(candidate),
+                    "image": _meal_card_image_data_uri(card_image(recipe_id)),
+                }
+            )
+        component_result = render_meal_order_component(
+            st,
+            data={
+                "recipes": component_recipes,
+                "occasions": MEAL_OCCASIONS,
+                "order": default_order,
+                "revision": hashlib.sha256(
+                    json.dumps(default_order, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                ).hexdigest()[:16],
+            },
+            default_order=default_order,
+        )
+        component_order = getattr(component_result, "order", None)
+        if isinstance(component_order, dict):
+            apply_component_order(component_order)
+        selected_ids = list(st.session_state["meal_recipe_ids"])
+        multipliers = dict(st.session_state["meal_multipliers"])
+        item_notes = dict(st.session_state["meal_item_notes"])
+        guest_count = int(st.session_state["meal_guest_count"])
+        child_count = int(st.session_state["meal_child_count"])
+        occasion = str(st.session_state["meal_occasion"])
+
+        selected_recipes: dict[str, Recipe] = {}
+        for recipe_id in selected_ids:
+            item = history_by_id[recipe_id]
+            recipe = recipe_for(recipe_id)
+            if recipe is None:
+                st.warning(f"无法读取“{item.title}”的 recipe.json，已跳过份量和采购统计。")
+                continue
+            selected_recipes[recipe_id] = recipe
+
+        if selected_recipes:
+            with st.container(border=True):
+                st.markdown('<span class="brn-meal-checkout-marker"></span>', unsafe_allow_html=True)
+                st.markdown("### 🧺 采购清单")
+                unit_label = st.segmented_control(
+                    "采购单位",
+                    ["保留原单位", "换算为公制"],
+                    key="meal_unit_system",
+                    default="保留原单位",
+                )
+                unit_system = "metric" if unit_label == "换算为公制" else "original"
+                shopping_rows: dict[str, dict[str, Any]] = {}
+                for recipe_id, recipe in selected_recipes.items():
+                    factor = float(multipliers.get(recipe_id, 1.0))
+                    for shopping_item in build_shopping_list(recipe, factor=factor, unit_system=unit_system):
+                        row = shopping_rows.setdefault(
+                            shopping_item.name.casefold(),
+                            {"食材": shopping_item.name, "需求明细": [], "用于菜品": []},
+                        )
+                        row["需求明细"].append(f"{recipe.title}：{shopping_item.amount}")
+                        row["用于菜品"].append(recipe.title)
+                rendered_shopping_rows = [
+                    {
+                        "食材": row["食材"],
+                        "需求明细": "；".join(row["需求明细"]),
+                        "用于菜品": "、".join(dict.fromkeys(row["用于菜品"])),
+                    }
+                    for row in sorted(shopping_rows.values(), key=lambda value: value["食材"])
+                ]
+                st.dataframe(rendered_shopping_rows, width="stretch", hide_index=True)
+                shopping_markdown = "\n".join(
+                    [
+                        f"# {guest_count} 人本餐采购清单",
+                        "",
+                        *[
+                            f"- [ ] {row['食材']}：{row['需求明细']}"
+                            for row in rendered_shopping_rows
+                        ],
+                    ]
+                ) + "\n"
+                st.download_button(
+                    "下载本餐采购清单",
+                    data=shopping_markdown,
+                    file_name=f"{guest_count}人本餐采购清单.md",
+                    mime="text/markdown",
+                    key="meal_download_shopping",
+                )
+
+        st.markdown("### ⭐ 把这桌保存为套餐")
+        if "meal_plan_name" not in st.session_state:
+            st.session_state["meal_plan_name"] = f"{occasion}{guest_count}人套餐"
+        with st.form("meal_save_form"):
+            plan_name = st.text_input("套餐名称", key="meal_plan_name")
+            plan_notes = st.text_area(
+                "组合说明",
+                placeholder="例如：适合周末午餐；提前炖汤；孩子不吃辣。",
+                key="meal_plan_notes",
+            )
+            practiced = st.checkbox("这是已经实践过、值得保留的组合", key="meal_save_practiced")
+            practice_rating = st.selectbox(
+                "本次组合评分",
+                [5, 4, 3, 2, 1],
+                key="meal_save_rating",
+                disabled=not practiced,
+            )
+            practice_notes = st.text_area(
+                "本次实践经验",
+                placeholder="例如：5 人份量刚好；汤可以减半；两道菜同时用烤箱会冲突。",
+                key="meal_save_practice_notes",
+                disabled=not practiced,
+            )
+            save_plan = st.form_submit_button(
+                "更新当前套餐" if st.session_state.get("meal_loaded_plan_id") else "保存新套餐",
+                type="primary",
+                disabled=not bool(selected_ids),
+            )
+        if save_plan:
+            try:
+                saved = save_meal_plan(
+                    name=plan_name,
+                    guest_count=guest_count,
+                    child_count=child_count,
+                    occasion=occasion,
+                    notes=plan_notes,
+                    items=[
+                        MealPlanItem(
+                            recipe_id=recipe_id,
+                            title=history_by_id[recipe_id].title,
+                            servings_multiplier=float(multipliers.get(recipe_id, 1.0)),
+                            note=str(item_notes.get(recipe_id, "")),
+                        )
+                        for recipe_id in selected_ids
+                    ],
+                    plan_id=st.session_state.get("meal_loaded_plan_id"),
+                )
+                if practiced:
+                    saved = record_meal_plan_practice(
+                        saved.id,
+                        rating=int(practice_rating),
+                        notes=practice_notes,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"保存套餐失败：{_clean_error(exc)}")
+            else:
+                st.session_state["meal_loaded_plan_id"] = saved.id
+                _rerun_with_notice(st, f"套餐“{saved.name}”已保存。")
+
+    with saved_tab:
+        if not saved_plans:
+            st.info("还没有保存套餐。先在“本餐点菜”中组合并保存。")
+        for plan in saved_plans:
+            ratings = [
+                int(record["rating"])
+                for record in plan.practice_records
+                if record.get("rating") in {1, 2, 3, 4, 5}
+            ]
+            with st.expander(
+                f"{plan.name} · {plan.guest_count} 人 · {len(plan.items)} 道菜",
+                expanded=plan.id == st.session_state.get("meal_loaded_plan_id"),
+            ):
+                st.caption(
+                    f"{plan.occasion}；儿童 {plan.child_count} 人；"
+                    f"实践 {len(plan.practice_records)} 次；"
+                    + (f"平均 {sum(ratings) / len(ratings):.1f} 星" if ratings else "尚未评分")
+                )
+                st.markdown("、".join(item.title for item in plan.items))
+                if plan.notes:
+                    st.info(plan.notes)
+                missing = [item.title for item in plan.items if item.recipe_id not in history_by_id]
+                if missing:
+                    st.warning("当前菜谱库缺少：" + "、".join(missing))
+                load_column, detail_column = st.columns(2)
+                with load_column:
+                    st.button(
+                        "载入为本餐",
+                        type="primary",
+                        key=f"meal_load_{plan.id}",
+                        use_container_width=True,
+                        on_click=load_saved_plan,
+                        args=(plan,),
+                    )
+                with detail_column:
+                    first_available = next(
+                        (item for item in plan.items if item.recipe_id in history_by_id),
+                        None,
+                    )
+                    if first_available and st.button(
+                        "查看第一道菜",
+                        key=f"meal_view_{plan.id}",
+                        use_container_width=True,
+                    ):
+                        _navigate_to_record(
+                            st,
+                            "菜谱详情",
+                            history_by_id[first_available.recipe_id].output_folder,
+                        )
+                st.markdown("#### 记录一次套餐实践")
+                practice_date = st.date_input("实践日期", key=f"meal_practice_date_{plan.id}")
+                rating = st.selectbox(
+                    "组合评分",
+                    [5, 4, 3, 2, 1],
+                    key=f"meal_practice_rating_{plan.id}",
+                )
+                notes = st.text_area(
+                    "实践记录",
+                    placeholder="份量、搭配、出菜顺序、孩子接受度或下次调整建议。",
+                    key=f"meal_practice_notes_{plan.id}",
+                )
+                if st.button("保存实践记录", key=f"meal_practice_save_{plan.id}"):
+                    try:
+                        record_meal_plan_practice(
+                            plan.id,
+                            rating=int(rating),
+                            notes=notes,
+                            practiced_on=practice_date.isoformat(),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"保存实践记录失败：{_clean_error(exc)}")
+                    else:
+                        _rerun_with_notice(st, f"已记录“{plan.name}”的本次实践。")
+                if plan.practice_records:
+                    st.dataframe(
+                        [
+                            {
+                                "日期": record.get("practiced_on") or "",
+                                "评分": "★" * int(record.get("rating") or 0),
+                                "经验": record.get("notes") or "",
+                            }
+                            for record in reversed(plan.practice_records)
+                        ],
+                        width="stretch",
+                        hide_index=True,
+                    )
+                confirm_delete = st.checkbox(
+                    "确认删除这个套餐（不会删除菜谱）",
+                    key=f"meal_delete_confirm_{plan.id}",
+                )
+                if st.button(
+                    "删除套餐",
+                    disabled=not confirm_delete,
+                    key=f"meal_delete_{plan.id}",
+                ):
+                    try:
+                        delete_meal_plan(plan.id)
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"删除套餐失败：{_clean_error(exc)}")
+                    else:
+                        if st.session_state.get("meal_loaded_plan_id") == plan.id:
+                            st.session_state.pop("meal_loaded_plan_id", None)
+                        _rerun_with_notice(st, f"套餐“{plan.name}”已删除。")
 
 
 def _render_cooking_mode(st, config: UIConfig) -> None:
@@ -2693,6 +3241,15 @@ def main() -> None:
 
     _stabilize_arrow_memory_pool()
     st.set_page_config(page_title="Bili Recipe Notes", layout="wide")
+    if _meal_mode_requested(st):
+        _inject_workspace_styles(st)
+        _show_pending_notice(st)
+        meal_config = load_config()
+        meal_out_dir = st.session_state.get("_meal_out_dir")
+        if meal_out_dir:
+            meal_config.out_dir = Path(str(meal_out_dir))
+        _render_restaurant_meal_ui(st, meal_config)
+        return
     st.title("Bili Recipe Notes")
     _show_pending_notice(st)
 
@@ -2768,6 +3325,9 @@ def main() -> None:
 
     if active_page == "菜谱详情":
         _render_recipe_detail(st, config)
+
+    if active_page == "本餐点菜":
+        _render_meal_planner(st, config)
 
     if active_page == "烹饪模式":
         _render_cooking_mode(st, config)

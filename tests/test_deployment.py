@@ -76,6 +76,16 @@ def test_deployment_bundle_contains_portable_app_outputs_and_curation_state(tmp_
         ),
         encoding="utf-8",
     )
+    (config_root / "meal-plans.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "plans": [{"id": "family", "name": "四人家庭餐", "items": []}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     (config_root / "batches" / "batch-demo.json").write_text(
         json.dumps(
             {
@@ -109,6 +119,7 @@ def test_deployment_bundle_contains_portable_app_outputs_and_curation_state(tmp_
         assert "bili-recipe-notes/outputs/宫保鸡丁--BV1demo/images/step_01.jpg" in names
         assert "bili-recipe-notes/outputs/curation-review/curation-decisions.json" in names
         assert "bili-recipe-notes/DEPLOYMENT.md" in names
+        assert "bili-recipe-notes/.bili-recipe-notes/meal-plans.json" in names
         assert not any(name.endswith("media.mp4") for name in names)
         assert not any(name.endswith("job.json.bak") for name in names)
         assert not any(name.endswith("run.sh") for name in names)

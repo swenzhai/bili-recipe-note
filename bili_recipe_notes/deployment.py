@@ -254,6 +254,9 @@ def _state_files(project_root: Path) -> list[tuple[str, bytes]]:
     config_path = config_root / "config.json"
     if config_path.is_file():
         files.append((".bili-recipe-notes/config.json", _portable_config(config_path)))
+    meal_plans_path = config_root / "meal-plans.json"
+    if meal_plans_path.is_file():
+        files.append((".bili-recipe-notes/meal-plans.json", meal_plans_path.read_bytes()))
     for path in sorted((config_root / "batches").glob("*.json")):
         if path.name.endswith(".json.bak"):
             continue
@@ -267,7 +270,7 @@ def _state_files(project_root: Path) -> list[tuple[str, bytes]]:
 def _deployment_guide() -> bytes:
     return """# Bili Recipe Notes 部署包
 
-本包包含应用源码、全部菜谱/字幕/步骤图片、同名菜谱审核报告以及已经保存的人工决定。
+本包包含应用源码、全部菜谱/字幕/步骤图片、同名菜谱审核报告、已保存套餐以及人工决定。
 不包含 Cookie、虚拟环境、Git 历史、缓存、原始音视频、备份文件或移动端数据库。
 
 ## Windows

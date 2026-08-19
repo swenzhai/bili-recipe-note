@@ -312,6 +312,7 @@ def test_recipe_detail_shows_complete_recipe_and_opens_same_cooking_record(tmp_p
     assert any("番茄出汁后再调味" in warning.value for warning in at.warning)
     assert any("鸡蛋不要炒老" in info.value for info in at.info)
     assert any("盐量需要按口味确认" in warning.value for warning in at.warning)
+    assert at.button(key=f"detail_{record_key}_meal") is not None
     assert at.button(key=f"detail_{record_key}_cook") is not None
 
     at.button(key=f"detail_{record_key}_cook").click()
@@ -350,6 +351,71 @@ def test_recipe_detail_picker_searches_and_switches_with_quick_buttons(tmp_path:
     assert "清炒时蔬" in str(at.selectbox(key="detail_select").value)
     assert at.button(key="detail_previous") is not None
     assert at.button(key="detail_next") is not None
+
+
+def test_main_meal_page_is_a_launcher_for_the_restaurant_interface(tmp_path: Path) -> None:
+    _write_record(tmp_path, "meal-launcher", _recipe("番茄炒蛋"))
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
+    at.selectbox(key="main_page").set_value("本餐点菜")
+    at.run()
+
+    assert not at.exception
+    assert at.button(key="meal_open_restaurant").label == "进入餐厅点餐界面 →"
+    assert not [widget for widget in at.number_input if widget.key == "meal_child_count"]
+
+
+def test_restaurant_meal_ui_mounts_custom_component_and_builds_shopping_list(tmp_path: Path) -> None:
+    recipes = [
+        ("麻辣水煮鱼", "中餐", []),
+        ("虾仁蒸水蛋", "中餐", []),
+        ("清蒸鸡", "中餐", []),
+        ("白灼菜心", "中餐", ["素菜"]),
+        ("冬瓜排骨汤", "汤羹", []),
+        ("瑶柱炒饭", "主食", []),
+        ("姜撞奶", "糕点", []),
+    ]
+    folders = {}
+    for index, (title, category, tags) in enumerate(recipes):
+        recipe = _recipe(title, ingredients=[{"name": f"食材{index}", "amount": "2份"}])
+        recipe.update(
+            {
+                "category": category,
+                "cuisine": "中式",
+                "tags": tags,
+                "servings": "2人份",
+                "steps": [{"title": "制作", "start_time": 0, "action": "完成制作"}],
+            }
+        )
+        folders[title] = _write_record(tmp_path, f"meal-{index}", recipe)
+
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20)
+    at.query_params["mode"] = "meal"
+    at.session_state["_meal_out_dir"] = str(tmp_path)
+    selected = [
+        folders["虾仁蒸水蛋"].name,
+        folders["清蒸鸡"].name,
+        folders["白灼菜心"].name,
+        folders["冬瓜排骨汤"].name,
+        folders["瑶柱炒饭"].name,
+    ]
+    at.session_state["meal_recipe_ids"] = selected
+    at.session_state["meal_multipliers"] = {recipe_id: 1.5 for recipe_id in selected}
+    at.session_state["meal_item_notes"] = {selected[0]: "儿童份少盐"}
+    at.session_state["meal_child_count"] = 1
+    at.session_state["meal_occasion"] = "带小孩"
+    at.run()
+
+    assert not at.exception
+    components = [node for node in at._tree if node.type == "bidi_component"]
+    assert len(components) == 1
+    assert components[0].value["order"]["selected_ids"] == selected
+    assert components[0].value["order"]["multipliers"][selected[0]] == 1.5
+    assert components[0].value["order"]["notes"][selected[0]] == "儿童份少盐"
+    assert not [widget for widget in at.number_input if widget.label == "份量倍率"]
+    assert any(button.label == "下载本餐采购清单" for button in at.get("download_button"))
+    assert any(button.label == "保存新套餐" for button in at.button)
+    assert len(at.dataframe) == 1
 
 
 def test_library_count_rows_orders_counts_and_uses_recipe_share() -> None:
