@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { streamLibraryPackage } from "./library-import";
 import styles from "./page.module.css";
 
 type Ingredient = { name?: string; amount?: string; note?: string };
@@ -49,18 +50,26 @@ type Backup = {
 type View = "recipes" | "meal" | "settings";
 
 const DB_NAME = "bili-recipe-pwa";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
+const ASSET_STORE = "assets";
+let databasePromise: Promise<IDBDatabase> | null = null;
 
 function openDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (databasePromise) return databasePromise;
+  databasePromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains("state")) db.createObjectStore("state");
+      if (!db.objectStoreNames.contains(ASSET_STORE)) db.createObjectStore(ASSET_STORE);
     };
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onerror = () => {
+      databasePromise = null;
+      reject(request.error);
+    };
   });
+  return databasePromise;
 }
 
 async function readState<T>(key: string, fallback: T): Promise<T> {
@@ -80,6 +89,103 @@ async function writeState(key: string, value: unknown): Promise<void> {
     transaction.oncomplete = () => resolve();
     transaction.onerror = () => reject(transaction.error);
   });
+}
+
+async function deleteState(key: string): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction("state", "readwrite");
+    transaction.objectStore("state").delete(key);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+}
+
+async function writeAssetBatch(entries: [string, Blob][]): Promise<void> {
+  if (!entries.length) return;
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(ASSET_STORE, "readwrite");
+    const store = transaction.objectStore(ASSET_STORE);
+    entries.forEach(([key, value]) => store.put(value, key));
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
+  });
+}
+
+async function readAsset(key: string): Promise<Blob | null> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(ASSET_STORE).objectStore(ASSET_STORE).get(key);
+    request.onsuccess = () => resolve(request.result instanceof Blob ? request.result : null);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function clearAssets(): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(ASSET_STORE, "readwrite");
+    transaction.objectStore(ASSET_STORE).clear();
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+}
+
+function dataUrlToBlob(value: string): Blob {
+  const match = value.match(/^data:([^;,]+)?(;base64)?,([\s\S]*)$/);
+  if (!match) throw new Error("菜谱包中包含无法识别的图片");
+  const mimeType = match[1] || "application/octet-stream";
+  if (!match[2]) return new Blob([decodeURIComponent(match[3])], { type: mimeType });
+  const decoded = atob(match[3]);
+  const bytes = new Uint8Array(decoded.length);
+  for (let index = 0; index < decoded.length; index += 1) bytes[index] = decoded.charCodeAt(index);
+  return new Blob([bytes], { type: mimeType });
+}
+
+async function migrateLegacyAssets(): Promise<void> {
+  const legacy = await readState<Record<string, string>>("assets", {});
+  const entries = Object.entries(legacy);
+  for (let offset = 0; offset < entries.length; offset += 40) {
+    await writeAssetBatch(
+      entries.slice(offset, offset + 40).map(([key, value]) => [key, dataUrlToBlob(value)]),
+    );
+  }
+  if (entries.length) await deleteState("assets");
+}
+
+async function writeAssetEntries(entries: [string, Blob][]): Promise<void> {
+  for (let offset = 0; offset < entries.length; offset += 40) {
+    await writeAssetBatch(entries.slice(offset, offset + 40));
+  }
+}
+
+async function assetKeys(): Promise<string[]> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const request = db.transaction(ASSET_STORE).objectStore(ASSET_STORE).getAllKeys();
+    request.onsuccess = () => resolve(request.result.map(String));
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function exportAssets(): Promise<Record<string, string>> {
+  const exported: Record<string, string> = {};
+  for (const key of await assetKeys()) {
+    const blob = await readAsset(key);
+    if (blob) exported[key] = await blobToDataUrl(blob);
+  }
+  return exported;
 }
 
 const sampleRecipe: Recipe = {
@@ -110,7 +216,6 @@ const sampleRecipe: Recipe = {
 export default function Home() {
   const [ready, setReady] = useState(false);
   const [recipes, setRecipes] = useState<Recipe[]>([]);
-  const [assets, setAssets] = useState<Record<string, string>>({});
   const [meal, setMeal] = useState<MealItem[]>([]);
   const [logs, setLogs] = useState<PracticeLog[]>([]);
   const [view, setView] = useState<View>("recipes");
@@ -120,20 +225,38 @@ export default function Home() {
   const [notice, setNotice] = useState("");
   const [online, setOnline] = useState(() => typeof navigator === "undefined" || navigator.onLine);
   const [installPrompt, setInstallPrompt] = useState<Event | null>(null);
+  const [assetRevision, setAssetRevision] = useState(0);
+  const [importState, setImportState] = useState<{
+    kind: "working" | "error";
+    message: string;
+    progress?: number;
+  } | null>(null);
   const importRef = useRef<HTMLInputElement>(null);
   const restoreRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     Promise.all([
       readState<Recipe[]>("recipes", []),
-      readState<Record<string, string>>("assets", {}),
       readState<MealItem[]>("meal", []),
       readState<PracticeLog[]>("practice_logs", []),
-    ]).then(([savedRecipes, savedAssets, savedMeal, savedLogs]) => {
+    ]).then(async ([savedRecipes, savedMeal, savedLogs]) => {
       setRecipes(savedRecipes);
-      setAssets(savedAssets);
       setMeal(savedMeal);
       setLogs(savedLogs);
+      try {
+        await migrateLegacyAssets();
+      } catch (error) {
+        setImportState({
+          kind: "error",
+          message: `旧版图片迁移失败：${error instanceof Error ? error.message : "请重新导入菜谱库"}`,
+        });
+      }
+      setReady(true);
+    }).catch((error) => {
+      setImportState({
+        kind: "error",
+        message: `本地菜谱库打开失败：${error instanceof Error ? error.message : "请刷新页面重试"}`,
+      });
       setReady(true);
     });
     const status = () => setOnline(navigator.onLine);
@@ -155,9 +278,6 @@ export default function Home() {
   useEffect(() => {
     if (ready) void writeState("recipes", recipes);
   }, [ready, recipes]);
-  useEffect(() => {
-    if (ready) void writeState("assets", assets);
-  }, [ready, assets]);
   useEffect(() => {
     if (ready) void writeState("meal", meal);
   }, [ready, meal]);
@@ -203,26 +323,53 @@ export default function Home() {
 
   async function importPackage(file?: File) {
     if (!file) return;
+    setImportState({
+      kind: "working",
+      message: file.size > 100 * 1024 * 1024
+        ? `正在分段导入 ${formatBytes(file.size)}，请保持页面在前台…`
+        : `正在导入 ${file.name}…`,
+      progress: 0,
+    });
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    const assetBatch: [string, Blob][] = [];
     try {
-      const backup = JSON.parse(await file.text()) as Backup;
-      if (backup.schema_version !== 1 || !Array.isArray(backup.recipes)) {
-        throw new Error("不支持的菜谱包");
-      }
+      const backup = await streamLibraryPackage(file, {
+        onAsset: async (key, value) => {
+          assetBatch.push([key, dataUrlToBlob(value)]);
+          if (assetBatch.length >= 40) {
+            await writeAssetBatch(assetBatch.splice(0));
+          }
+        },
+        onProgress: (progress) => setImportState((current) => current?.kind === "working"
+          ? { ...current, progress: Math.round(progress * 100) }
+          : current),
+      });
+      await writeAssetBatch(assetBatch.splice(0));
       const merged = new Map(recipes.map((recipe) => [recipe.id, recipe]));
-      backup.recipes.forEach((recipe) => merged.set(recipe.id, normalizeRecipe(recipe)));
+      backup.recipes.forEach((recipe) => {
+        const typed = recipe as Recipe;
+        merged.set(String(typed.id), normalizeRecipe(typed));
+      });
       setRecipes([...merged.values()]);
-      setAssets((current) => ({ ...current, ...(backup.assets ?? {}) }));
-      if (Array.isArray(backup.practice_logs)) {
+      setAssetRevision((current) => current + 1);
+      if (backup.practiceLogs.length) {
         setLogs((current) => {
           const combined = new Map(current.map((entry) => [entry.id, entry]));
-          backup.practice_logs?.forEach((entry) => combined.set(entry.id, entry));
+          backup.practiceLogs.forEach((entry) => {
+            const typed = entry as PracticeLog;
+            combined.set(String(typed.id), typed);
+          });
           return [...combined.values()];
         });
       }
       flash(`已导入 ${backup.recipes.length} 道菜谱，可离线使用`);
+      setImportState(null);
       setView("recipes");
     } catch (error) {
-      flash(error instanceof Error ? error.message : "菜谱包导入失败");
+      const message = error instanceof DOMException && error.name === "QuotaExceededError"
+        ? "手机可用存储空间不足，无法保存全部图片。请释放 Safari 网站数据或改用较小的菜谱包。"
+        : error instanceof Error ? error.message : "菜谱包导入失败";
+      setImportState({ kind: "error", message: `导入失败：${message}` });
     }
   }
 
@@ -232,7 +379,11 @@ export default function Home() {
       const backup = JSON.parse(await file.text()) as Backup;
       if (backup.schema_version !== 1 || !Array.isArray(backup.recipes)) throw new Error();
       setRecipes(backup.recipes.map(normalizeRecipe));
-      setAssets(backup.assets ?? {});
+      await clearAssets();
+      await writeAssetEntries(
+        Object.entries(backup.assets ?? {}).map(([key, value]) => [key, dataUrlToBlob(value)]),
+      );
+      setAssetRevision((current) => current + 1);
       setMeal(backup.meal ?? []);
       setLogs(backup.practice_logs ?? []);
       flash("备份已完整恢复");
@@ -241,15 +392,25 @@ export default function Home() {
     }
   }
 
-  function exportBackup() {
-    downloadJson(`bili-recipe-backup-${dateKey()}.json`, {
-      schema_version: 1,
-      exported_at: new Date().toISOString(),
-      recipes,
-      assets,
-      meal,
-      practice_logs: logs,
-    });
+  async function exportBackup() {
+    setImportState({ kind: "working", message: "正在准备完整备份…" });
+    try {
+      downloadJson(`bili-recipe-backup-${dateKey()}.json`, {
+        schema_version: 1,
+        exported_at: new Date().toISOString(),
+        recipes,
+        assets: await exportAssets(),
+        meal,
+        practice_logs: logs,
+      });
+      setImportState(null);
+      flash("完整备份已生成");
+    } catch (error) {
+      setImportState({
+        kind: "error",
+        message: `备份生成失败：${error instanceof Error ? error.message : "浏览器可用内存不足"}`,
+      });
+    }
   }
 
   function addSample() {
@@ -264,7 +425,7 @@ export default function Home() {
   function clearLibrary() {
     if (!window.confirm("确定清空手机中的菜谱、点菜单和心得吗？请先导出备份。")) return;
     setRecipes([]);
-    setAssets({});
+    void clearAssets().then(() => setAssetRevision((current) => current + 1));
     setMeal([]);
     setLogs([]);
     setSelected(null);
@@ -294,7 +455,8 @@ export default function Home() {
           item={current.item}
           step={step}
           stepIndex={cooking.stepIndex}
-          imageUrl={step?.image_path ? assets[step.image_path] : undefined}
+          imageKey={step?.image_path}
+          assetRevision={assetRevision}
           onBack={() => setCooking(null)}
           onPrevious={() => setCooking({ ...cooking, stepIndex: cooking.stepIndex - 1 })}
           onNext={() => {
@@ -471,9 +633,15 @@ export default function Home() {
         <button className={view === "settings" ? styles.active : ""} onClick={() => setView("settings")}><span>⚙</span>设置</button>
       </nav>
 
-      <input ref={importRef} hidden type="file" accept="application/json,.json" onChange={(event) => void importPackage(event.target.files?.[0])} />
-      <input ref={restoreRef} hidden type="file" accept="application/json,.json" onChange={(event) => void restoreBackup(event.target.files?.[0])} />
-      {selected && <RecipeDetail recipe={selected} imageAssets={assets} inMeal={meal.some((item) => item.recipeId === selected.id)} onClose={() => setSelected(null)} onAdd={() => addToMeal(selected)} />}
+      <input ref={importRef} hidden type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; void importPackage(file); }} />
+      <input ref={restoreRef} hidden type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; void restoreBackup(file); }} />
+      {selected && <RecipeDetail recipe={selected} assetRevision={assetRevision} inMeal={meal.some((item) => item.recipeId === selected.id)} onClose={() => setSelected(null)} onAdd={() => addToMeal(selected)} />}
+      {importState && <div className={styles.importPanel} role={importState.kind === "error" ? "alert" : "status"}>
+        <strong>{importState.kind === "working" ? "正在导入菜谱库" : "菜谱库未导入"}</strong>
+        <p>{importState.message}</p>
+        {importState.kind === "working" && <div className={styles.importProgress}><i style={{ width: `${importState.progress ?? 0}%` }} /></div>}
+        {importState.kind === "error" && <button onClick={() => setImportState(null)}>知道了</button>}
+      </div>}
       {notice && <div className={styles.toast}>{notice}</div>}
     </main>
   );
@@ -490,7 +658,7 @@ function EmptyLibrary({ onImport, onSample }: { onImport: () => void; onSample: 
   </div>;
 }
 
-function RecipeDetail({ recipe, imageAssets, inMeal, onClose, onAdd }: { recipe: Recipe; imageAssets: Record<string, string>; inMeal: boolean; onClose: () => void; onAdd: () => void }) {
+function RecipeDetail({ recipe, assetRevision, inMeal, onClose, onAdd }: { recipe: Recipe; assetRevision: number; inMeal: boolean; onClose: () => void; onAdd: () => void }) {
   return <div className={styles.modalBackdrop}>
     <button className={styles.modalDismiss} onClick={onClose} aria-label="关闭菜谱详情" />
     <article className={styles.detailSheet}>
@@ -503,22 +671,40 @@ function RecipeDetail({ recipe, imageAssets, inMeal, onClose, onAdd }: { recipe:
       <h3>食材与调料</h3>
       <div className={styles.ingredientList}>{[...(recipe.ingredients ?? []), ...(recipe.seasonings ?? [])].map((item, index) => <div key={`${item.name}-${index}`}><span>{item.name}</span><b>{item.amount}</b><small>{item.note}</small></div>)}</div>
       <h3>步骤</h3>
-      <div className={styles.stepList}>{(recipe.steps ?? []).map((step, index) => <section key={`${step.title}-${index}`}>{step.image_path && imageAssets[step.image_path] && <img src={imageAssets[step.image_path]} alt={step.title ?? `步骤${index + 1}`} />}<span>{String(index + 1).padStart(2, "0")}</span><div><h4>{step.title}</h4><p>{step.action}</p><small>{[step.heat, step.duration].filter(Boolean).join(" · ")}</small></div></section>)}</div>
+      <div className={styles.stepList}>{(recipe.steps ?? []).map((step, index) => <section key={`${step.title}-${index}`}>{step.image_path && <AssetImage assetKey={step.image_path} revision={assetRevision} alt={step.title ?? `步骤${index + 1}`} />}<span>{String(index + 1).padStart(2, "0")}</span><div><h4>{step.title}</h4><p>{step.action}</p><small>{[step.heat, step.duration].filter(Boolean).join(" · ")}</small></div></section>)}</div>
     </article>
   </div>;
 }
 
-function CookingView({ recipe, item, step, stepIndex, imageUrl, onBack, onPrevious, onNext }: { recipe: Recipe; item: MealItem; step?: Step; stepIndex: number; imageUrl?: string; onBack: () => void; onPrevious: () => void; onNext: () => void }) {
+function CookingView({ recipe, item, step, stepIndex, imageKey, assetRevision, onBack, onPrevious, onNext }: { recipe: Recipe; item: MealItem; step?: Step; stepIndex: number; imageKey?: string; assetRevision: number; onBack: () => void; onPrevious: () => void; onNext: () => void }) {
   const steps = recipe.steps ?? [];
   if (!step) return <main className={styles.cooking}><button className={styles.backButton} onClick={onBack}>‹ 返回本餐</button><h1>{recipe.title}</h1><p>这道菜没有分步内容。</p><button className={styles.primaryButton} onClick={onNext}>标记完成</button></main>;
   return <main className={styles.cooking}>
     <header><button className={styles.backButton} onClick={onBack}>‹ 本餐</button><span>{stepIndex + 1} / {steps.length}</span></header>
     <div className={styles.progress}><i style={{ width: `${((stepIndex + 1) / steps.length) * 100}%` }} /></div>
     <span className={styles.eyebrow}>{recipe.title} · {item.multiplier.toFixed(1)}×</span>
-    {imageUrl && <img className={styles.cookingImage} src={imageUrl} alt={step.title ?? "烹饪步骤"} />}
+    {imageKey && <AssetImage className={styles.cookingImage} assetKey={imageKey} revision={assetRevision} alt={step.title ?? "烹饪步骤"} />}
     <article className={styles.cookingCard}><span>STEP {String(stepIndex + 1).padStart(2, "0")}</span><h1>{step.title}</h1><p>{step.action}</p>{(step.heat || step.duration) && <div className={styles.cookingMeta}>{step.heat && <b>火候<br /><strong>{step.heat}</strong></b>}{step.duration && <b>时间<br /><strong>{step.duration}</strong></b>}</div>}{step.tips && <aside>提示：{step.tips}</aside>}</article>
     <footer><button onClick={onPrevious} disabled={stepIndex === 0}>上一步</button><button onClick={onNext}>{stepIndex === steps.length - 1 ? "完成这道菜" : "下一步"}</button></footer>
   </main>;
+}
+
+function AssetImage({ assetKey, revision, alt, className }: { assetKey: string; revision: number; alt: string; className?: string }) {
+  const [source, setSource] = useState("");
+  useEffect(() => {
+    let active = true;
+    let objectUrl = "";
+    void readAsset(assetKey).then((blob) => {
+      if (!active || !blob) return;
+      objectUrl = URL.createObjectURL(blob);
+      setSource(objectUrl);
+    });
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [assetKey, revision]);
+  return source ? <img className={className} src={source} alt={alt} /> : null;
 }
 
 function normalizeRecipe(recipe: Recipe): Recipe {
@@ -534,11 +720,17 @@ function scaleAmount(amount: string, multiplier: number): string {
 }
 
 function buildShoppingList(entries: { item: MealItem; recipe: Recipe }[]) {
-  const grouped = new Map<string, { name: string; numeric: Map<string, number>; literal: string[]; sources: string[] }>();
+  type ShoppingGroup = { name: string; numeric: Map<string, number>; literal: string[]; sources: string[] };
+  const grouped = new Map<string, ShoppingGroup>();
   entries.forEach(({ item, recipe }) => [...(recipe.ingredients ?? []), ...(recipe.seasonings ?? [])].forEach((ingredient) => {
     const name = ingredient.name?.trim();
     if (!name) return;
-    const group = grouped.get(name) ?? { name, numeric: new Map(), literal: [], sources: [] };
+    const group: ShoppingGroup = grouped.get(name) ?? {
+      name,
+      numeric: new Map<string, number>(),
+      literal: [],
+      sources: [],
+    };
     const amount = scaleAmount(ingredient.amount?.trim() ?? "", item.multiplier);
     const match = amount.match(/^\s*(\d+(?:\.\d+)?)\s*(.*?)\s*$/);
     if (match) group.numeric.set(match[2], (group.numeric.get(match[2]) ?? 0) + Number(match[1]));
@@ -563,3 +755,4 @@ function downloadJson(filename: string, value: unknown) {
 }
 
 function dateKey() { return new Date().toISOString().slice(0, 10); }
+function formatBytes(value: number) { return `${(value / 1024 / 1024).toFixed(1)} MB`; }

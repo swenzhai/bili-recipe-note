@@ -31,6 +31,7 @@ APP_ROOT_FILES = {
     "TODO.md",
     "requirements.txt",
     "requirements-dev.txt",
+    "start-ui-linux.sh",
     "start-ui-mac.command",
     "start-ui-windows.bat",
     "package-ui-mac.command",
@@ -276,7 +277,13 @@ def _deployment_guide() -> bytes:
 3. 运行 `.\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt`。
 4. 双击 `start-ui-windows.bat`，浏览器打开 `http://127.0.0.1:8501`。
 
-## Linux / macOS
+## Linux（可信局域网）
+
+1. 运行 `chmod +x start-ui-linux.sh`。
+2. 运行 `./start-ui-linux.sh`；脚本会自动创建 `.venv`、安装依赖并显示局域网访问地址。
+3. 当前网页没有登录认证，请勿把 8501 或 8765 端口暴露到公网或公共 Wi-Fi。
+
+## macOS
 
 1. 运行 `python3 -m venv .venv`。
 2. 运行 `.venv/bin/python -m pip install -r requirements.txt`。

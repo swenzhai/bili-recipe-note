@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import zipfile
 from pathlib import Path
 
@@ -11,6 +12,9 @@ def test_deployment_bundle_contains_portable_app_outputs_and_curation_state(tmp_
     (tmp_path / "bili_recipe_notes").mkdir()
     (tmp_path / "bili_recipe_notes" / "ui.py").write_text("print('ui')\n", encoding="utf-8")
     (tmp_path / "requirements.txt").write_text("streamlit==1.58.0\n", encoding="utf-8")
+    linux_launcher = tmp_path / "start-ui-linux.sh"
+    linux_launcher.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    linux_launcher.chmod(0o755)
     (tmp_path / "run.sh").write_text("private helper\n", encoding="utf-8")
     (tmp_path / ".venv").mkdir()
     (tmp_path / ".venv" / "secret.txt").write_text("not portable\n", encoding="utf-8")
@@ -98,6 +102,9 @@ def test_deployment_bundle_contains_portable_app_outputs_and_curation_state(tmp_
     with zipfile.ZipFile(result.path) as archive:
         names = set(archive.namelist())
         assert "bili-recipe-notes/bili_recipe_notes/ui.py" in names
+        assert "bili-recipe-notes/start-ui-linux.sh" in names
+        launcher_info = archive.getinfo("bili-recipe-notes/start-ui-linux.sh")
+        assert ((launcher_info.external_attr >> 16) & stat.S_IXUSR) != 0
         assert "bili-recipe-notes/outputs/宫保鸡丁--BV1demo/recipe.json" in names
         assert "bili-recipe-notes/outputs/宫保鸡丁--BV1demo/images/step_01.jpg" in names
         assert "bili-recipe-notes/outputs/curation-review/curation-decisions.json" in names

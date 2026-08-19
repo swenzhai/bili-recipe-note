@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 *.pyc
 outputs/
+outputs*/
 *.mp4
 *.m4a
 *.webm

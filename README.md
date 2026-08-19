@@ -235,7 +235,14 @@ py -3 -m venv .venv
 .\start-ui-windows.bat
 ```
 
-Linux/macOS 解压后运行：
+Linux 解压后如需让可信局域网内的其他机器访问，运行：
+
+```bash
+chmod +x start-ui-linux.sh
+./start-ui-linux.sh
+```
+
+macOS 解压后运行：
 
 ```bash
 python3 -m venv .venv
@@ -283,6 +290,16 @@ ssh -N -L 8501:127.0.0.1:8501 用户名@服务器地址
 
 - Windows: `start-ui-windows.bat`
 - macOS: `start-ui-mac.command`
+- Linux: `start-ui-linux.sh`
+
+Linux 下运行：
+
+```bash
+chmod +x start-ui-linux.sh
+./start-ui-linux.sh
+```
+
+脚本会自动创建 `.venv`、安装或更新依赖，同时在 `0.0.0.0:8501` 启动管理页面、在 `0.0.0.0:8765` 启动手机同步 API，并在终端显示类似 `http://192.168.1.20:8501` 的局域网地址。局域网其他机器打开该地址即可访问；如果仍无法连接，请在 Linux 防火墙中仅对可信局域网放行 TCP 8501 和 8765 端口。
 
 macOS 直接双击 `start-ui-mac.command` 即可。首次打开会自动在项目目录创建隔离的 `.venv` 并安装依赖，可能需要几分钟；以后双击会直接启动并打开浏览器，不会把依赖安装到 Conda base 环境。
 
@@ -334,7 +351,7 @@ UI 会在浏览器中打开，支持：
 - 对已有视频做 LLM 二次分析，例如提取通用烹饪技巧、食材替换建议、常见失败点
 - 导出 Obsidian Markdown、PDF、Word
 
-Streamlit 管理页面仅监听 `127.0.0.1:8501`。一键启动器会另外在 `0.0.0.0:8765` 启动带设备令牌的手机同步 API；它只允许私有局域网来源，仅适合可信家庭网络，不能暴露到互联网或公共 Wi-Fi。若未来需要远程或多人使用，必须先完成 [TODO.md](TODO.md) 中的认证、权限和数据隔离事项。输出仍写入 `outputs/` 或界面中指定的目录。
+默认的 Windows/macOS 启动器让 Streamlit 管理页面仅监听 `127.0.0.1:8501`；Linux 局域网启动器会让管理页面监听 `0.0.0.0:8501`。Linux/macOS 一键启动器还会在 `0.0.0.0:8765` 启动带设备令牌的手机同步 API。管理页面本身没有登录认证，两项服务都只适合可信家庭局域网，不能暴露到互联网或公共 Wi-Fi。若未来需要远程或多人使用，必须先完成 [TODO.md](TODO.md) 中的认证、权限和数据隔离事项。输出仍写入 `outputs/` 或界面中指定的目录。
 
 UI 默认配置会保存到：
 

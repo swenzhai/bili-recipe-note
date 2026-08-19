@@ -1193,7 +1193,10 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
             health = json.load(response)
         st.success(f"同步 API 正常 · 协议 v{health.get('protocol_version', '?')}")
     except Exception:  # noqa: BLE001
-        st.warning("同步 API 当前不可访问；请使用 start-ui-mac.command 一键启动管理页和同步服务。")
+        st.warning(
+            "同步 API 当前不可访问；请使用对应系统的一键启动器（Linux: start-ui-linux.sh；"
+            "macOS: start-ui-mac.command）启动管理页和同步服务。"
+        )
     metrics = st.columns(4)
     metrics[0].metric("菜谱", index_result["indexed"])
     metrics[1].metric("服务修订", store.current_revision())

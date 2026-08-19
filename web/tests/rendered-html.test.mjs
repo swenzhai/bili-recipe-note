@@ -29,8 +29,9 @@ test("server-renders the offline recipe app", async () => {
 });
 
 test("ships an installable cached PWA without starter artifacts", async () => {
-  const [page, layout, packageJson, manifest, serviceWorker] = await Promise.all([
+  const [page, libraryImport, layout, packageJson, manifest, serviceWorker] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/library-import.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../public/manifest.webmanifest", import.meta.url), "utf8"),
@@ -39,10 +40,15 @@ test("ships an installable cached PWA without starter artifacts", async () => {
 
   assert.doesNotMatch(packageJson, /react-loading-skeleton|site-creator-vinext-starter/);
   assert.match(page, /indexedDB\.open/);
+  assert.match(page, /createObjectStore\(ASSET_STORE\)/);
+  assert.match(page, /role=\{importState\.kind === "error" \? "alert" : "status"\}/);
+  assert.match(libraryImport, /file\.slice\(offset, end\)/);
+  assert.doesNotMatch(libraryImport, /file\.text\(\)/);
   assert.match(page, /serviceWorker\.register\("\/sw\.js"\)/);
   assert.match(layout, /manifest:\s*"\/manifest\.webmanifest"/);
   assert.equal(JSON.parse(manifest).display, "standalone");
   assert.match(serviceWorker, /caches\.open/);
+  assert.match(serviceWorker, /bili-recipe-shell-v3/);
   await access(new URL("../public/icon-192.png", import.meta.url));
   await access(new URL("../public/icon-512.png", import.meta.url));
   await assert.rejects(access(new URL("../app/_sites-preview", templateRoot)));
