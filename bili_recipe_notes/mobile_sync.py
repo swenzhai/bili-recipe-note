@@ -22,7 +22,7 @@ from .storage import atomic_write_json
 
 
 SCHEMA_VERSION = 1
-DATABASE_SCHEMA_VERSION = 6
+DATABASE_SCHEMA_VERSION = 7
 PROTOCOL_VERSION = 2
 MAX_SYNC_OPERATIONS = 100
 MAX_SYNC_CHANGES = 200
@@ -108,6 +108,21 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def normalize_source_url(value: str) -> str:
+    """Normalize a video URL for durable recipe/non-recipe classification."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if not parsed.netloc:
+        return raw.rstrip("/")
+    query = parse_qs(parsed.query)
+    page = str((query.get("p") or [""])[0]).strip()
+    normalized = f"{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+    return f"{normalized}?p={page}" if page else normalized
+
+
 class MobileSyncStore:
     """Server-side source of truth for mobile pairing and offline synchronization."""
 
@@ -171,6 +186,13 @@ class MobileSyncStore:
                     content_hash TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, revision INTEGER NOT NULL,
                     published INTEGER NOT NULL DEFAULT 1, recommended INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS video_sources (
+                    source_key TEXT PRIMARY KEY, source_url TEXT NOT NULL,
+                    creator_name TEXT, title TEXT, classification TEXT NOT NULL,
+                    recipe_id TEXT, batch_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_video_sources_classification
+                    ON video_sources(classification, updated_at DESC);
                 CREATE TABLE IF NOT EXISTS assets (
                     sha256 TEXT PRIMARY KEY, recipe_id TEXT, path TEXT NOT NULL, mime_type TEXT NOT NULL,
                     byte_size INTEGER NOT NULL, kind TEXT NOT NULL, created_at TEXT NOT NULL
@@ -454,6 +476,26 @@ class MobileSyncStore:
     def _assets_for_recipe(self, folder: Path, payload: dict[str, Any], recipe_id: str) -> list[dict[str, Any]]:
         found: list[dict[str, Any]] = []
         root = folder.resolve()
+        cover_raw = str(payload.get("cover_image_path") or "").strip()
+        if cover_raw and "://" not in cover_raw:
+            cover_path = (folder / cover_raw).resolve()
+            try:
+                cover_path.relative_to(root)
+            except ValueError:
+                cover_path = Path()
+            if cover_path.is_file():
+                digest = _sha256_file(cover_path)
+                payload["cover_image_sha256"] = digest
+                found.append(
+                    {
+                        "sha256": digest,
+                        "recipe_id": recipe_id,
+                        "kind": "recipe_cover",
+                        "mime_type": mimetypes.guess_type(cover_path.name)[0] or "application/octet-stream",
+                        "byte_size": cover_path.stat().st_size,
+                        "_path": str(cover_path),
+                    }
+                )
         for index, step in enumerate(payload.get("steps") or []):
             if not isinstance(step, dict):
                 continue
@@ -484,6 +526,13 @@ class MobileSyncStore:
 
     def index_recipes(self) -> dict[str, Any]:
         candidates: dict[str, list[tuple[float, Path, dict[str, Any], list[dict[str, Any]], str]]] = {}
+        with self._connect() as connection:
+            non_recipe_keys = {
+                str(row["source_key"])
+                for row in connection.execute(
+                    "SELECT source_key FROM video_sources WHERE classification='non_recipe'"
+                )
+            }
         if self.out_dir.exists():
             for folder in self.out_dir.iterdir():
                 recipe_path = folder / "recipe.json"
@@ -491,6 +540,8 @@ class MobileSyncStore:
                     continue
                 recipe = _read_object(recipe_path)
                 if not recipe or not isinstance(recipe.get("steps"), list):
+                    continue
+                if normalize_source_url(str(recipe.get("source_url") or "")) in non_recipe_keys:
                     continue
                 recipe_id = self._recipe_id(folder, recipe, _read_object(folder / "job.json"))
                 payload = {**recipe, "id": recipe_id, "schema_version": SCHEMA_VERSION}
@@ -512,6 +563,17 @@ class MobileSyncStore:
             now = utc_now()
             for recipe_id, (_, folder, payload, assets, content_hash) in chosen.items():
                 old = existing.get(recipe_id)
+                source_url = str(payload.get("source_url") or "").strip()
+                source_key = normalize_source_url(source_url)
+                if source_key:
+                    creator_name = str(payload.get("creator_name") or payload.get("uploader") or "").strip() or None
+                    connection.execute(
+                        "INSERT INTO video_sources(source_key,source_url,creator_name,title,classification,recipe_id,batch_id,created_at,updated_at) "
+                        "VALUES (?,?,?,?, 'recipe', ?, NULL, ?, ?) ON CONFLICT(source_key) DO UPDATE SET "
+                        "source_url=excluded.source_url,creator_name=COALESCE(excluded.creator_name,video_sources.creator_name),"
+                        "title=excluded.title,classification='recipe',recipe_id=excluded.recipe_id,updated_at=excluded.updated_at",
+                        (source_key, source_url, creator_name, str(payload.get("video_title") or payload.get("title") or ""), recipe_id, now, now),
+                    )
                 if old and old["content_hash"] == content_hash and old["deleted_at"] is None:
                     continue
                 published = bool(old["published"]) if old is not None else True
@@ -534,9 +596,13 @@ class MobileSyncStore:
                 )
                 for asset in assets:
                     connection.execute(
-                        "INSERT INTO assets VALUES (?, ?, ?, ?, ?, 'recipe_image', ?) ON CONFLICT(sha256) DO UPDATE SET "
-                        "recipe_id=excluded.recipe_id,path=excluded.path,mime_type=excluded.mime_type,byte_size=excluded.byte_size",
-                        (asset["sha256"], recipe_id, asset["_path"], asset["mime_type"], asset["byte_size"], now),
+                        "INSERT INTO assets VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(sha256) DO UPDATE SET "
+                        "recipe_id=excluded.recipe_id,path=excluded.path,mime_type=excluded.mime_type,"
+                        "byte_size=excluded.byte_size,kind=excluded.kind",
+                        (
+                            asset["sha256"], recipe_id, asset["_path"], asset["mime_type"],
+                            asset["byte_size"], asset["kind"], now,
+                        ),
                     )
                 changed += 1
             for recipe_id, old in existing.items():
@@ -552,6 +618,53 @@ class MobileSyncStore:
                 )
                 deleted += 1
         return {"indexed": len(chosen), "changed": changed, "deleted": deleted, "duplicates": duplicates}
+
+    def known_non_recipe_urls(self, urls: Iterable[str]) -> set[str]:
+        keyed = {normalize_source_url(url): str(url) for url in urls if normalize_source_url(url)}
+        if not keyed:
+            return set()
+        placeholders = ",".join("?" for _ in keyed)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT source_key FROM video_sources WHERE classification='non_recipe' AND source_key IN ({placeholders})",
+                tuple(keyed),
+            ).fetchall()
+        return {keyed[str(row["source_key"])] for row in rows}
+
+    def set_video_classifications(
+        self,
+        urls: Iterable[str],
+        classification: str,
+        *,
+        creator_name: str | None = None,
+        batch_id: str | None = None,
+    ) -> int:
+        if classification not in {"recipe", "non_recipe"}:
+            raise ValidationError("classification must be recipe or non_recipe")
+        values = [(normalize_source_url(url), str(url).strip()) for url in urls]
+        values = [(key, url) for key, url in values if key and url]
+        now = utc_now()
+        with self._write_connection() as connection:
+            for source_key, source_url in values:
+                connection.execute(
+                    "INSERT INTO video_sources(source_key,source_url,creator_name,title,classification,recipe_id,batch_id,created_at,updated_at) "
+                    "VALUES (?,?,?,NULL,?,NULL,?,?,?) ON CONFLICT(source_key) DO UPDATE SET "
+                    "source_url=excluded.source_url,creator_name=COALESCE(excluded.creator_name,video_sources.creator_name),"
+                    "classification=excluded.classification,batch_id=COALESCE(excluded.batch_id,video_sources.batch_id),"
+                    "recipe_id=CASE WHEN excluded.classification='non_recipe' THEN NULL ELSE video_sources.recipe_id END,"
+                    "updated_at=excluded.updated_at",
+                    (source_key, source_url, creator_name, classification, batch_id, now, now),
+                )
+        return len(values)
+
+    def list_video_sources(self, classification: str | None = None) -> list[dict[str, Any]]:
+        where = "WHERE classification=?" if classification else ""
+        parameters = (classification,) if classification else ()
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM video_sources {where} ORDER BY updated_at DESC", parameters
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def set_recipe_publications(self, updates: dict[str, bool]) -> int:
         return self.set_recipe_menu_states({recipe_id: {"published": value} for recipe_id, value in updates.items()})
@@ -1490,6 +1603,38 @@ class MobileSyncStore:
                 "recommended": bool(row["recommended"]),
             })
         return sorted(result, key=lambda item: item["title"])
+
+    def list_recipe_cover_reviews(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id,output_folder,payload_json,published FROM recipes "
+                "WHERE deleted_at IS NULL ORDER BY updated_at DESC"
+            ).fetchall()
+        reviews = []
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            status = str(payload.get("cover_image_status") or "").strip()
+            reviews.append(
+                {
+                    "id": str(row["id"]),
+                    "title": str(payload.get("title") or row["id"]),
+                    "output_folder": str(row["output_folder"]),
+                    "published": bool(row["published"]),
+                    "cover_status": status or "unreviewed",
+                    "cover_image_path": str(payload.get("cover_image_path") or ""),
+                    "cover_image_time": payload.get("cover_image_time"),
+                    "cover_source_kind": payload.get("cover_source_kind"),
+                    "cover_source_label": payload.get("cover_source_label"),
+                    "cover_source_url": payload.get("cover_source_url"),
+                    "cover_source_step_index": payload.get("cover_source_step_index"),
+                    "cover_original_size": payload.get("cover_original_size"),
+                    "cover_crop_box": payload.get("cover_crop_box"),
+                    "cover_selected_at": payload.get("cover_selected_at"),
+                    "source_url": str(payload.get("source_url") or ""),
+                    "steps": payload.get("steps") if isinstance(payload.get("steps"), list) else [],
+                }
+            )
+        return sorted(reviews, key=lambda item: item["title"])
 
     def admin_update_practice(
         self, log_id: str, updates: dict[str, Any], *, delete: bool = False

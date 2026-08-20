@@ -475,3 +475,21 @@ def download_lowres_video(url: str, output_dir: Path, cookies: str | None = None
             _cleanup_ydl_opts(opts)
 
     return _run_with_bilibili_412_retry(operation)
+
+
+def download_cover_video(url: str, output_dir: Path, cookies: str | None = None) -> Path:
+    """Download a video-only 1080p source for high-quality menu cover frames."""
+
+    def operation() -> Path:
+        opts = _base_ydl_opts(cookies)
+        opts.update({
+            "format": "bestvideo[height<=1080]/best[height<=1080]/bestvideo/best",
+            "quiet": True,
+        })
+        try:
+            files = _download_to_staging(url, output_dir, "cover-video", opts)
+            return files[0]
+        finally:
+            _cleanup_ydl_opts(opts)
+
+    return _run_with_bilibili_412_retry(operation)

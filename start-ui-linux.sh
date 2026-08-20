@@ -52,7 +52,7 @@ if [ -f "$STAMP_FILE" ]; then
 fi
 
 if [ "$INSTALLED_REQUIREMENTS" != "$REQUIREMENTS_ID" ] || \
-   ! "$PYTHON_EXE" -c "import streamlit, yt_dlp, faster_whisper, pydantic, rich, reportlab, docx, fastapi, uvicorn, qrcode" >/dev/null 2>&1; then
+   ! "$PYTHON_EXE" -c "import streamlit, streamlit_cropper, yt_dlp, faster_whisper, pydantic, rich, reportlab, docx, fastapi, uvicorn, qrcode" >/dev/null 2>&1; then
     echo "正在安装或更新依赖，首次启动可能需要几分钟..."
     if ! "$PYTHON_EXE" -m pip install -r requirements.txt; then
         echo

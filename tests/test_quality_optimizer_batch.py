@@ -8,6 +8,7 @@ import pytest
 from bili_recipe_notes import optimizer, pipeline
 from bili_recipe_notes.batch_queue import create_batch_state, load_batch_state
 from bili_recipe_notes.optimizer import OptimizeOptions, optimize_existing_note
+from bili_recipe_notes.mobile_sync import MobileSyncStore
 from bili_recipe_notes.pipeline import BatchJobOptions, RawJobResult, RecipeJobResult, run_batch
 from bili_recipe_notes.quality import analyze_recipe_quality, write_quality_report
 from bili_recipe_notes.recipe_extractor import Recipe, RecipeIngredient, RecipeStep
@@ -145,6 +146,32 @@ def test_run_batch_persists_new_batch_state(monkeypatch, tmp_path) -> None:
 
     assert [item.status for item in result.items] == ["done", "done"]
     assert [item.status for item in state.items] == ["done", "done"]
+
+
+def test_persistent_batch_skips_database_non_recipe_sources(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    source_url = "https://www.bilibili.com/video/BV1ad"
+    database = tmp_path / ".bili-recipe-notes" / "mobile-sync.sqlite3"
+    store = MobileSyncStore(tmp_path, out_dir=tmp_path / "outputs", database_path=database)
+    store.set_video_classifications([source_url], "non_recipe", creator_name="测试 UP")
+    processed: list[str] = []
+    monkeypatch.setattr(pipeline, "generate_recipe_note", lambda options, log=None: processed.append(options.url))
+
+    result = run_batch(
+        BatchJobOptions(
+            urls=[source_url],
+            out=str(tmp_path / "outputs"),
+            batch_id="non-recipe-batch",
+            source_database_path=str(database),
+        )
+    )
+    state = load_batch_state("non-recipe-batch", project_root=tmp_path)
+
+    assert result.items == []
+    assert processed == []
+    assert state.items[0].status == "non_recipe"
+    assert state.items[0].stages["raw"].status == "done"
+    assert state.items[0].stages["recipe"].status == "done"
 
 
 def test_run_batch_resume_unfinished_processes_pending_and_failed(monkeypatch, tmp_path) -> None:

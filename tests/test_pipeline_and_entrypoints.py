@@ -377,11 +377,15 @@ def test_generate_recipe_note_uses_structured_recipe_without_freeform_rewrite(mo
             no_llm_summary=False,
             llm_provider="codex",
             codex_model="gpt-test",
+            creator_name="统一 UP 主名",
         )
     )
 
     assert result.output_folder.name.endswith("BV1stable-cid9988")
-    assert json.loads(result.recipe_path.read_text(encoding="utf-8"))["extraction_method"] == "llm"
+    recipe = json.loads(result.recipe_path.read_text(encoding="utf-8"))
+    assert recipe["extraction_method"] == "llm"
+    assert recipe["creator_name"] == "统一 UP 主名"
+    assert json.loads((result.output_folder / "source.json").read_text(encoding="utf-8"))["creator_name"] == "统一 UP 主名"
     assert captured["provider"] == "codex"
     assert captured["codex_model"] == "gpt-test"
 

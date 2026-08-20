@@ -174,6 +174,35 @@ def test_screenshot_video_prefers_up_to_720p_and_atomically_replaces_old_file(mo
     assert "+" not in captured["format"]
 
 
+def test_cover_video_prefers_up_to_1080p_without_replacing_step_video(monkeypatch, tmp_path) -> None:
+    step_video = tmp_path / "video.mp4"
+    step_video.write_bytes(b"step-video")
+    captured = {}
+
+    class _WritingYDL:
+        def __init__(self, opts):
+            captured.update(opts)
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def download(self, _urls):
+            Path(self.opts["outtmpl"].replace("%(ext)s", "mp4")).write_bytes(b"cover-video")
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", types.SimpleNamespace(YoutubeDL=_WritingYDL))
+
+    result = downloader.download_cover_video("https://example.com/video", tmp_path, cookies="cookies.txt")
+
+    assert result == tmp_path / "cover-video.mp4"
+    assert result.read_bytes() == b"cover-video"
+    assert step_video.read_bytes() == b"step-video"
+    assert captured["format"].startswith("bestvideo[height<=1080]/best[height<=1080]")
+
+
 def test_creator_crawl_recursively_expands_collections_and_deduplicates(monkeypatch) -> None:
     home = "https://space.bilibili.com/123/video"
     collection = "https://space.bilibili.com/123/lists/99?type=season"

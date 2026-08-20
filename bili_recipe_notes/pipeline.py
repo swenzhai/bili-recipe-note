@@ -15,6 +15,7 @@ from .downloader import (
     CreatorCrawlResult,
     crawl_creator_videos,
     download_audio,
+    download_cover_video,
     download_lowres_video,
     download_subtitles,
     extract_creator_video_links,
@@ -35,11 +36,16 @@ from .screenshot import (
     MAX_SAVED_STEP_IMAGES,
     ScreenshotCandidate,
     capture_screenshot_at,
+    crop_screenshot_content,
+    capture_finished_dish_cover,
     capture_step_screenshots,
     generate_screenshot_candidates,
     optimize_screenshot,
+    optimize_cover_screenshot,
+    optimize_cover_screenshot_content,
     optimize_screenshot_content,
     score_screenshot,
+    finished_dish_candidate_timestamps,
     step_candidate_timestamps,
 )
 from .storage import atomic_write_bytes, atomic_write_json, atomic_write_text
@@ -71,6 +77,7 @@ class RecipeJobOptions:
     max_recipe_steps: int = 10
     max_step_images: int = 3
     enable_recipe_review: bool = False
+    creator_name: str | None = None
 
 
 @dataclass
@@ -121,6 +128,8 @@ class BatchJobOptions:
     batch_id: str | None = None
     resume_mode: str = "new"
     target_stage: PipelineTarget = "recipe"
+    creator_name: str | None = None
+    source_database_path: str | None = None
 
 
 @dataclass
@@ -379,6 +388,7 @@ def capture_raw_material(
             "source_url": options.url,
             "video_title": title,
             "uploader": info.get("uploader"),
+            "creator_name": options.creator_name or info.get("uploader"),
             "bvid": bvid,
             "cid": cid,
             "part_id": part_id,
@@ -466,7 +476,9 @@ def _load_source_metadata(folder: Path, fallback_url: str = "") -> dict:
         job = _read_json_object(folder / "job.json")
         metadata = {
             key: job.get(key)
-            for key in ("source_url", "video_title", "uploader", "bvid", "cid", "part_id", "part_label", "duration")
+            for key in (
+                "source_url", "video_title", "uploader", "creator_name", "bvid", "cid", "part_id", "part_label", "duration"
+            )
         }
     if not metadata.get("source_url"):
         metadata["source_url"] = fallback_url
@@ -485,6 +497,8 @@ def generate_recipe_from_raw(
     if not transcript:
         raise PipelineStageError("load_raw", "transcript contains no usable text")
     metadata = _load_source_metadata(folder, options.url)
+    if options.creator_name:
+        metadata["creator_name"] = options.creator_name
     source_url = str(metadata.get("source_url") or options.url)
     media_dir = ensure_dir(folder / "media")
     stage_errors: list[str] = []
@@ -527,6 +541,7 @@ def generate_recipe_from_raw(
                 recipe = extract_recipe_rule_based(transcript, metadata, max_steps=options.max_recipe_steps)
             except Exception as exc:  # noqa: BLE001
                 raise PipelineStageError("extract_recipe", str(exc)) from exc
+        recipe.creator_name = options.creator_name or str(metadata.get("creator_name") or metadata.get("uploader") or "") or None
 
         if options.require_screenshot and options.no_screenshot:
             raise PipelineStageError("screenshot", "step screenshots are required but disabled")
@@ -535,6 +550,17 @@ def generate_recipe_from_raw(
                 _emit(log, "Capturing step screenshots...")
                 video = download_lowres_video(source_url, media_dir, cookies=options.cookies)
                 capture_step_screenshots(video, recipe.steps, folder / "images", max_images=options.max_step_images)
+                cover = capture_finished_dish_cover(
+                    video,
+                    recipe.steps,
+                    folder / "images",
+                    video_duration=float(metadata["duration"]) if metadata.get("duration") else None,
+                )
+                if cover and (folder / "images" / "cover.jpg").is_file():
+                    recipe.cover_image_path = "images/cover.jpg"
+                    recipe.cover_image_time = cover.timestamp
+                    recipe.cover_image_status = "auto_finished_dish"
+                    recipe.cover_image_score = cover.score
                 if not _has_step_images(recipe):
                     _emit(log, "No screenshot candidate met the quality threshold; leaving steps unillustrated.")
             except Exception as exc:  # noqa: BLE001
@@ -684,6 +710,7 @@ def _recipe_options(options: BatchJobOptions, url: str) -> RecipeJobOptions:
         max_recipe_steps=options.max_recipe_steps,
         max_step_images=options.max_step_images,
         enable_recipe_review=options.enable_recipe_review,
+        creator_name=options.creator_name,
     )
 
 
@@ -766,6 +793,38 @@ def _batch_options_snapshot(options: BatchJobOptions) -> dict:
     return snapshot
 
 
+def _batch_source_store(options: BatchJobOptions):
+    if not options.source_database_path:
+        return None
+    from .mobile_sync import MobileSyncStore
+
+    return MobileSyncStore(
+        Path.cwd(),
+        out_dir=options.out,
+        database_path=options.source_database_path,
+    )
+
+
+def _exclude_known_non_recipes(state, options: BatchJobOptions) -> int:
+    store = _batch_source_store(options)
+    if store is None:
+        return 0
+    blocked = store.known_non_recipe_urls(item.url for item in state.items)
+    changed = 0
+    for item in state.items:
+        if item.url not in blocked:
+            continue
+        item.status = "non_recipe"
+        item.error = "已在来源数据库中归类为非菜谱"
+        item.finished_at = _now()
+        for stage in item.stages.values():
+            stage.status = "done"
+            stage.error = None
+            stage.finished_at = item.finished_at
+        changed += 1
+    return changed
+
+
 def _run_persistent_batch(options: BatchJobOptions, log: LogCallback | None = None) -> BatchJobResult:
     if options.batch_id and options.resume_mode != "new":
         state = load_batch_state(options.batch_id)
@@ -798,6 +857,9 @@ def _run_persistent_batch(options: BatchJobOptions, log: LogCallback | None = No
             item.error = None
             item.note_path = None
             item.finished_at = None
+    excluded = _exclude_known_non_recipes(state, options)
+    if excluded:
+        _emit(log, f"Skipped {excluded} source(s) already classified as non-recipe.")
     save_batch_state(state)
 
     items_to_process = selectable_items(state, options.resume_mode, options.target_stage)
@@ -844,6 +906,9 @@ def _run_persistent_batch(options: BatchJobOptions, log: LogCallback | None = No
         item.finished_at = _now()
         save_batch_state(state)
         results.append(result)
+    source_store = _batch_source_store(options)
+    if source_store is not None:
+        source_store.index_recipes()
     return BatchJobResult(items=results)
 
 
@@ -859,10 +924,18 @@ def run_batch(options: BatchJobOptions, log: LogCallback | None = None) -> Batch
             seen.add(cleaned)
             urls.append(cleaned)
 
+    source_store = _batch_source_store(options)
+    blocked = source_store.known_non_recipe_urls(urls) if source_store is not None else set()
     items: list[BatchJobItemResult] = []
     for idx, url in enumerate(urls, start=1):
         _emit(log, f"[{idx}/{len(urls)}] {url}")
+        if url in blocked:
+            _emit(log, "Skipped source already classified as non-recipe.")
+            items.append(BatchJobItemResult(url=url, status="non_recipe", error="已归类为非菜谱"))
+            continue
         items.append(_process_batch_url(options, url, log=log))
+    if source_store is not None:
+        source_store.index_recipes()
     return BatchJobResult(items=items)
 
 
@@ -934,6 +1007,7 @@ def _resolve_screenshot_video(
     *,
     cookies: str | None,
     video_path: str | Path | None,
+    high_resolution: bool = False,
 ) -> tuple[Path, bool]:
     media_dir = ensure_dir(folder / "media")
     if video_path:
@@ -941,11 +1015,13 @@ def _resolve_screenshot_video(
         if not video.is_file():
             raise FileNotFoundError(f"Video file does not exist: {video}")
         return video, False
-    existing = next(iter(sorted(media_dir.glob("video.*"))), None)
+    pattern = "cover-video.*" if high_resolution else "video.*"
+    existing = next(iter(sorted(media_dir.glob(pattern))), None)
     if existing:
         return existing, False
     if recipe.source_url:
-        return download_lowres_video(recipe.source_url, media_dir, cookies=cookies), True
+        downloader = download_cover_video if high_resolution else download_lowres_video
+        return downloader(recipe.source_url, media_dir, cookies=cookies), True
     raise FileNotFoundError("No source video is available for recapturing screenshots")
 
 
@@ -998,6 +1074,255 @@ def suggest_step_screenshots(
         return generate_screenshot_candidates(video, step_candidate_timestamps(step, next_start))
     finally:
         _cleanup_temporary_screenshot_video(video, downloaded, keep_video)
+
+
+def recipe_cover_candidate_timestamps(recipe: Recipe, video_duration: float | None = None) -> list[float]:
+    """Build a compact review set from the opening reveal and finished-dish stages."""
+
+    timestamps = finished_dish_candidate_timestamps(recipe.steps, video_duration)
+    opening = [2.0, 4.5, 7.0, 10.0, 15.0]
+    if video_duration:
+        opening = [value for value in opening if value < max(1.0, video_duration - 1.0)]
+    timestamps.extend(opening)
+    return sorted({round(max(0.0, value), 2) for value in timestamps})[:16]
+
+
+def suggest_recipe_cover_screenshots(
+    output_folder: str | Path,
+    *,
+    cookies: str | None = None,
+    video_path: str | Path | None = None,
+    keep_video: bool = False,
+) -> list[ScreenshotCandidate]:
+    folder = Path(output_folder)
+    recipe = _load_recipe(folder / "recipe.json")
+    metadata = _load_source_metadata(folder, recipe.source_url)
+    duration = float(metadata["duration"]) if metadata.get("duration") else None
+    video, downloaded = _resolve_screenshot_video(
+        folder, recipe, cookies=cookies, video_path=video_path, high_resolution=True
+    )
+    try:
+        return generate_screenshot_candidates(
+            video,
+            recipe_cover_candidate_timestamps(recipe, duration),
+            optimizer=optimize_cover_screenshot,
+        )
+    finally:
+        _cleanup_temporary_screenshot_video(video, downloaded, keep_video)
+
+
+def _save_recipe_cover(
+    folder: Path,
+    content: bytes,
+    *,
+    timestamp: float | None,
+    status: str,
+    source_kind: str | None = None,
+    source_label: str | None = None,
+    source_url: str | None = None,
+    source_step_index: int | None = None,
+    original_size: dict[str, int] | None = None,
+    crop_box: dict[str, int] | None = None,
+) -> Path:
+    recipe_path = folder / "recipe.json"
+    recipe = _load_recipe(recipe_path)
+    normalized = optimize_cover_screenshot_content(content)
+    cover_path = folder / "images" / "cover.jpg"
+    atomic_write_bytes(cover_path, normalized, backup=False)
+    recipe.cover_image_path = "images/cover.jpg"
+    recipe.cover_image_time = timestamp
+    recipe.cover_image_status = status
+    recipe.cover_image_score = score_screenshot(normalized)
+    recipe.cover_source_kind = source_kind
+    recipe.cover_source_label = source_label
+    recipe.cover_source_url = source_url
+    recipe.cover_source_step_index = source_step_index
+    recipe.cover_original_size = original_size
+    recipe.cover_crop_box = crop_box
+    recipe.cover_selected_at = datetime.now(timezone.utc).isoformat()
+    atomic_write_json(recipe_path, _model_dump(recipe))
+    return cover_path
+
+
+def save_recipe_cover_candidate(
+    output_folder: str | Path,
+    candidate: ScreenshotCandidate,
+) -> Path:
+    return _save_recipe_cover(
+        Path(output_folder),
+        candidate.content,
+        timestamp=candidate.timestamp,
+        status="manual_video",
+        source_kind="video_frame",
+        source_label="原视频候选帧",
+        source_url=_load_recipe(Path(output_folder) / "recipe.json").source_url,
+    )
+
+
+def save_recipe_cover_content(
+    output_folder: str | Path,
+    content: bytes,
+    *,
+    timestamp: float | None,
+    status: str,
+    source_kind: str | None = None,
+    source_label: str | None = None,
+    source_url: str | None = None,
+    source_step_index: int | None = None,
+    original_size: dict[str, int] | None = None,
+    crop_box: dict[str, int] | None = None,
+) -> Path:
+    return _save_recipe_cover(
+        Path(output_folder),
+        content,
+        timestamp=timestamp,
+        status=status,
+        source_kind=source_kind,
+        source_label=source_label,
+        source_url=source_url,
+        source_step_index=source_step_index,
+        original_size=original_size,
+        crop_box=crop_box,
+    )
+
+
+def save_cropped_recipe_cover(
+    output_folder: str | Path,
+    content: bytes,
+    *,
+    timestamp: float | None,
+    status: str,
+    zoom: float,
+    horizontal_position: float,
+    vertical_position: float,
+) -> Path:
+    cropped = crop_screenshot_content(
+        content,
+        zoom=zoom,
+        horizontal_position=horizontal_position,
+        vertical_position=vertical_position,
+    )
+    return _save_recipe_cover(
+        Path(output_folder),
+        cropped,
+        timestamp=timestamp,
+        status=status,
+    )
+
+
+def capture_recipe_cover_candidate(
+    output_folder: str | Path,
+    timestamp: float,
+    *,
+    cookies: str | None = None,
+    video_path: str | Path | None = None,
+    keep_video: bool = False,
+) -> ScreenshotCandidate:
+    folder = Path(output_folder)
+    recipe = _load_recipe(folder / "recipe.json")
+    video, downloaded = _resolve_screenshot_video(
+        folder, recipe, cookies=cookies, video_path=video_path, high_resolution=True
+    )
+    temporary = folder / "images" / ".cover.candidate.jpg"
+    try:
+        capture_screenshot_at(video, timestamp, temporary)
+        content = optimize_cover_screenshot(temporary)
+        return ScreenshotCandidate(
+            timestamp=max(0.0, float(timestamp)),
+            score=score_screenshot(content),
+            content=content,
+        )
+    finally:
+        temporary.unlink(missing_ok=True)
+        _cleanup_temporary_screenshot_video(video, downloaded, keep_video)
+
+
+def save_recipe_cover_from_step(output_folder: str | Path, step_index: int) -> Path:
+    folder = Path(output_folder)
+    recipe = _load_recipe(folder / "recipe.json")
+    if step_index < 1 or step_index > len(recipe.steps):
+        raise IndexError("step_index is out of range")
+    step = recipe.steps[step_index - 1]
+    if not step.screenshot_path:
+        raise ValueError("selected step has no screenshot")
+    source = (folder / step.screenshot_path).resolve()
+    try:
+        source.relative_to(folder.resolve())
+    except ValueError:
+        raise ValueError("step screenshot escapes recipe folder") from None
+    if not source.is_file():
+        raise FileNotFoundError(f"Step screenshot does not exist: {source}")
+    return _save_recipe_cover(
+        folder,
+        source.read_bytes(),
+        timestamp=step.screenshot_time if step.screenshot_time is not None else step.start_time,
+        status="manual_step",
+        source_kind="step_frame",
+        source_label=f"步骤 {step_index} · {step.title}",
+        source_url=recipe.source_url,
+        source_step_index=step_index,
+    )
+
+
+def save_uploaded_recipe_cover(output_folder: str | Path, content: bytes) -> Path:
+    return _save_recipe_cover(
+        Path(output_folder),
+        content,
+        timestamp=None,
+        status="uploaded",
+        source_kind="upload",
+        source_label="上传的真实成品照片",
+    )
+
+
+def recapture_recipe_cover(
+    output_folder: str | Path,
+    timestamp: float,
+    *,
+    cookies: str | None = None,
+    video_path: str | Path | None = None,
+    keep_video: bool = False,
+) -> Path:
+    candidate = capture_recipe_cover_candidate(
+        output_folder,
+        timestamp,
+        cookies=cookies,
+        video_path=video_path,
+        keep_video=keep_video,
+    )
+    return _save_recipe_cover(
+        Path(output_folder),
+        candidate.content,
+        timestamp=candidate.timestamp,
+        status="manual_timestamp",
+        source_kind="video_frame",
+        source_label="原视频精确时间截图",
+        source_url=_load_recipe(Path(output_folder) / "recipe.json").source_url,
+    )
+
+
+def mark_recipe_cover_unavailable(output_folder: str | Path) -> None:
+    folder = Path(output_folder)
+    recipe_path = folder / "recipe.json"
+    recipe = _load_recipe(recipe_path)
+    cover_path = folder / str(recipe.cover_image_path or "images/cover.jpg")
+    recipe.cover_image_path = None
+    recipe.cover_image_time = None
+    recipe.cover_image_status = "no_suitable"
+    recipe.cover_image_score = None
+    recipe.cover_source_kind = None
+    recipe.cover_source_label = None
+    recipe.cover_source_url = None
+    recipe.cover_source_step_index = None
+    recipe.cover_original_size = None
+    recipe.cover_crop_box = None
+    recipe.cover_selected_at = None
+    atomic_write_json(recipe_path, _model_dump(recipe))
+    try:
+        cover_path.resolve().relative_to((folder / "images").resolve())
+    except ValueError:
+        return
+    cover_path.unlink(missing_ok=True)
 
 
 def save_step_screenshot_candidate(

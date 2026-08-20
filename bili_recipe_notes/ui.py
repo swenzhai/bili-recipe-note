@@ -20,8 +20,11 @@ from typing import Any, Iterable
 from urllib.parse import unquote
 from urllib.request import urlopen
 
+from PIL import Image
+from streamlit_cropper import st_cropper
+
 try:
-    from .batch_queue import create_batch_id, create_batch_state, list_batch_states
+    from .batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state
     from .batch_runner import get_background_batch_status, read_batch_log, start_background_batch
     from .config import UIConfig, load_config, save_config
     from .content_analysis import ContentAnalysisOptions, analyze_video_content
@@ -89,14 +92,18 @@ try:
     from .pipeline import (
         BatchJobOptions,
         RecipeJobOptions,
+        capture_recipe_cover_candidate,
         crawl_and_archive_creator,
         generate_recipe_note,
         recapture_step_screenshot,
         regenerate_note_from_recipe,
         regenerate_recipe_from_transcript,
         save_step_screenshot_candidate,
+        save_recipe_cover_content,
         save_uploaded_step_screenshot,
         clear_step_screenshot,
+        mark_recipe_cover_unavailable,
+        suggest_recipe_cover_screenshots,
         suggest_step_screenshots,
     )
     from .quality import analyze_recipe_quality
@@ -119,7 +126,7 @@ try:
     from .storage import atomic_write_json, atomic_write_text
     from .web_export import build_web_library_payload, web_library_bytes
 except ImportError:  # pragma: no cover - supports direct streamlit script execution
-    from bili_recipe_notes.batch_queue import create_batch_id, create_batch_state, list_batch_states
+    from bili_recipe_notes.batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state
     from bili_recipe_notes.batch_runner import get_background_batch_status, read_batch_log, start_background_batch
     from bili_recipe_notes.config import UIConfig, load_config, save_config
     from bili_recipe_notes.content_analysis import ContentAnalysisOptions, analyze_video_content
@@ -187,14 +194,18 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
     from bili_recipe_notes.pipeline import (
         BatchJobOptions,
         RecipeJobOptions,
+        capture_recipe_cover_candidate,
         crawl_and_archive_creator,
         generate_recipe_note,
         recapture_step_screenshot,
         regenerate_note_from_recipe,
         regenerate_recipe_from_transcript,
         save_step_screenshot_candidate,
+        save_recipe_cover_content,
         save_uploaded_step_screenshot,
         clear_step_screenshot,
+        mark_recipe_cover_unavailable,
+        suggest_recipe_cover_screenshots,
         suggest_step_screenshots,
     )
     from bili_recipe_notes.quality import analyze_recipe_quality
@@ -505,6 +516,17 @@ def _creator_link_document_label(path_value: str | Path | None) -> str:
     return f"{uploader} | {count} 条 | {path}"
 
 
+def _creator_name_from_document(path_value: str | Path | None) -> str:
+    if not path_value:
+        return ""
+    path = Path(path_value)
+    try:
+        manifest = json.loads((path.parent / "creator.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ""
+    return str(manifest.get("uploader") or "").strip() if isinstance(manifest, dict) else ""
+
+
 def _load_batch_urls(
     links_text: str,
     links_file: str,
@@ -533,6 +555,7 @@ BATCH_STATUS_LABELS = {
     "done": "已完成",
     "skipped": "已跳过",
     "failed": "失败",
+    "non_recipe": "非菜谱（已忽略）",
 }
 
 
@@ -559,7 +582,7 @@ def _batch_progress_summary(state: Any) -> dict[str, int]:
     completed = failed = running = 0
     for item in state.items:
         status = str(getattr(item, "status", "pending") or "pending")
-        if status in {"done", "skipped"}:
+        if status in {"done", "skipped", "non_recipe"}:
             completed += 1
         elif status == "failed":
             failed += 1
@@ -2517,6 +2540,461 @@ def _lan_ip_address() -> str:
         probe.close()
 
 
+def _cover_review_state(status: str) -> str:
+    if status == "no_suitable":
+        return "暂无合适图片"
+    if status in {"manual_video", "manual_step", "manual_timestamp", "manual_crop", "uploaded"}:
+        return "已确认"
+    return "待审核"
+
+
+def _format_video_position(value: Any) -> str:
+    try:
+        total_seconds = max(0.0, float(value))
+    except (TypeError, ValueError):
+        return ""
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours >= 1:
+        return f"{int(hours):02d}:{int(minutes):02d}:{seconds:04.1f}"
+    return f"{int(minutes):02d}:{seconds:04.1f}"
+
+
+def _video_url_at(source_url: str, timestamp: Any) -> str:
+    separator = "&" if "?" in source_url else "?"
+    return f"{source_url}{separator}t={max(0, int(float(timestamp)))}"
+
+
+def _render_recipe_cover_review(st, store: MobileSyncStore, config: UIConfig) -> None:
+    reviews = store.list_recipe_cover_reviews()
+    if not reviews:
+        st.info("还没有可审核的菜谱。")
+        return
+    state_counts = Counter(_cover_review_state(str(item["cover_status"])) for item in reviews)
+    metrics = st.columns(3)
+    metrics[0].metric("待审核", state_counts["待审核"])
+    metrics[1].metric("已确认", state_counts["已确认"])
+    metrics[2].metric("暂无图片", state_counts["暂无合适图片"])
+
+    filter_columns = st.columns([2, 1])
+    review_filter = filter_columns[0].selectbox(
+        "审核状态",
+        ["待审核", "已确认", "暂无合适图片", "全部"],
+        key="mobile_cover_review_filter",
+    )
+    published_only = filter_columns[1].toggle(
+        "只看已上架",
+        value=True,
+        key="mobile_cover_published_only",
+    )
+    visible = [
+        item for item in reviews
+        if (not published_only or item["published"])
+        and (review_filter == "全部" or _cover_review_state(str(item["cover_status"])) == review_filter)
+    ]
+    if not visible:
+        st.success("这个范围已经全部处理完成。")
+        return
+
+    visible_ids = [str(item["id"]) for item in visible]
+    next_recipe_id = st.session_state.pop("_next_mobile_cover_recipe", None)
+    if next_recipe_id in visible_ids:
+        st.session_state["mobile_cover_recipe_select"] = next_recipe_id
+    elif st.session_state.get("mobile_cover_recipe_select") not in visible_ids:
+        st.session_state["mobile_cover_recipe_select"] = visible_ids[0]
+    by_id = {str(item["id"]): item for item in visible}
+    selected_id = st.selectbox(
+        "选择菜品",
+        visible_ids,
+        format_func=lambda value: f"{by_id[value]['title']} · {_cover_review_state(str(by_id[value]['cover_status']))}",
+        key="mobile_cover_recipe_select",
+    )
+    selected = by_id[selected_id]
+    folder = Path(str(selected["output_folder"]))
+    candidate_state_key = f"mobile_cover_candidates_{selected_id}"
+    crop_state_key = f"mobile_cover_crop_{selected_id}"
+
+    def finish_review(message: str) -> None:
+        store.index_recipes()
+        st.session_state.pop(candidate_state_key, None)
+        st.session_state.pop(crop_state_key, None)
+        remaining = [
+            str(item["id"])
+            for item in reviews
+            if str(item["id"]) != selected_id
+            and item["published"]
+            and _cover_review_state(str(item["cover_status"])) == "待审核"
+        ]
+        if remaining:
+            st.session_state["_next_mobile_cover_recipe"] = remaining[0]
+        _rerun_with_notice(st, message)
+
+    def stage_for_crop(
+        content: bytes,
+        *,
+        timestamp: float | None,
+        status: str,
+        label: str,
+        source_kind: str,
+        source_url: str | None = None,
+        source_step_index: int | None = None,
+        original_size: dict[str, int] | None = None,
+        crop_box: dict[str, int] | None = None,
+    ) -> None:
+        st.session_state[crop_state_key] = {
+            "content": content,
+            "timestamp": timestamp,
+            "status": status,
+            "label": label,
+            "source_kind": source_kind,
+            "source_url": source_url,
+            "source_step_index": source_step_index,
+            "original_size": original_size,
+            "crop_box": crop_box,
+            "token": hashlib.sha256(content).hexdigest()[:12],
+        }
+
+    st.markdown(f"##### {selected['title']}")
+    current_cover = folder / str(selected.get("cover_image_path") or "")
+    if selected.get("cover_image_path") and current_cover.is_file():
+        st.image(str(current_cover), caption="当前菜单封面", width=420)
+        source_position = _format_video_position(selected.get("cover_image_time"))
+        source_label = str(selected.get("cover_source_label") or "").strip()
+        if not source_label:
+            source_label = "原视频画面" if source_position else "上传图片"
+        source_summary = f"来源：{source_label}"
+        if source_position:
+            source_summary += f" · 视频位置 {source_position}"
+        st.caption(source_summary)
+        original_size = selected.get("cover_original_size")
+        crop_box = selected.get("cover_crop_box")
+        trace_details = []
+        if isinstance(original_size, dict):
+            trace_details.append(
+                f"原图 {int(original_size.get('width') or 0)}×{int(original_size.get('height') or 0)}"
+            )
+        if isinstance(crop_box, dict):
+            trace_details.append(
+                "裁剪区域 "
+                f"x={int(crop_box.get('left') or 0)}, y={int(crop_box.get('top') or 0)}, "
+                f"{int(crop_box.get('width') or 0)}×{int(crop_box.get('height') or 0)}"
+            )
+        if trace_details:
+            st.caption(" · ".join(trace_details))
+        trace_url = str(selected.get("cover_source_url") or selected.get("source_url") or "")
+        if trace_url and source_position:
+            st.link_button(
+                f"回到原视频 {source_position} 核对",
+                _video_url_at(trace_url, selected.get("cover_image_time")),
+            )
+        st.button(
+            "重新裁剪当前封面",
+            key=f"mobile_cover_recrop_{selected_id}",
+            on_click=stage_for_crop,
+            kwargs={
+                "content": current_cover.read_bytes(),
+                "timestamp": selected.get("cover_image_time"),
+                "status": "manual_crop",
+                "label": source_label,
+                "source_kind": str(
+                    selected.get("cover_source_kind")
+                    or ("video_frame" if source_position else "upload")
+                ),
+                "source_url": selected.get("cover_source_url") or selected.get("source_url"),
+                "source_step_index": selected.get("cover_source_step_index"),
+                "original_size": original_size if isinstance(original_size, dict) else None,
+                "crop_box": crop_box if isinstance(crop_box, dict) else None,
+            },
+        )
+    elif selected["cover_status"] == "no_suitable":
+        st.info("当前已设置为暂无合适图片，手机菜单会显示无图占位。")
+    else:
+        st.caption("尚未人工确认封面。先从已有步骤图中选择，通常几秒即可完成一道菜。")
+    if selected.get("source_url"):
+        st.link_button("打开原视频对照", str(selected["source_url"]))
+
+    crop_source = st.session_state.get(crop_state_key)
+    if isinstance(crop_source, dict) and isinstance(crop_source.get("content"), bytes):
+        crop_token = str(crop_source.get("token") or "candidate")
+
+        @st.dialog("裁剪成品封面", width="large")
+        def show_cover_crop_dialog() -> None:
+            st.caption(
+                f"{crop_source.get('label') or '候选图'} · 直接拖动矩形框移动位置，拖动边角缩放；"
+                "裁剪框锁定为手机菜单的 4:3 比例。"
+            )
+            try:
+                with Image.open(io.BytesIO(crop_source["content"])) as raw_image:
+                    source_image = raw_image.convert("RGB")
+                cropped_image, crop_box = st_cropper(
+                    source_image,
+                    realtime_update=True,
+                    box_color="#c44932",
+                    aspect_ratio=(4, 3),
+                    return_type="both",
+                    key=f"mobile_cover_rectangle_{selected_id}_{crop_token}",
+                    stroke_width=4,
+                )
+                source_size = {"width": source_image.width, "height": source_image.height}
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"图片无法裁剪：{_clean_error(exc)}")
+                cropped_image = None
+                crop_box = None
+                source_size = None
+            if cropped_image is not None and crop_box is not None:
+                st.caption(
+                    f"当前区域：{int(crop_box['width'])} × {int(crop_box['height'])} 像素；"
+                    "矩形框内就是手机菜单最终显示内容。"
+                )
+            crop_actions = st.columns(2)
+            if crop_actions[0].button(
+                "确认裁剪并通过审核",
+                type="primary",
+                disabled=cropped_image is None,
+                key=f"mobile_cover_crop_confirm_{selected_id}_{crop_token}",
+                width="stretch",
+            ):
+                try:
+                    output = io.BytesIO()
+                    cropped_image.convert("RGB").save(output, format="JPEG", quality=92)
+                    saved_original_size = source_size
+                    saved_crop_box = {
+                        key: int(round(float(crop_box[key])))
+                        for key in ("left", "top", "width", "height")
+                    }
+                    prior_size = crop_source.get("original_size")
+                    prior_crop = crop_source.get("crop_box")
+                    if (
+                        isinstance(prior_size, dict)
+                        and isinstance(prior_crop, dict)
+                        and source_size
+                        and source_size["width"] > 0
+                        and source_size["height"] > 0
+                    ):
+                        scale_x = float(prior_crop.get("width") or 0) / source_size["width"]
+                        scale_y = float(prior_crop.get("height") or 0) / source_size["height"]
+                        saved_original_size = {
+                            "width": int(prior_size.get("width") or 0),
+                            "height": int(prior_size.get("height") or 0),
+                        }
+                        saved_crop_box = {
+                            "left": int(
+                                round(
+                                    float(prior_crop.get("left") or 0)
+                                    + saved_crop_box["left"] * scale_x
+                                )
+                            ),
+                            "top": int(
+                                round(
+                                    float(prior_crop.get("top") or 0)
+                                    + saved_crop_box["top"] * scale_y
+                                )
+                            ),
+                            "width": int(round(saved_crop_box["width"] * scale_x)),
+                            "height": int(round(saved_crop_box["height"] * scale_y)),
+                        }
+                    save_recipe_cover_content(
+                        folder,
+                        output.getvalue(),
+                        timestamp=crop_source.get("timestamp"),
+                        status=str(crop_source.get("status") or "manual_crop"),
+                        source_kind=str(crop_source.get("source_kind") or "upload"),
+                        source_label=str(crop_source.get("label") or "候选图"),
+                        source_url=str(crop_source.get("source_url") or "") or None,
+                        source_step_index=crop_source.get("source_step_index"),
+                        original_size=saved_original_size,
+                        crop_box=saved_crop_box,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"保存裁剪结果失败：{_clean_error(exc)}")
+                else:
+                    finish_review(f"已裁剪并确认《{selected['title']}》的成品封面。")
+            if crop_actions[1].button(
+                "取消，返回候选图",
+                key=f"mobile_cover_crop_cancel_{selected_id}_{crop_token}",
+                width="stretch",
+            ):
+                st.session_state.pop(crop_state_key, None)
+                st.rerun()
+
+        show_cover_crop_dialog()
+
+    existing_candidates = []
+    for step_index, step in enumerate(selected.get("steps") or [], start=1):
+        if not isinstance(step, dict) or not step.get("screenshot_path"):
+            continue
+        image_path = folder / str(step["screenshot_path"])
+        if image_path.is_file():
+            existing_candidates.append((step_index, step, image_path))
+    if existing_candidates:
+        st.markdown("###### 先从现有步骤图选择")
+        for row_start in range(0, len(existing_candidates), 4):
+            columns = st.columns(4)
+            for column, (step_index, step, image_path) in zip(
+                columns, existing_candidates[row_start : row_start + 4]
+            ):
+                with column:
+                    st.image(str(image_path), width="stretch")
+                    st.caption(f"步骤 {step_index} · {step.get('title') or '未命名'}")
+                    st.button(
+                        "裁剪这张",
+                        key=f"mobile_cover_step_{selected_id}_{step_index}",
+                        width="stretch",
+                        on_click=stage_for_crop,
+                        kwargs={
+                            "content": image_path.read_bytes(),
+                            "timestamp": (
+                                step.get("screenshot_time")
+                                if step.get("screenshot_time") is not None
+                                else step.get("start_time")
+                            ),
+                            "status": "manual_step",
+                            "label": f"步骤 {step_index} · {step.get('title') or '未命名'}",
+                            "source_kind": "step_frame",
+                            "source_url": selected.get("source_url"),
+                            "source_step_index": step_index,
+                        },
+                    )
+
+    st.markdown("###### 现有图片不合适")
+    st.caption(
+        "可从原视频开头展示段、出锅和装盘段提取更多候选；使用最高 1080p 视频取帧，"
+        "并优先排列无明显字幕的画面。"
+    )
+    keep_review_video = st.checkbox(
+        "保留本次下载的高清封面视频，方便继续微调",
+        value=False,
+        key=f"mobile_cover_keep_video_{selected_id}",
+    )
+    if st.button(
+        "从原视频生成更多候选",
+        key=f"mobile_cover_generate_{selected_id}",
+        type="primary",
+    ):
+        try:
+            with st.spinner("正在下载最高 1080p 视频并截取高清候选图..."):
+                st.session_state[candidate_state_key] = suggest_recipe_cover_screenshots(
+                    folder,
+                    cookies=_optional_text(config.cookies),
+                    keep_video=keep_review_video,
+                )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"生成候选图失败：{_clean_error(exc)}")
+
+    video_candidates = st.session_state.get(candidate_state_key)
+    if isinstance(video_candidates, list):
+        if not video_candidates:
+            st.warning("原视频中没有生成可用候选，可尝试上传真实照片或精确时间点截图。")
+        for row_start in range(0, len(video_candidates), 3):
+            columns = st.columns(3)
+            for candidate_index, (column, candidate) in enumerate(
+                zip(columns, video_candidates[row_start : row_start + 3]),
+                start=row_start,
+            ):
+                with column:
+                    st.image(candidate.content, width="stretch")
+                    time_label = f"{float(candidate.timestamp):.1f} 秒" if candidate.timestamp is not None else "未知时间"
+                    try:
+                        with Image.open(io.BytesIO(candidate.content)) as candidate_image:
+                            resolution_label = f"{candidate_image.width}×{candidate_image.height}"
+                    except Exception:  # noqa: BLE001
+                        resolution_label = "分辨率未知"
+                    subtitle_score = float(getattr(candidate, "subtitle_score", 0.0))
+                    st.caption(
+                        f"{time_label} · {resolution_label} · 画面质量 {candidate.score * 100:.0f}% · "
+                        + (
+                            "无明显字幕"
+                            if subtitle_score < 0.28
+                            else "可能有字幕"
+                            if subtitle_score < 0.58
+                            else "字幕明显"
+                        )
+                    )
+                    st.button(
+                        "裁剪这张",
+                        key=f"mobile_cover_video_{selected_id}_{candidate_index}",
+                        width="stretch",
+                        on_click=stage_for_crop,
+                        kwargs={
+                            "content": candidate.content,
+                            "timestamp": candidate.timestamp,
+                            "status": "manual_video",
+                            "label": f"原视频 {time_label}",
+                            "source_kind": "video_frame",
+                            "source_url": selected.get("source_url"),
+                        },
+                    )
+
+    adjustment_columns = st.columns([2, 1])
+    exact_timestamp = adjustment_columns[0].number_input(
+        "按原视频时间精确截图（秒）",
+        min_value=0.0,
+        value=float(selected.get("cover_image_time") or 0.0),
+        step=0.5,
+        key=f"mobile_cover_timestamp_{selected_id}",
+    )
+    if adjustment_columns[1].button(
+        "截取该时间点",
+        key=f"mobile_cover_recapture_{selected_id}",
+        width="stretch",
+    ):
+        try:
+            with st.spinner("正在截取指定画面..."):
+                captured_candidate = capture_recipe_cover_candidate(
+                    folder,
+                    exact_timestamp,
+                    cookies=_optional_text(config.cookies),
+                    keep_video=keep_review_video,
+                )
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"截图失败：{_clean_error(exc)}")
+        else:
+            stage_for_crop(
+                captured_candidate.content,
+                timestamp=captured_candidate.timestamp,
+                status="manual_timestamp",
+                label=f"原视频 {exact_timestamp:.1f} 秒",
+                source_kind="video_frame",
+                source_url=selected.get("source_url"),
+            )
+            st.rerun()
+
+    uploaded_cover = st.file_uploader(
+        "上传真实成品照片",
+        type=["jpg", "jpeg", "png", "webp"],
+        key=f"mobile_cover_upload_{selected_id}",
+    )
+    action_columns = st.columns(2)
+    if uploaded_cover is None:
+        action_columns[0].button(
+            "裁剪上传照片",
+            disabled=True,
+            key=f"mobile_cover_use_upload_{selected_id}",
+            width="stretch",
+        )
+    else:
+        action_columns[0].button(
+            "裁剪上传照片",
+            key=f"mobile_cover_use_upload_{selected_id}",
+            width="stretch",
+            on_click=stage_for_crop,
+            kwargs={
+                "content": uploaded_cover.getvalue(),
+                "timestamp": None,
+                "status": "uploaded",
+                "label": "上传的真实成品照片",
+                "source_kind": "upload",
+            },
+        )
+    if action_columns[1].button(
+        "暂无合适图片，先留空",
+        key=f"mobile_cover_none_{selected_id}",
+        width="stretch",
+    ):
+        mark_recipe_cover_unavailable(folder)
+        finish_review(f"《{selected['title']}》暂时留空，后续可随时补图。")
+
+
 def _render_mobile_client_admin(st, config: UIConfig) -> None:
     st.subheader("手机客户端")
     try:
@@ -2688,6 +3166,18 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
         changed = store.set_recipe_publications({str(item["id"]): True for item in indexed_recipes})
         st.success(f"已恢复 {changed} 道菜。")
         st.rerun()
+
+    st.markdown("##### 成品图审核")
+    st.caption("人工确认菜单封面：优先复用已有步骤图，不合适时再从原视频补充候选或上传真实照片。")
+    cover_review_open = st.toggle(
+        "打开成品图审核台",
+        value=False,
+        key="mobile_cover_review_open",
+        help="打开状态会在生成候选图、裁剪和页面刷新后保持，不需要重复展开。",
+    )
+    if cover_review_open:
+        with st.container(border=True):
+            _render_recipe_cover_review(st, store, config)
 
     st.markdown("##### 导出常用菜单图片")
     st.caption(
@@ -3802,6 +4292,11 @@ def main() -> None:
 
     if active_page == "批量处理":
         st.subheader("批量处理")
+        try:
+            batch_source_store = MobileSyncStore(Path.cwd(), out_dir=config.out_dir)
+        except Exception as exc:  # noqa: BLE001
+            batch_source_store = None
+            st.warning(f"视频来源分类数据库暂不可用：{_clean_error(exc)}")
         if st.button("打开后台任务仪表盘", type="primary", key="batch_open_dashboard"):
             st.session_state["_next_page"] = "任务仪表盘"
             st.rerun()
@@ -3824,6 +4319,13 @@ def main() -> None:
         with st.expander("手动添加 URL 或导入其他文件（可选）", expanded=not bool(selected_saved_links)):
             links_text = st.text_area("视频 URL，每行一个", height=180)
             links_file = st.text_input("其他链接文件路径", placeholder="outputs/creator_video_links.txt")
+        suggested_creator_name = _creator_name_from_document(selected_saved_links)
+        creator_name_input = st.text_input(
+            "本批次 UP 主名称（选填）",
+            placeholder=f"留空则使用视频信息{f'，当前识别为：{suggested_creator_name}' if suggested_creator_name else ''}",
+            help="用于统一同一位 UP 主的名称，并随菜谱写入数据库；不会覆盖视频原始作者字段。",
+        )
+        batch_creator_name = creator_name_input.strip() or suggested_creator_name
         target_label = st.radio(
             "运行到目标阶段",
             ["仅形成原始版", "生成完整菜谱版"],
@@ -3934,8 +4436,15 @@ def main() -> None:
                     urls = []
                 else:
                     urls = _load_batch_urls(links_text, links_file, selected_saved_links)
+                    if batch_source_store is not None:
+                        known_non_recipes = batch_source_store.known_non_recipe_urls(urls)
+                        if known_non_recipes:
+                            urls = [url for url in urls if url not in known_non_recipes]
+                            st.warning(
+                                f"已自动排除 {len(known_non_recipes)} 条曾标记为非菜谱的视频，不会重复处理。"
+                            )
                 if not urls and run_mode not in {"resume-unfinished", "retry-failed"}:
-                    raise ValueError("请先输入 URL 或提供有效的链接文件。")
+                    raise ValueError("没有可处理的视频；请添加链接，或检查它们是否已归类为非菜谱。")
                 if run_mode in {"new-queue", "new-direct"}:
                     overlaps = _running_batch_overlaps(urls, running_batch_ids, batch_by_id)
                     if overlaps:
@@ -3975,6 +4484,8 @@ def main() -> None:
                     batch_id=batch_id,
                     resume_mode=resume_mode,
                     target_stage=target_stage,
+                    creator_name=batch_creator_name or None,
+                    source_database_path=str(batch_source_store.database_path) if batch_source_store else None,
                 )
                 if run_mode in {"new-queue", "new-direct"}:
                     options_snapshot = {key: value for key, value in options.__dict__.items() if key != "urls"}
@@ -4036,6 +4547,50 @@ def main() -> None:
                     key=f"batch_table_page_{selected_batch_id}",
                 )
                 st.dataframe([_batch_item_row(item) for item in visible_batch_items], width="stretch")
+                markable_items = [
+                    item for item in selected_state.items
+                    if item.status not in {"raw_running", "recipe_running", "running", "non_recipe"}
+                ]
+                if markable_items and batch_source_store is not None:
+                    with st.expander("归类广告或无用视频为非菜谱"):
+                        st.caption(
+                            "被标记的视频会保留来源记录，但从点餐菜单移除；以后再次导入相同链接时会自动跳过。"
+                        )
+                        non_recipe_urls = st.multiselect(
+                            "选择非菜谱视频",
+                            [item.url for item in markable_items],
+                            key=f"batch_non_recipe_urls_{selected_batch_id}",
+                        )
+                        if st.button(
+                            "确认归类为非菜谱",
+                            disabled=not non_recipe_urls,
+                            key=f"batch_mark_non_recipe_{selected_batch_id}",
+                        ):
+                            creator = str(selected_state.options.get("creator_name") or "").strip() or None
+                            batch_source_store.set_video_classifications(
+                                non_recipe_urls,
+                                "non_recipe",
+                                creator_name=creator,
+                                batch_id=selected_batch_id,
+                            )
+                            stamp = datetime.now(timezone.utc).isoformat()
+                            selected_urls = set(non_recipe_urls)
+                            for item in selected_state.items:
+                                if item.url not in selected_urls:
+                                    continue
+                                item.status = "non_recipe"
+                                item.error = "人工归类为非菜谱"
+                                item.finished_at = stamp
+                                for stage in item.stages.values():
+                                    stage.status = "done"
+                                    stage.error = None
+                                    stage.finished_at = stamp
+                            save_batch_state(selected_state)
+                            batch_source_store.index_recipes()
+                            _rerun_with_notice(
+                                st,
+                                f"已将 {len(non_recipe_urls)} 条视频归类为非菜谱，并从点餐菜单中移除。",
+                            )
                 batch_log = read_batch_log(selected_batch_id)
                 if batch_log:
                     st.text_area("后台运行日志（最新）", value=batch_log, height=220, disabled=True)
@@ -4112,6 +4667,38 @@ def main() -> None:
                             f"跳过 {archived_batch.skipped_count}，失败 {archived_batch.failed_count}"
                             f"{knowledge_message}。",
                         )
+
+        if batch_source_store is not None:
+            excluded_sources = batch_source_store.list_video_sources("non_recipe")
+            if excluded_sources:
+                with st.expander(f"已排除的非菜谱来源（{len(excluded_sources)}）"):
+                    st.caption("这里保留的是去重记录。若误判，可恢复后在下一次批处理中重新生成。")
+                    st.dataframe(
+                        [
+                            {
+                                "UP 主": item.get("creator_name") or "",
+                                "视频": item.get("title") or item.get("source_url") or "",
+                                "来源": item.get("source_url") or "",
+                                "更新时间": item.get("updated_at") or "",
+                            }
+                            for item in excluded_sources[:200]
+                        ],
+                        hide_index=True,
+                        width="stretch",
+                    )
+                    restore_urls = st.multiselect(
+                        "恢复为待识别来源",
+                        [str(item["source_url"]) for item in excluded_sources],
+                        key="batch_restore_non_recipe_urls",
+                    )
+                    if st.button(
+                        "恢复所选来源",
+                        disabled=not restore_urls,
+                        key="batch_restore_non_recipe",
+                    ):
+                        batch_source_store.set_video_classifications(restore_urls, "recipe")
+                        batch_source_store.index_recipes()
+                        _rerun_with_notice(st, f"已恢复 {len(restore_urls)} 条来源，可重新加入批处理。")
 
     if active_page == "工作交接":
         st.subheader("两台电脑工作交接")
@@ -5327,6 +5914,24 @@ def main() -> None:
             st.caption(
                 f"已选择 {len(selected_urls)} / {len(crawl.videos)} 个视频；链接文档仍保留全部视频。"
             )
+            creator_display_name = st.text_input(
+                "UP 主名称",
+                value=crawl.uploader,
+                key=f"creator_display_name_{crawl.uid}_{result_version}",
+                help="可修正或统一名称；会写入本批次生成的每份菜谱及来源数据库。",
+            ).strip()
+            try:
+                creator_source_store = MobileSyncStore(Path.cwd(), out_dir=config.out_dir)
+                known_non_recipe_urls = creator_source_store.known_non_recipe_urls(selected_urls)
+            except Exception as exc:  # noqa: BLE001
+                creator_source_store = None
+                known_non_recipe_urls = set()
+                st.warning(f"暂时无法校验非菜谱来源：{_clean_error(exc)}")
+            processable_urls = [url for url in selected_urls if url not in known_non_recipe_urls]
+            if known_non_recipe_urls:
+                st.info(
+                    f"其中 {len(known_non_recipe_urls)} 条已归类为非菜谱，创建批次时会自动排除。"
+                )
             creator_target_label = st.radio(
                 "立即运行时的目标阶段",
                 ["仅形成原始版", "生成完整菜谱版"],
@@ -5336,7 +5941,7 @@ def main() -> None:
             creator_target = "raw" if creator_target_label == "仅形成原始版" else "recipe"
 
             creator_batch_options = BatchJobOptions(
-                urls=selected_urls,
+                urls=processable_urls,
                 cookies=_optional_text(config.cookies),
                 out=config.out_dir,
                 no_screenshot=not config.enable_screenshot,
@@ -5355,9 +5960,13 @@ def main() -> None:
                 enable_recipe_review=config.enable_recipe_review,
                 skip_existing=True,
                 target_stage=creator_target,
+                creator_name=creator_display_name or None,
+                source_database_path=(
+                    str(creator_source_store.database_path) if creator_source_store is not None else None
+                ),
             )
             deferred_col, immediate_col = st.columns(2)
-            can_create = bool(selected_urls) and bool(accept_partial)
+            can_create = bool(processable_urls) and bool(accept_partial)
             with deferred_col:
                 defer_clicked = st.button(
                     "保存清单并创建待执行批次",
@@ -5376,7 +5985,7 @@ def main() -> None:
                 options_snapshot = {
                     key: value for key, value in creator_batch_options.__dict__.items() if key != "urls"
                 }
-                state = create_batch_state(selected_urls, options_snapshot, batch_id=batch_id)
+                state = create_batch_state(processable_urls, options_snapshot, batch_id=batch_id)
                 st.success(f"待执行批次已创建：{state.batch_id}，共 {len(state.items)} 条。")
             if run_clicked:
                 batch_id = create_batch_id()
@@ -5385,7 +5994,7 @@ def main() -> None:
                     options_snapshot = {
                         key: value for key, value in creator_batch_options.__dict__.items() if key != "urls"
                     }
-                    create_batch_state(selected_urls, options_snapshot, batch_id=batch_id)
+                    create_batch_state(processable_urls, options_snapshot, batch_id=batch_id)
                     creator_batch_options.urls = []
                     creator_batch_options.resume_mode = "resume-unfinished"
 

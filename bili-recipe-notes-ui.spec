@@ -5,9 +5,12 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 datas = [("bili_recipe_notes/ui.py", "bili_recipe_notes")]
 datas.extend(collect_data_files("streamlit"))
+datas.extend(collect_data_files("streamlit_cropper"))
 
 hiddenimports = []
-for package in ("bili_recipe_notes", "streamlit", "yt_dlp", "faster_whisper", "reportlab", "docx"):
+for package in (
+    "bili_recipe_notes", "streamlit", "streamlit_cropper", "yt_dlp", "faster_whisper", "reportlab", "docx"
+):
     hiddenimports.extend(collect_submodules(package))
 
 a = Analysis(

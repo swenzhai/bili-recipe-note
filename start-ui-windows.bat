@@ -19,7 +19,7 @@ if not exist "web\dist\index.html" (
     exit /b 1
 )
 
-"%PYTHON_EXE%" -c "import streamlit" >nul 2>nul
+"%PYTHON_EXE%" -c "import streamlit, streamlit_cropper" >nul 2>nul
 if errorlevel 1 (
     echo Streamlit is not installed. Installing requirements...
     "%PYTHON_EXE%" -m pip install -r requirements.txt

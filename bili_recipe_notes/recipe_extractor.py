@@ -60,6 +60,18 @@ class Recipe(BaseModel):
     source_url: str
     video_title: str | None = None
     uploader: str | None = None
+    creator_name: str | None = None
+    cover_image_path: str | None = None
+    cover_image_time: float | None = None
+    cover_image_status: str | None = None
+    cover_image_score: float | None = None
+    cover_source_kind: str | None = None
+    cover_source_label: str | None = None
+    cover_source_url: str | None = None
+    cover_source_step_index: int | None = None
+    cover_original_size: dict[str, int] | None = None
+    cover_crop_box: dict[str, int] | None = None
+    cover_selected_at: str | None = None
     category: str = "未分类"
     cuisine: str = "未分类"
     tags: list[str] = Field(default_factory=list)

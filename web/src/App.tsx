@@ -8,6 +8,9 @@ type Recipe = {
   tags?: string[];
   published?: boolean;
   recommended?: boolean;
+  creator_name?: string;
+  cover_image_sha256?: string;
+  cover_image_status?: string;
   ingredients?: { name?: string; amount?: string }[];
   prep_items?: string[];
   steps?: { title?: string; action?: string; heat?: string; duration?: string; tips?: string; image_sha256?: string }[];
@@ -175,7 +178,10 @@ function pendingActionKey(operation: Partial<Operation>): string | undefined {
 }
 
 function recipeThumbnail(recipe?: Recipe): string | undefined {
-  return recipe?.steps?.find(step => step.image_sha256)?.image_sha256
+  if (recipe?.cover_image_status === "no_suitable") return undefined;
+  return recipe?.cover_image_sha256
+    || recipe?.assets?.find(asset => asset.kind === "recipe_cover")?.sha256
+    || [...(recipe?.steps || [])].reverse().find(step => step.image_sha256)?.image_sha256
     || recipe?.assets?.find(asset => asset.kind === "recipe_image")?.sha256
     || recipe?.assets?.[0]?.sha256;
 }

@@ -94,6 +94,71 @@ def test_recipe_index_uses_part_identity_assets_and_tombstones(tmp_path: Path) -
     assert any(change["entity_id"] == first_id and change["action"] == "delete" for change in changes)
 
 
+def test_non_recipe_sources_are_remembered_excluded_and_reversible(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "广告视频")
+    recipe_data = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
+    recipe_data["creator_name"] = "厨房 UP 主"
+    (folder / "recipe.json").write_text(json.dumps(recipe_data, ensure_ascii=False), encoding="utf-8")
+    source_url = str(recipe_data["source_url"])
+    store = MobileSyncStore(tmp_path)
+
+    assert store.index_recipes()["indexed"] == 1
+    source = store.list_video_sources()[0]
+    assert source["classification"] == "recipe"
+    assert source["creator_name"] == "厨房 UP 主"
+    assert source["recipe_id"]
+
+    assert store.set_video_classifications(
+        [source_url], "non_recipe", creator_name="厨房 UP 主", batch_id="batch-1"
+    ) == 1
+    assert store.known_non_recipe_urls([source_url, "https://example.com/new"]) == {source_url}
+    excluded = store.index_recipes()
+    assert excluded["indexed"] == 0
+    assert store.list_indexed_recipes() == []
+    assert store.list_video_sources("non_recipe")[0]["batch_id"] == "batch-1"
+
+    store.set_video_classifications([source_url], "recipe")
+    restored = store.index_recipes()
+    assert restored["indexed"] == 1
+    assert len(store.list_indexed_recipes()) == 1
+
+
+def test_recipe_cover_is_published_as_the_preferred_asset(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "成品图菜谱")
+    cover = folder / "images" / "cover.jpg"
+    cover.write_bytes(b"finished-dish-cover")
+    recipe_path = folder / "recipe.json"
+    recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
+    recipe["cover_image_path"] = "images/cover.jpg"
+    recipe["cover_image_time"] = 73.5
+    recipe["cover_source_kind"] = "video_frame"
+    recipe["cover_source_label"] = "原视频候选帧"
+    recipe["cover_source_url"] = "https://www.bilibili.com/video/BV1demo"
+    recipe["cover_original_size"] = {"width": 1920, "height": 1080}
+    recipe["cover_crop_box"] = {"left": 240, "top": 0, "width": 1440, "height": 1080}
+    recipe["cover_selected_at"] = "2026-08-20T10:00:00+00:00"
+    recipe_path.write_text(json.dumps(recipe, ensure_ascii=False), encoding="utf-8")
+    store = MobileSyncStore(tmp_path)
+
+    store.index_recipes()
+
+    published = store.list_recipes()[0]
+    expected = hashlib.sha256(cover.read_bytes()).hexdigest()
+    assert published["cover_image_sha256"] == expected
+    assert published["assets"][0]["kind"] == "recipe_cover"
+    assert published["assets"][0]["sha256"] == expected
+    review = store.list_recipe_cover_reviews()[0]
+    assert review["title"] == "成品图菜谱"
+    assert review["cover_image_path"] == "images/cover.jpg"
+    assert review["output_folder"] == str(folder)
+    assert review["cover_image_time"] == 73.5
+    assert review["cover_source_kind"] == "video_frame"
+    assert review["cover_source_url"] == "https://www.bilibili.com/video/BV1demo"
+    assert review["cover_original_size"] == {"width": 1920, "height": 1080}
+    assert review["cover_crop_box"] == {"left": 240, "top": 0, "width": 1440, "height": 1080}
+    assert review["cover_selected_at"] == "2026-08-20T10:00:00+00:00"
+
+
 def test_recipe_identity_uses_part_number_and_persists_random_fallback(tmp_path: Path) -> None:
     part = _recipe(tmp_path, "无 CID 分集", cid="")
     (part / "job.json").write_text(
@@ -340,11 +405,11 @@ def test_database_v2_migration_defaults_existing_recipes_to_published(tmp_path: 
 
     assert migrated.list_indexed_recipes()[0]["published"] is True
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         columns = {row[1] for row in connection.execute("PRAGMA table_info(recipes)")}
         assert {"published", "recommended"} <= columns
         assert connection.execute("SELECT recommended FROM recipes").fetchone()[0] == 0
-    assert list(database.parent.glob("mobile-sync.before-v2-to-v6-*.bak"))
+    assert list(database.parent.glob("mobile-sync.before-v2-to-v7-*.bak"))
 
 
 def test_recipe_recommendation_auto_publishes_and_unpublish_clears_it(tmp_path: Path) -> None:
@@ -625,13 +690,13 @@ def test_database_v3_migration_adds_meal_stages(tmp_path: Path) -> None:
         connection.row_factory = sqlite3.Row
         order = connection.execute("SELECT * FROM meal_orders").fetchone()
         state = connection.execute("SELECT * FROM meal_dish_states").fetchone()
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         assert order["phase"] == "ordering"
         assert order["chef_device_id"] is None
         assert state["prep_completed"] == 0
         assert state["cook_completed"] == 1
         assert state["served"] == 0
-    assert list(database.parent.glob("mobile-sync.before-v3-to-v6-*.bak"))
+    assert list(database.parent.glob("mobile-sync.before-v3-to-v7-*.bak"))
 
 
 def test_legacy_capabilities_hide_shared_meal_changes(tmp_path: Path) -> None:

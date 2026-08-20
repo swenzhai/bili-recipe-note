@@ -5,8 +5,9 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
-from PIL import Image, ImageFilter, ImageOps, ImageStat
+from PIL import Image, ImageChops, ImageFilter, ImageOps, ImageStat
 from rich.console import Console
 
 from .recipe_extractor import RecipeStep
@@ -17,8 +18,12 @@ DEFAULT_MAX_STEP_IMAGES = 3
 MAX_SAVED_STEP_IMAGES = 4
 DEFAULT_CANDIDATES_PER_STEP = 5
 MIN_AUTOMATIC_SCREENSHOT_SCORE = 0.38
+MIN_AUTOMATIC_COVER_SCORE = 0.34
 MAX_SCREENSHOT_DIMENSION = 1280
 MAX_SCREENSHOT_BYTES = 450 * 1024
+MAX_COVER_DIMENSION = 1920
+MAX_COVER_BYTES = 1536 * 1024
+SUBTITLE_SCORE_PENALTY = 0.32
 VISUAL_STEP_KEYWORDS = {
     "装盘": 6,
     "出锅": 6,
@@ -37,6 +42,7 @@ VISUAL_STEP_KEYWORDS = {
     "静置": -2,
     "等待": -2,
 }
+FINISHED_DISH_KEYWORDS = {"成品", "装盘", "摆盘", "出锅", "盛出", "上桌", "完成", "收汁"}
 
 
 @dataclass(frozen=True)
@@ -44,6 +50,7 @@ class ScreenshotCandidate:
     timestamp: float | None
     score: float
     content: bytes
+    subtitle_score: float = 0.0
 
 
 def capture_screenshot_at(video_path: Path, timestamp: float, output_path: Path) -> Path:
@@ -87,23 +94,28 @@ def _encoded_jpeg(image: Image.Image, quality: int) -> bytes:
     return output.getvalue()
 
 
-def _optimize_image(source: Image.Image) -> bytes:
+def _optimize_image(
+    source: Image.Image,
+    *,
+    max_dimension: int = MAX_SCREENSHOT_DIMENSION,
+    max_bytes: int = MAX_SCREENSHOT_BYTES,
+) -> bytes:
     image = ImageOps.exif_transpose(source).convert("RGB")
-    image.thumbnail((MAX_SCREENSHOT_DIMENSION, MAX_SCREENSHOT_DIMENSION), Image.Resampling.LANCZOS)
+    image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
     content = b""
     for quality in (84, 78, 72, 66, 60):
         content = _encoded_jpeg(image, quality)
-        if len(content) <= MAX_SCREENSHOT_BYTES:
+        if len(content) <= max_bytes:
             return content
-    while len(content) > MAX_SCREENSHOT_BYTES and min(image.size) > 180:
+    while len(content) > max_bytes and min(image.size) > 180:
         image.thumbnail(
             (max(180, int(image.width * 0.82)), max(180, int(image.height * 0.82))),
             Image.Resampling.LANCZOS,
         )
         content = _encoded_jpeg(image, 60)
-    if len(content) > MAX_SCREENSHOT_BYTES:
+    if len(content) > max_bytes:
         content = _encoded_jpeg(image, 42)
-    if len(content) > MAX_SCREENSHOT_BYTES:
+    if len(content) > max_bytes:
         raise ValueError("screenshot could not be compressed within the storage limit")
     return content
 
@@ -118,6 +130,50 @@ def optimize_screenshot(path: Path) -> bytes:
 def optimize_screenshot_content(content: bytes) -> bytes:
     with Image.open(io.BytesIO(content)) as source:
         return _optimize_image(source)
+
+
+def optimize_cover_screenshot(path: Path) -> bytes:
+    with Image.open(path) as source:
+        return _optimize_image(source, max_dimension=MAX_COVER_DIMENSION, max_bytes=MAX_COVER_BYTES)
+
+
+def optimize_cover_screenshot_content(content: bytes) -> bytes:
+    with Image.open(io.BytesIO(content)) as source:
+        return _optimize_image(source, max_dimension=MAX_COVER_DIMENSION, max_bytes=MAX_COVER_BYTES)
+
+
+def crop_screenshot_content(
+    content: bytes,
+    *,
+    zoom: float = 1.0,
+    horizontal_position: float = 0.5,
+    vertical_position: float = 0.5,
+    aspect_ratio: float = 4 / 3,
+) -> bytes:
+    """Crop around a chosen focal point while enforcing the menu-card ratio."""
+
+    if not 1.0 <= float(zoom) <= 4.0:
+        raise ValueError("zoom must be between 1 and 4")
+    if not 0.0 <= float(horizontal_position) <= 1.0:
+        raise ValueError("horizontal_position must be between 0 and 1")
+    if not 0.0 <= float(vertical_position) <= 1.0:
+        raise ValueError("vertical_position must be between 0 and 1")
+    if float(aspect_ratio) <= 0:
+        raise ValueError("aspect_ratio must be positive")
+    with Image.open(io.BytesIO(content)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        if image.width / image.height >= aspect_ratio:
+            base_height = float(image.height)
+            base_width = base_height * aspect_ratio
+        else:
+            base_width = float(image.width)
+            base_height = base_width / aspect_ratio
+        crop_width = max(2, min(image.width, int(round(base_width / zoom))))
+        crop_height = max(2, min(image.height, int(round(base_height / zoom))))
+        left = int(round((image.width - crop_width) * horizontal_position))
+        top = int(round((image.height - crop_height) * vertical_position))
+        cropped = image.crop((left, top, left + crop_width, top + crop_height))
+        return _optimize_image(cropped)
 
 
 def score_screenshot(content: bytes) -> float:
@@ -152,6 +208,53 @@ def score_screenshot(content: bytes) -> float:
     )
 
 
+def subtitle_likelihood(content: bytes) -> float:
+    """Estimate bright, outlined subtitle text in the lower-center video area."""
+
+    with Image.open(io.BytesIO(content)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        image.thumbnail((480, 480), Image.Resampling.BILINEAR)
+        left = int(image.width * 0.08)
+        right = max(left + 1, int(image.width * 0.92))
+        top = int(image.height * 0.55)
+        bottom = max(top + 1, int(image.height * 0.94))
+        gray = ImageOps.grayscale(image.crop((left, top, right, bottom)))
+
+    bright = gray.point(lambda value: 255 if value >= 198 else 0)
+    dark = gray.point(lambda value: 255 if value <= 82 else 0)
+    nearby_dark = dark.filter(ImageFilter.MaxFilter(7))
+    outlined_bright = ImageChops.multiply(bright, nearby_dark)
+    width, height = outlined_bright.size
+    if width <= 0 or height <= 0:
+        return 0.0
+
+    pixels = list(outlined_bright.get_flattened_data())
+    row_counts = [
+        sum(1 for value in pixels[row * width : (row + 1) * width] if value)
+        for row in range(height)
+    ]
+    column_counts = [
+        sum(1 for row in range(height) if pixels[row * width + column])
+        for column in range(width)
+    ]
+    window_height = max(6, min(height, int(round(height * 0.22))))
+    peak_density = max(
+        sum(row_counts[start : start + window_height]) / (width * window_height)
+        for start in range(0, height - window_height + 1)
+    )
+    active_row_fraction = sum(count >= width * 0.015 for count in row_counts) / height
+    horizontal_spread = sum(count > 0 for count in column_counts) / width
+
+    density_score = min(1.0, max(0.0, (peak_density - 0.006) / 0.045))
+    row_score = min(1.0, max(0.0, (active_row_fraction - 0.025) / 0.18))
+    spread_score = min(1.0, max(0.0, (horizontal_spread - 0.10) / 0.58))
+    return round(0.5 * density_score + 0.2 * row_score + 0.3 * spread_score, 4)
+
+
+def screenshot_preference_score(candidate: ScreenshotCandidate) -> float:
+    return candidate.score - SUBTITLE_SCORE_PENALTY * candidate.subtitle_score
+
+
 def step_candidate_timestamps(
     step: RecipeStep,
     next_step_start: float | None = None,
@@ -174,6 +277,8 @@ def step_candidate_timestamps(
 def generate_screenshot_candidates(
     video_path: Path,
     timestamps: list[float],
+    *,
+    optimizer: Callable[[Path], bytes] = optimize_screenshot,
 ) -> list[ScreenshotCandidate]:
     candidates: list[ScreenshotCandidate] = []
     with tempfile.TemporaryDirectory(prefix="bili-recipe-frames-") as temp_dir:
@@ -182,17 +287,75 @@ def generate_screenshot_candidates(
             path = root / f"candidate-{index:02d}.jpg"
             try:
                 capture_screenshot_at(video_path, timestamp, path)
-                content = optimize_screenshot(path)
+                content = optimizer(path)
                 candidates.append(
                     ScreenshotCandidate(
                         timestamp=timestamp,
                         score=score_screenshot(content),
                         content=content,
+                        subtitle_score=subtitle_likelihood(content),
                     )
                 )
             except (subprocess.SubprocessError, OSError, RuntimeError, ValueError) as exc:
                 console.print(f"[yellow]Warning:[/yellow] screenshot candidate failed at {timestamp:.1f}s: {exc}")
-    return sorted(candidates, key=lambda candidate: candidate.score, reverse=True)
+    return sorted(candidates, key=screenshot_preference_score, reverse=True)
+
+
+def finished_dish_candidate_timestamps(
+    steps: list[RecipeStep],
+    video_duration: float | None = None,
+) -> list[float]:
+    """Choose late, food-relevant moments instead of early preparation frames."""
+
+    timestamps: list[float] = []
+    for reverse_index, step_index in enumerate(range(len(steps) - 1, -1, -1)):
+        step = steps[step_index]
+        text = f"{step.title} {step.action}"
+        if reverse_index < 2 or any(keyword in text for keyword in FINISHED_DISH_KEYWORDS):
+            next_start = steps[step_index + 1].start_time if step_index + 1 < len(steps) else None
+            candidates = step_candidate_timestamps(step, next_start, count=4)
+            timestamps.extend(candidates[-2:])
+        if len(timestamps) >= 5:
+            break
+    final_step_end = 0.0
+    if steps:
+        final_step = steps[-1]
+        final_step_end = float(final_step.end_time or (final_step.start_time + 7.0))
+    if video_duration and video_duration > 10 and final_step_end >= video_duration * 0.55:
+        timestamps.extend(video_duration * ratio for ratio in (0.72, 0.82, 0.9, 0.95))
+    return sorted({round(max(0.0, value), 2) for value in timestamps})
+
+
+def capture_finished_dish_cover(
+    video_path: Path,
+    steps: list[RecipeStep],
+    images_dir: Path,
+    *,
+    video_duration: float | None = None,
+) -> ScreenshotCandidate | None:
+    """Capture a dedicated menu cover, biased toward the finished dish."""
+
+    cover_path = images_dir / "cover.jpg"
+    cover_path.unlink(missing_ok=True)
+    timestamps = finished_dish_candidate_timestamps(steps, video_duration)
+    candidates = generate_screenshot_candidates(
+        video_path,
+        timestamps,
+        optimizer=optimize_cover_screenshot,
+    )
+    if not candidates:
+        return None
+    latest = max(timestamps, default=1.0)
+    best = max(
+        candidates,
+        key=lambda candidate: screenshot_preference_score(candidate)
+        + 0.08 * min(1.0, float(candidate.timestamp or 0.0) / max(1.0, latest)),
+    )
+    if best.score < MIN_AUTOMATIC_COVER_SCORE:
+        return best
+    images_dir.mkdir(parents=True, exist_ok=True)
+    cover_path.write_bytes(best.content)
+    return best
 
 
 def select_key_step_indices(steps: list[RecipeStep], max_images: int = DEFAULT_MAX_STEP_IMAGES) -> list[int]:

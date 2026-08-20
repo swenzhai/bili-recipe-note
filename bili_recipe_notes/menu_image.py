@@ -208,7 +208,14 @@ def _draw_category_header(draw: ImageDraw.ImageDraw, category: str, y: int, widt
 
 
 def _recipe_digest(recipe: dict[str, Any]) -> str:
-    for step in recipe.get("steps") or []:
+    if recipe.get("cover_image_status") == "no_suitable":
+        return ""
+    if recipe.get("cover_image_sha256"):
+        return str(recipe["cover_image_sha256"])
+    for asset in recipe.get("assets") or []:
+        if isinstance(asset, dict) and asset.get("kind") == "recipe_cover" and asset.get("sha256"):
+            return str(asset["sha256"])
+    for step in reversed(recipe.get("steps") or []):
         if isinstance(step, dict) and step.get("image_sha256"):
             return str(step["image_sha256"])
     for asset in recipe.get("assets") or []:

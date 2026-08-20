@@ -36,10 +36,16 @@ from bili_recipe_notes.pipeline import (
     BatchJobOptions,
     RecipeJobResult,
     clear_step_screenshot,
+    mark_recipe_cover_unavailable,
     recapture_step_screenshot,
+    recipe_cover_candidate_timestamps,
     regenerate_note_from_recipe,
     regenerate_recipe_from_transcript,
     run_batch,
+    save_cropped_recipe_cover,
+    save_recipe_cover_content,
+    save_recipe_cover_from_step,
+    save_uploaded_recipe_cover,
     save_uploaded_step_screenshot,
     suggest_step_screenshots,
 )
@@ -292,6 +298,119 @@ def test_screenshot_candidate_download_is_removed_after_use(monkeypatch, tmp_pat
     assert suggest_step_screenshots(folder, 1) == []
     assert not (folder / "media" / "video.mp4").exists()
     assert not (folder / "media").exists()
+
+
+def test_recipe_cover_can_use_step_upload_or_explicitly_stay_empty(tmp_path: Path) -> None:
+    folder = tmp_path / "outputs" / "demo"
+    _write_recipe_folder(folder)
+    recipe = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
+    images = folder / "images"
+    images.mkdir()
+    step_image = images / "step_01.jpg"
+    Image.effect_noise((800, 600), 70).convert("RGB").save(step_image, format="JPEG")
+    recipe["steps"][0]["screenshot_path"] = "images/step_01.jpg"
+    recipe["steps"][0]["screenshot_time"] = 12.5
+    (folder / "recipe.json").write_text(json.dumps(recipe, ensure_ascii=False), encoding="utf-8")
+
+    cover = save_recipe_cover_from_step(folder, 1)
+    selected = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
+    assert cover.is_file()
+    assert selected["cover_image_path"] == "images/cover.jpg"
+    assert selected["cover_image_time"] == 12.5
+    assert selected["cover_image_status"] == "manual_step"
+    assert selected["cover_source_kind"] == "step_frame"
+    assert selected["cover_source_step_index"] == 1
+    assert selected["cover_source_url"] == "https://example.com/video"
+    assert selected["cover_selected_at"]
+
+    uploaded = io.BytesIO()
+    Image.effect_noise((1200, 900), 90).convert("RGB").save(uploaded, format="PNG")
+    save_uploaded_recipe_cover(folder, uploaded.getvalue())
+    selected = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
+    assert selected["cover_image_status"] == "uploaded"
+    assert selected["cover_image_time"] is None
+    assert selected["cover_source_kind"] == "upload"
+    assert selected["cover_source_url"] is None
+
+    save_recipe_cover_content(
+        folder,
+        uploaded.getvalue(),
+        timestamp=42.5,
+        status="manual_video",
+        source_kind="video_frame",
+        source_label="原视频 42.5 秒",
+        source_url="https://example.com/video",
+        original_size={"width": 1920, "height": 1080},
+        crop_box={"left": 120, "top": 40, "width": 1440, "height": 1080},
+    )
+    selected = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
+    assert selected["cover_image_time"] == 42.5
+    assert selected["cover_source_kind"] == "video_frame"
+    assert selected["cover_source_url"] == "https://example.com/video"
+    assert selected["cover_original_size"] == {"width": 1920, "height": 1080}
+    assert selected["cover_crop_box"] == {
+        "left": 120,
+        "top": 40,
+        "width": 1440,
+        "height": 1080,
+    }
+
+    save_cropped_recipe_cover(
+        folder,
+        uploaded.getvalue(),
+        timestamp=None,
+        status="uploaded",
+        zoom=1.5,
+        horizontal_position=0.7,
+        vertical_position=0.4,
+    )
+    with Image.open(folder / "images" / "cover.jpg") as cropped:
+        assert cropped.width / cropped.height == pytest.approx(4 / 3, rel=0.002)
+
+    mark_recipe_cover_unavailable(folder)
+    selected = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
+    assert selected["cover_image_status"] == "no_suitable"
+    assert selected["cover_image_path"] is None
+    assert selected["cover_image_time"] is None
+    assert selected["cover_source_kind"] is None
+    assert selected["cover_source_url"] is None
+    assert selected["cover_original_size"] is None
+    assert selected["cover_crop_box"] is None
+    assert selected["cover_selected_at"] is None
+    assert not cover.exists()
+
+
+def test_recipe_cover_step_uses_start_time_when_screenshot_time_is_missing(tmp_path: Path) -> None:
+    folder = tmp_path / "outputs" / "demo"
+    _write_recipe_folder(folder)
+    recipe = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
+    images = folder / "images"
+    images.mkdir()
+    Image.effect_noise((800, 600), 70).convert("RGB").save(images / "step_01.jpg", format="JPEG")
+    recipe["steps"][0]["screenshot_path"] = "images/step_01.jpg"
+    recipe["steps"][0]["start_time"] = 18.75
+    recipe["steps"][0].pop("screenshot_time", None)
+    (folder / "recipe.json").write_text(json.dumps(recipe, ensure_ascii=False), encoding="utf-8")
+
+    save_recipe_cover_from_step(folder, 1)
+
+    selected = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
+    assert selected["cover_image_time"] == 18.75
+    assert selected["cover_source_kind"] == "step_frame"
+    assert selected["cover_source_step_index"] == 1
+
+
+def test_recipe_cover_candidates_include_opening_and_finished_dish() -> None:
+    recipe = _recipe()
+    recipe.steps = [
+        RecipeStep(title="炒制", start_time=30, end_time=50, action="翻炒"),
+        RecipeStep(title="装盘", start_time=55, end_time=70, action="成品出锅"),
+    ]
+
+    timestamps = recipe_cover_candidate_timestamps(recipe, 80)
+
+    assert {2.0, 4.5, 7.0, 10.0, 15.0} <= set(timestamps)
+    assert any(55 < value < 70 for value in timestamps)
 
 
 def test_analyze_video_content_writes_markdown_and_metadata(monkeypatch, tmp_path) -> None:
