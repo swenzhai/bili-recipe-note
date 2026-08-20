@@ -1864,8 +1864,8 @@ def _meal_card_image_data_uri(path: Path | None) -> str | None:
 
 
 def _render_meal_planner(st, config: UIConfig) -> None:
-    st.subheader("餐厅式点餐")
-    st.caption("点餐在独立界面中完成，主工作区不会再混入菜单、采购和套餐表单。")
+    st.subheader("餐厅式点餐（兼容入口）")
+    st.caption("旧 Streamlit 点餐台仅用于数据迁移期间兼容；多人共享点餐请使用 8765 移动客户端。")
     selected_count = len(st.session_state.get("meal_recipe_ids", []))
     try:
         saved_count = len(load_meal_plans())
@@ -2524,45 +2524,51 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
         st.error(f"同步服务数据初始化失败：{_clean_error(exc)}")
         return
 
-    st.markdown("#### 网页离线版（推荐个人使用）")
-    st.caption("不需要 Apple 开发者账号。先在 iPhone 的 Safari 打开网页版并添加到主屏幕，再把下面的菜谱包导入一次。")
-    image_mode_labels = {
-        "all": "全部步骤图",
-        "first": "每道菜仅一张（推荐）",
-        "none": "只导出文字",
-    }
-    image_mode = st.radio(
-        "图片导出方式",
-        ["first", "none", "all"],
-        format_func=image_mode_labels.get,
-        horizontal=True,
-        key="web_library_image_mode",
-        help="“每道菜仅一张”会保留该菜第一张有效步骤图；“只导出文字”会移除图片数据和图片引用。",
-    )
-    try:
-        web_payload = build_web_library_payload(store, image_mode=image_mode)
-        web_content = web_library_bytes(web_payload)
-        st.download_button(
-            "下载网页版菜谱包",
-            data=web_content,
-            file_name="bili-recipe-web-library.json",
-            mime="application/json",
-            type="primary",
-            width="stretch",
+    st.markdown("#### 局域网多人点餐（推荐）")
+    st.caption("手机直接打开 8765 端口，输入设备名称即可加入当前共享本餐。")
+    with st.expander("高级功能：旧网页版菜谱包"):
+        st.caption("仅用于旧离线网页版兼容；新局域网客户端无需手动导入。")
+        image_mode_labels = {"all": "全部步骤图", "first": "每道菜仅一张（推荐）", "none": "只导出文字"}
+        image_mode = st.radio(
+            "图片导出方式", ["first", "none", "all"], format_func=image_mode_labels.get,
+            horizontal=True, key="web_library_image_mode",
         )
-        st.caption(
-            f"包含 {len(web_payload['recipes'])} 道菜谱、{len(web_payload['assets'])} 张步骤图；"
-            f"文件约 {len(web_content) / (1024 * 1024):.1f} MB。"
-            "菜谱包只在电脑与手机之间传递，不会上传到网页版服务器。"
-        )
-    except Exception as exc:  # noqa: BLE001
-        st.warning(f"网页版菜谱包生成失败：{_clean_error(exc)}")
+        try:
+            web_payload = build_web_library_payload(store, image_mode=image_mode)
+            web_content = web_library_bytes(web_payload)
+            st.download_button(
+                "下载旧网页版菜谱包", data=web_content,
+                file_name="bili-recipe-web-library.json", mime="application/json", width="stretch",
+            )
+            st.caption(f"{len(web_payload['recipes'])} 道菜谱 · {len(web_content) / (1024 * 1024):.1f} MB")
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"网页版菜谱包生成失败：{_clean_error(exc)}")
 
     st.divider()
-    st.markdown("#### 原生 App 局域网同步（保留）")
-    st.warning("当前使用 HTTP，仅适合可信家庭局域网。不要在公共 Wi-Fi 中启动或配对。")
+    st.markdown("#### 新设备加入与设备管理")
+    st.warning("当前使用 HTTP，仅适合可信家庭局域网。不要在公共 Wi-Fi 中开放新设备加入。")
 
     base_url = st.text_input("手机同步地址", value=f"http://{_lan_ip_address()}:8765")
+    current_join_setting = store.self_join_enabled()
+    join_enabled = st.toggle(
+        "允许局域网新设备自助加入",
+        value=current_join_setting,
+        help="关闭后，已经加入的设备不受影响；新设备将无法注册。",
+    )
+    if join_enabled != current_join_setting:
+        store.set_self_join_enabled(join_enabled)
+        st.rerun()
+    if join_enabled:
+        st.success("新设备可直接打开下方网址，输入设备名称后加入。")
+    else:
+        st.info("新设备加入已锁定；已加入设备仍可正常点餐。")
+    st.link_button("打开移动点餐客户端", base_url, type="primary")
+    try:
+        import qrcode
+
+        st.image(qrcode.make(base_url), caption="二维码只包含点餐网址，可直接分享", width=240)
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"网址二维码生成失败：{_clean_error(exc)}")
     try:
         with urlopen("http://127.0.0.1:8765/api/v1/health", timeout=0.8) as response:  # noqa: S310
             health = json.load(response)
@@ -2581,20 +2587,87 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
         st.warning("发现重复菜谱身份，手机客户端只发布最近修改的一份。")
         st.json(index_result["duplicates"])
 
-    if st.button("生成 10 分钟配对二维码", type="primary"):
-        credential = store.issue_pairing_credential(base_url)
-        st.session_state["mobile_pairing_payload"] = credential.qr_payload()
-        st.session_state["mobile_pairing_expires"] = credential.expires_at
-    pairing_payload = st.session_state.get("mobile_pairing_payload")
-    if isinstance(pairing_payload, str):
-        try:
-            import qrcode
+    st.markdown("#### 点餐菜谱上下架")
+    indexed_recipes = store.list_indexed_recipes()
+    published_count = len([item for item in indexed_recipes if item["published"]])
+    st.caption(
+        f"当前上架 {published_count} / {len(indexed_recipes)} 道。"
+        "下架后会立即从移动点餐菜单隐藏；已经点入本餐的菜仍保留名称和图片。"
+    )
+    publication_filters = st.columns([3, 2])
+    publication_query = publication_filters[0].text_input(
+        "筛选菜谱", placeholder="输入菜名或原分类", key="mobile_publication_query"
+    ).strip().lower()
+    publication_status = publication_filters[1].selectbox(
+        "上架状态", ["全部", "已上架", "已下架"], key="mobile_publication_status"
+    )
+    visible_recipes = [
+        item for item in indexed_recipes
+        if (
+            not publication_query
+            or publication_query in str(item["title"]).lower()
+            or publication_query in str(item.get("category") or "").lower()
+        ) and (
+            publication_status == "全部"
+            or (publication_status == "已上架" and item["published"])
+            or (publication_status == "已下架" and not item["published"])
+        )
+    ]
+    editor_scope = hashlib.sha256(
+        "\n".join(str(item["id"]) for item in visible_recipes).encode("utf-8")
+    ).hexdigest()[:12]
+    bulk_publication_columns = st.columns(2)
+    if visible_recipes and bulk_publication_columns[0].button(
+        "当前筛选全部上架", key=f"mobile_publish_filtered_{editor_scope}", width="stretch"
+    ):
+        changed = store.set_recipe_publications({str(item["id"]): True for item in visible_recipes})
+        st.success(f"已上架 {changed} 道菜。")
+        st.rerun()
+    if visible_recipes and bulk_publication_columns[1].button(
+        "当前筛选全部下架", key=f"mobile_unpublish_filtered_{editor_scope}", width="stretch"
+    ):
+        changed = store.set_recipe_publications({str(item["id"]): False for item in visible_recipes})
+        st.success(f"已下架 {changed} 道菜。")
+        st.rerun()
+    with st.form("mobile_recipe_publications"):
+        edited_publications = st.data_editor(
+            [
+                {
+                    "上架": bool(item["published"]),
+                    "菜谱": item["title"],
+                    "原分类": item.get("category") or "未分类",
+                }
+                for item in visible_recipes
+            ],
+            hide_index=True,
+            disabled=["菜谱", "原分类"],
+            width="stretch",
+            height=min(520, max(180, 38 * (len(visible_recipes) + 1))),
+            key=f"mobile_recipe_publication_editor_{editor_scope}",
+        )
+        save_publications = st.form_submit_button("保存上下架状态", type="primary")
+    if save_publications:
+        updates = {
+            str(recipe["id"]): bool(row.get("上架"))
+            for recipe, row in zip(visible_recipes, edited_publications)
+            if bool(row.get("上架")) != bool(recipe["published"])
+        }
+        changed = store.set_recipe_publications(updates)
+        st.success(f"已更新 {changed} 道菜，移动点餐端会自动同步。")
+        st.rerun()
+    if published_count < len(indexed_recipes) and st.button("恢复全部上架", key="mobile_publish_all"):
+        changed = store.set_recipe_publications({str(item["id"]): True for item in indexed_recipes})
+        st.success(f"已恢复 {changed} 道菜。")
+        st.rerun()
 
-            st.image(qrcode.make(pairing_payload), caption="在手机客户端中扫码", width=280)
-        except Exception as exc:  # noqa: BLE001
-            st.warning(f"二维码生成失败，可复制下方配对数据：{_clean_error(exc)}")
-        st.caption(f"有效期至：{st.session_state.get('mobile_pairing_expires', '')}")
-        with st.expander("查看配对数据"):
+    with st.expander("兼容功能：为旧 Flutter 客户端生成一次性配对数据"):
+        if st.button("生成 10 分钟配对数据"):
+            credential = store.issue_pairing_credential(base_url)
+            st.session_state["mobile_pairing_payload"] = credential.qr_payload()
+            st.session_state["mobile_pairing_expires"] = credential.expires_at
+        pairing_payload = st.session_state.get("mobile_pairing_payload")
+        if isinstance(pairing_payload, str):
+            st.caption(f"有效期至：{st.session_state.get('mobile_pairing_expires', '')}")
             st.code(pairing_payload, language="json")
 
     st.markdown("#### 已配对设备")

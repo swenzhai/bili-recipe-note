@@ -131,6 +131,20 @@ def test_pairing_is_single_use_and_revocation_is_immediate(tmp_path: Path) -> No
         store.authenticate(paired["access_token"])
 
 
+def test_self_join_defaults_open_and_persists_lock(tmp_path: Path) -> None:
+    store = MobileSyncStore(tmp_path)
+    joined = store.join_device("厨房平板")
+    assert store.authenticate(joined["access_token"])["name"] == "厨房平板"
+
+    store.set_self_join_enabled(False)
+    restarted = MobileSyncStore(tmp_path)
+
+    assert restarted.self_join_enabled() is False
+    with pytest.raises(AuthenticationError):
+        restarted.join_device("新手机")
+    assert restarted.authenticate(joined["access_token"])["id"] == joined["device_id"]
+
+
 def test_expired_pairing_token_is_rejected(tmp_path: Path) -> None:
     store = MobileSyncStore(tmp_path)
     credential = store.issue_pairing_credential("http://192.168.1.2:8765")
@@ -236,8 +250,190 @@ def test_change_cursor_is_paginated_without_gaps(tmp_path: Path) -> None:
     assert second["next_cursor"] == store.current_revision()
 
 
+def test_capable_client_bootstraps_current_snapshot_instead_of_recipe_history(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "快照菜谱")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    recipe_path = folder / "recipe.json"
+    for version in range(12):
+        recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
+        recipe["title"] = f"快照菜谱-{version}"
+        recipe_path.write_text(json.dumps(recipe, ensure_ascii=False), encoding="utf-8")
+        store.index_recipes()
+    device_id, _ = _paired(store)
+
+    bootstrapped = store.sync(device_id, 0, [], ["recipe", "practice_log", "meal_plan"])
+    legacy = store.sync(device_id, 0, [])
+
+    recipes = [change for change in bootstrapped["changes"] if change["entity_type"] == "recipe"]
+    assert bootstrapped["bootstrap"] is True
+    assert bootstrapped["has_more"] is False
+    assert bootstrapped["next_cursor"] == store.current_revision()
+    assert len(recipes) == 1
+    assert recipes[0]["payload"]["title"] == "快照菜谱-11"
+    assert len([change for change in legacy["changes"] if change["entity_type"] == "recipe"]) == 13
+    assert "bootstrap" not in legacy
+
+
+def test_recipe_publication_persists_and_syncs_without_losing_details(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "上下架菜谱")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    recipe_id = json.loads((folder / "sync-meta.json").read_text(encoding="utf-8"))["recipe_id"]
+    device_id, _ = _paired(store)
+    capabilities = ["recipe", "meal_order", "meal_selection", "meal_dish_state"]
+    bootstrap = store.sync(device_id, 0, [], capabilities)
+    meal = bootstrap["meal"]
+    cursor = bootstrap["next_cursor"]
+
+    assert bootstrap["changes"][0]["payload"]["published"] is True
+    assert store.set_recipe_publications({recipe_id: False}) == 1
+    hidden = store.sync(device_id, cursor, [], capabilities)
+
+    recipe_change = next(change for change in hidden["changes"] if change["entity_id"] == recipe_id)
+    assert recipe_change["action"] == "upsert"
+    assert recipe_change["payload"]["title"] == "上下架菜谱"
+    assert recipe_change["payload"]["published"] is False
+    assert store.list_indexed_recipes()[0]["published"] is False
+
+    recipe = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
+    recipe["summary_tips"] = ["重新索引"]
+    (folder / "recipe.json").write_text(json.dumps(recipe, ensure_ascii=False), encoding="utf-8")
+    store.index_recipes()
+    restarted = MobileSyncStore(tmp_path)
+    assert restarted.list_indexed_recipes()[0]["published"] is False
+
+    rejected = restarted.sync(
+        device_id,
+        restarted.current_revision(),
+        [_meal_op(meal, "add_quantity", recipe_id, quantity=1)],
+        capabilities,
+    )
+    assert rejected["operation_results"][0]["reason"] == "recipe_unpublished"
+
+    assert restarted.set_recipe_publications({recipe_id: True}) == 1
+    accepted = restarted.sync(
+        device_id,
+        restarted.current_revision(),
+        [_meal_op(restarted.current_meal_order(), "add_quantity", recipe_id, quantity=1)],
+        capabilities,
+    )
+    assert accepted["operation_results"][0]["status"] == "accepted"
+
+
+def test_database_v2_migration_defaults_existing_recipes_to_published(tmp_path: Path) -> None:
+    database = tmp_path / ".bili-recipe-notes" / "mobile-sync.sqlite3"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE recipes (id TEXT PRIMARY KEY, output_folder TEXT NOT NULL, payload_json TEXT NOT NULL, "
+            "content_hash TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, revision INTEGER NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO recipes VALUES (?,?,?,?,?,NULL,?)",
+            (str(uuid.uuid4()), "folder", json.dumps({"title": "旧菜谱"}), "hash", "2026-08-20T00:00:00Z", 1),
+        )
+        connection.execute("PRAGMA user_version = 2")
+
+    migrated = MobileSyncStore(tmp_path, database_path=database)
+
+    assert migrated.list_indexed_recipes()[0]["published"] is True
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert "published" in {row[1] for row in connection.execute("PRAGMA table_info(recipes)")}
+    assert list(database.parent.glob("mobile-sync.before-v2-to-v3-*.bak"))
+
+
 def test_private_network_filter() -> None:
     assert is_private_client("127.0.0.1")
+
+
+def _meal_op(snapshot: dict, action: str, recipe_id: str | None = None, **values) -> dict:
+    return {
+        "op_id": str(uuid.uuid4()),
+        "entity_type": "meal_selection",
+        "action": action,
+        "order_id": snapshot["order"]["id"],
+        "epoch": snapshot["order"]["epoch"],
+        **({"recipe_id": recipe_id} if recipe_id else {}),
+        **values,
+    }
+
+
+def test_shared_meal_preserves_people_aggregates_and_idempotency(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "多人番茄炒蛋")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    recipe_id = json.loads((folder / "sync-meta.json").read_text(encoding="utf-8"))["recipe_id"]
+    first_device, _ = _paired(store)
+    second_device, _ = _paired(store)
+    capabilities = ["recipe", "meal_order", "meal_selection", "meal_dish_state"]
+    meal = store.sync(first_device, 0, [], capabilities)["meal"]
+    first_add = _meal_op(meal, "add_quantity", recipe_id, quantity=1)
+
+    store.sync(first_device, 0, [first_add, first_add], capabilities)
+    store.sync(second_device, 0, [_meal_op(meal, "add_quantity", recipe_id, quantity=1.5)], capabilities)
+    store.sync(second_device, 0, [_meal_op(meal, "set_note", recipe_id, note="少盐")], capabilities)
+    snapshot = store.current_meal_order()
+
+    assert sum(item["quantity"] for item in snapshot["selections"]) == 2.5
+    assert {item["device_id"] for item in snapshot["selections"]} == {first_device, second_device}
+    assert next(item for item in snapshot["selections"] if item["device_id"] == second_device)["note"] == "少盐"
+
+
+def test_clear_and_complete_reject_stale_offline_operations(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "旧操作保护")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    recipe_id = json.loads((folder / "sync-meta.json").read_text(encoding="utf-8"))["recipe_id"]
+    device_id, _ = _paired(store)
+    capabilities = ["recipe", "meal_order", "meal_selection", "meal_dish_state"]
+    meal = store.sync(device_id, 0, [], capabilities)["meal"]
+    stale = _meal_op(meal, "add_quantity", recipe_id, quantity=1)
+    clear = _meal_op(meal, "clear_order")
+    clear["entity_type"] = "meal_order"
+
+    assert store.sync(device_id, 0, [clear], capabilities)["operation_results"][0]["status"] == "accepted"
+    assert store.sync(device_id, 0, [stale], capabilities)["operation_results"][0]["reason"] == "stale_order"
+    current = store.current_meal_order()
+    complete = _meal_op(current, "complete_order")
+    complete["entity_type"] = "meal_order"
+    store.sync(device_id, 0, [complete], capabilities)
+    result = store.sync(device_id, 0, [_meal_op(current, "add_quantity", recipe_id, quantity=1)], capabilities)
+    assert result["operation_results"][0]["reason"] == "order_completed"
+
+
+def test_legacy_capabilities_hide_shared_meal_changes(tmp_path: Path) -> None:
+    store = MobileSyncStore(tmp_path)
+    device_id, _ = _paired(store)
+    store.sync(device_id, 0, [], ["meal_order", "meal_selection", "meal_dish_state"])
+
+    legacy = store.sync(device_id, 0, [])
+
+    assert legacy["capabilities"] == ["practice_log", "recipe"]
+    assert all(change["entity_type"] in {"recipe", "practice_log"} for change in legacy["changes"])
+    assert "meal" not in legacy
+
+
+def test_legacy_meal_plans_migrate_once_with_backup(tmp_path: Path) -> None:
+    config = tmp_path / ".bili-recipe-notes"
+    config.mkdir()
+    source = config / "meal-plans.json"
+    source.write_text(json.dumps({
+        "schema_version": 1,
+        "plans": [{
+            "id": "family-plan", "name": "家庭套餐", "guest_count": 3, "child_count": 0,
+            "occasion": "日常家宴", "notes": "", "items": [{"recipe_id": "r1", "title": "菜一", "servings_multiplier": 1}],
+            "created_at": "2026-08-19T00:00:00+00:00", "updated_at": "2026-08-19T00:00:00+00:00",
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    store = MobileSyncStore(tmp_path)
+    restarted = MobileSyncStore(tmp_path)
+
+    assert store.list_meal_plans()[0]["name"] == "家庭套餐"
+    assert restarted.list_meal_plans()[0]["version"] == 1
+    assert len(list(config.glob("meal-plans.migrated-*.json.bak"))) == 1
     assert is_private_client("192.168.1.10")
     assert is_private_client("testclient")
     assert not is_private_client("8.8.8.8")

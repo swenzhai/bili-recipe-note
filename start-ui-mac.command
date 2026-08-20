@@ -23,6 +23,13 @@ echo "Starting Bili Recipe Notes UI..."
 echo "Project: $(pwd)"
 echo
 
+if [ ! -f "web/dist/index.html" ]; then
+    echo "Mobile client build is missing: web/dist/index.html"
+    echo "Run: cd web && corepack pnpm install && corepack pnpm build"
+    pause_before_exit
+    exit 1
+fi
+
 if ! "$BOOTSTRAP_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
     echo "Python 3.10 or newer is required."
     echo "Detected: $($BOOTSTRAP_PYTHON --version 2>&1)"
@@ -73,9 +80,10 @@ if ! "$PYTHON_EXE" -c "import inspect; from yt_dlp.extractor.bilibili import Bil
     fi
 fi
 
+LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 127.0.0.1)"
 echo
-echo "Browser URL: http://localhost:8501"
-echo "Mobile API: http://0.0.0.0:8765 (use the pairing page to get the LAN address)"
+echo "Admin URL: http://$LAN_IP:8501"
+echo "Mobile client: http://$LAN_IP:8765"
 echo "Press Ctrl+C in this window to stop the server."
 echo
 
@@ -120,8 +128,9 @@ UI_RESTART_COUNT=0
 UI_MAX_RESTARTS=3
 while true; do
     "$PYTHON_EXE" -m streamlit run bili_recipe_notes/ui.py \
-        --server.address=127.0.0.1 \
-        --browser.serverAddress=127.0.0.1 \
+        --server.address=0.0.0.0 \
+        --server.port=8501 \
+        --browser.serverAddress="$LAN_IP" \
         --server.headless=false 2>&1 | tee -a "$UI_LOG"
     UI_STATUS=${PIPESTATUS[0]}
     if [ "$UI_STATUS" -eq 0 ] || [ "$UI_STATUS" -eq 130 ] || [ "$UI_STATUS" -eq 143 ]; then

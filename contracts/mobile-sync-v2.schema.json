@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bili-recipe-notes.local/contracts/mobile-sync-v2.schema.json",
+  "title": "Bili Recipe Notes Mobile Sync v2",
+  "type": "object",
+  "$defs": {
+    "capability": {
+      "enum": ["recipe", "practice_log", "meal_plan", "meal_order", "meal_selection", "meal_dish_state"]
+    },
+    "operation": {
+      "type": "object",
+      "required": ["op_id", "entity_type", "action"],
+      "properties": {
+        "op_id": {"type": "string", "format": "uuid"},
+        "entity_type": {"enum": ["practice_log", "meal_plan", "meal_order", "meal_selection", "meal_dish_state"]},
+        "action": {"enum": ["upsert", "delete", "resolve_conflict", "add_quantity", "set_quantity", "set_note", "remove_selection", "set_dish_completed", "clear_order", "complete_order", "load_plan"]},
+        "order_id": {"type": "string", "format": "uuid"},
+        "epoch": {"type": "integer", "minimum": 1},
+        "payload": {"type": "object"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "cursor": {"type": "integer", "minimum": 0},
+    "capabilities": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/capability"}},
+    "operations": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/operation"}},
+    "changes": {"type": "array", "maxItems": 200},
+    "next_cursor": {"type": "integer", "minimum": 0},
+    "has_more": {"type": "boolean"},
+    "bootstrap": {"type": "boolean"},
+    "meal": {"type": ["object", "null"]}
+  }
+}

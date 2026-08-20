@@ -2,54 +2,35 @@ import assert from "node:assert/strict";
 import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 
-const templateRoot = new URL("../", import.meta.url);
-
-async function render() {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
-
-  return worker.fetch(
-    new Request("http://localhost/", { headers: { accept: "text/html" } }),
-    { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } },
-    { waitUntil() {}, passThroughOnException() {} },
-  );
-}
-
-test("server-renders the offline recipe app", async () => {
-  const response = await render();
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
-
-  const html = await response.text();
-  assert.match(html, /<title>Bili 菜谱 · 离线点菜<\/title>/i);
-  assert.match(html, /正在打开离线菜谱库/);
-  assert.match(html, /manifest\.webmanifest/);
-  assert.doesNotMatch(html, /codex-preview|react-loading-skeleton|Your site is taking shape/);
-});
-
-test("ships an installable cached PWA without starter artifacts", async () => {
-  const [page, libraryImport, layout, packageJson, manifest, serviceWorker] = await Promise.all([
-    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/library-import.ts", import.meta.url), "utf8"),
-    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
+test("builds a standard Vite LAN client", async () => {
+  const [html, source, packageJson, manifest] = await Promise.all([
+    readFile(new URL("../dist/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../public/manifest.webmanifest", import.meta.url), "utf8"),
-    readFile(new URL("../public/sw.js", import.meta.url), "utf8"),
   ]);
-
-  assert.doesNotMatch(packageJson, /react-loading-skeleton|site-creator-vinext-starter/);
-  assert.match(page, /indexedDB\.open/);
-  assert.match(page, /createObjectStore\(ASSET_STORE\)/);
-  assert.match(page, /role=\{importState\.kind === "error" \? "alert" : "status"\}/);
-  assert.match(libraryImport, /file\.slice\(offset, end\)/);
-  assert.doesNotMatch(libraryImport, /file\.text\(\)/);
-  assert.match(page, /serviceWorker\.register\("\/sw\.js"\)/);
-  assert.match(layout, /manifest:\s*"\/manifest\.webmanifest"/);
+  assert.match(html, /Bili 家庭点餐/);
+  assert.match(source, /indexedDB\.open/);
+  assert.match(source, /api\/v1\/events/);
+  assert.match(source, /api\/v1\/join/);
+  assert.match(source, /function DishThumbnail/);
+  assert.match(source, /image_sha256/);
+  assert.match(source, /IntersectionObserver/);
+  assert.match(source, /serviceWorker\.register/);
+  assert.match(source, /setInterval\([^]*3000/);
+  assert.match(source, /while \(true\)[^]*payload\.has_more/);
+  assert.match(source, /function mergeChanges/);
+  assert.match(source, /function optimisticallyAddQuantity/);
+  assert.match(source, /syncRequested\.current = true/);
+  assert.match(source, /mealRef\.current/);
+  assert.match(source, /updateViaCache: "none"/);
+  assert.match(source, /function newUuid/);
+  assert.doesNotMatch(source, /op_id: crypto\.randomUUID/);
+  assert.match(source, /recipeOrderCategories/);
+  assert.match(source, /categoryBar/);
+  assert.match(source, /recipe\.published !== false/);
+  assert.match(source, /Authorization: `Bearer/);
+  assert.doesNotMatch(packageJson, /vinext|cloudflare|wrangler/);
   assert.equal(JSON.parse(manifest).display, "standalone");
-  assert.match(serviceWorker, /caches\.open/);
-  assert.match(serviceWorker, /bili-recipe-shell-v3/);
-  await access(new URL("../public/icon-192.png", import.meta.url));
-  await access(new URL("../public/icon-512.png", import.meta.url));
-  await assert.rejects(access(new URL("../app/_sites-preview", templateRoot)));
+  await access(new URL("../dist/assets", import.meta.url));
 });

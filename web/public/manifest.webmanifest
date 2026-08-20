@@ -1,7 +1,7 @@
 {
-  "name": "Bili 菜谱 · 离线点菜",
-  "short_name": "Bili 菜谱",
-  "description": "私密、离线可用的个人菜谱与点菜应用",
+  "name": "Bili 家庭共享点餐",
+  "short_name": "家庭点餐",
+  "description": "局域网多人共享点餐与菜谱客户端",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#f5efe3",

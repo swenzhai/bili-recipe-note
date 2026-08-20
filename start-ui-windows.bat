@@ -12,6 +12,13 @@ echo Starting Bili Recipe Notes UI...
 echo Project: %CD%
 echo.
 
+if not exist "web\dist\index.html" (
+    echo Mobile client build is missing: web\dist\index.html
+    echo Run: cd web ^&^& corepack pnpm install ^&^& corepack pnpm build
+    pause
+    exit /b 1
+)
+
 "%PYTHON_EXE%" -c "import streamlit" >nul 2>nul
 if errorlevel 1 (
     echo Streamlit is not installed. Installing requirements...
@@ -36,12 +43,17 @@ if errorlevel 1 (
     )
 )
 
+set "LAN_IP=127.0.0.1"
+for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "(Get-NetIPAddress -AddressFamily IPv4 ^| Where-Object { $_.IPAddress -notlike '127.*' -and $_.PrefixOrigin -ne 'WellKnown' } ^| Select-Object -First 1 -ExpandProperty IPAddress)"`) do set "LAN_IP=%%I"
 echo.
-echo Browser URL: http://localhost:8501
-echo Press Ctrl+C in this window to stop the server.
+echo Admin URL: http://%LAN_IP%:8501
+echo Mobile client: http://%LAN_IP%:8765
+echo Press Ctrl+C in this window to stop both services.
 echo.
 
-"%PYTHON_EXE%" -m streamlit run bili_recipe_notes/ui.py --server.address=127.0.0.1 --browser.serverAddress=127.0.0.1
+start "Bili Recipe Mobile" /b "%PYTHON_EXE%" -m uvicorn bili_recipe_notes.mobile_api:app --host 0.0.0.0 --port 8765 --no-access-log
+"%PYTHON_EXE%" -m streamlit run bili_recipe_notes/ui.py --server.address=0.0.0.0 --server.port=8501 --browser.serverAddress=%LAN_IP%
+taskkill /fi "WINDOWTITLE eq Bili Recipe Mobile" /t /f >nul 2>nul
 
 echo.
 echo UI server stopped.

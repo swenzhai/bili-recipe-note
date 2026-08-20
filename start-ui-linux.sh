@@ -17,6 +17,12 @@ echo "正在启动 Bili Recipe Notes 局域网服务..."
 echo "项目目录：$(pwd)"
 echo
 
+if [ ! -f "web/dist/index.html" ]; then
+    echo "未找到手机网页构建产物 web/dist/index.html。"
+    echo "请先运行：cd web && corepack pnpm install && corepack pnpm build"
+    exit 1
+fi
+
 if ! "$BOOTSTRAP_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
     echo "需要 Python 3.10 或更新版本。"
     echo "当前版本：$($BOOTSTRAP_PYTHON --version 2>&1)"
@@ -84,7 +90,7 @@ if [ "$LAN_IP" != "127.0.0.1" ]; then
 else
     echo "未能自动获取局域网 IP；可运行 'hostname -I' 查看后访问 http://<局域网IP>:8501"
 fi
-echo "手机同步 API：http://$LAN_IP:8765"
+echo "移动点餐客户端：http://$LAN_IP:8765"
 echo "仅限可信局域网使用，请勿把 8501 或 8765 端口暴露到公网。"
 echo "按 Ctrl+C 可停止全部服务。"
 echo

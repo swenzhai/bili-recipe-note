@@ -6,6 +6,7 @@ import ipaddress
 import json
 import mimetypes
 import secrets
+import shutil
 import sqlite3
 import threading
 import uuid
@@ -21,7 +22,8 @@ from .storage import atomic_write_json
 
 
 SCHEMA_VERSION = 1
-PROTOCOL_VERSION = 1
+DATABASE_SCHEMA_VERSION = 3
+PROTOCOL_VERSION = 2
 MAX_SYNC_OPERATIONS = 100
 MAX_SYNC_CHANGES = 200
 MAX_PRACTICE_PHOTO_BYTES = 5 * 1024 * 1024
@@ -31,6 +33,10 @@ MEDIA_DIR_NAME = "mobile-media"
 SYNC_META_FILE_NAME = "sync-meta.json"
 RECIPE_NAMESPACE = uuid.UUID("f7e7b2d5-96dd-43c6-a769-83e95f72bd39")
 ALLOWED_OUTCOMES = {"", "success", "partial", "failed"}
+LEGACY_CAPABILITIES = {"recipe", "practice_log"}
+SUPPORTED_CAPABILITIES = LEGACY_CAPABILITIES | {
+    "meal_plan", "meal_order", "meal_selection", "meal_dish_state"
+}
 
 
 class MobileSyncError(RuntimeError):
@@ -140,12 +146,12 @@ class MobileSyncStore:
     def _initialize(self) -> None:
         with self._lock, self._connect() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > SCHEMA_VERSION:
+            if version > DATABASE_SCHEMA_VERSION:
                 raise MobileSyncError(f"Unsupported mobile sync database version: {version}")
-            if 0 < version < SCHEMA_VERSION:
+            if 0 < version < DATABASE_SCHEMA_VERSION:
                 timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 backup_path = self.database_path.with_name(
-                    f"{self.database_path.stem}.before-v{version}-to-v{SCHEMA_VERSION}-{timestamp}.bak"
+                    f"{self.database_path.stem}.before-v{version}-to-v{DATABASE_SCHEMA_VERSION}-{timestamp}.bak"
                 )
                 with sqlite3.connect(backup_path) as backup:
                     connection.backup(backup)
@@ -162,7 +168,8 @@ class MobileSyncStore:
                 );
                 CREATE TABLE IF NOT EXISTS recipes (
                     id TEXT PRIMARY KEY, output_folder TEXT NOT NULL, payload_json TEXT NOT NULL,
-                    content_hash TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, revision INTEGER NOT NULL
+                    content_hash TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, revision INTEGER NOT NULL,
+                    published INTEGER NOT NULL DEFAULT 1
                 );
                 CREATE TABLE IF NOT EXISTS assets (
                     sha256 TEXT PRIMARY KEY, recipe_id TEXT, path TEXT NOT NULL, mime_type TEXT NOT NULL,
@@ -189,11 +196,74 @@ class MobileSyncStore:
                 CREATE INDEX IF NOT EXISTS idx_changes_entity ON change_log(entity_type, entity_id);
                 CREATE INDEX IF NOT EXISTS idx_practice_recipe ON practice_logs(recipe_id, cooked_on DESC);
                 CREATE INDEX IF NOT EXISTS idx_conflicts_open ON conflicts(resolved_at, created_at);
+                CREATE TABLE IF NOT EXISTS meal_plans (
+                    id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, version INTEGER NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS meal_orders (
+                    id TEXT PRIMARY KEY, status TEXT NOT NULL, version INTEGER NOT NULL, epoch INTEGER NOT NULL,
+                    created_at TEXT NOT NULL, completed_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_single_active_meal
+                    ON meal_orders(status) WHERE status='active';
+                CREATE TABLE IF NOT EXISTS meal_selections (
+                    order_id TEXT NOT NULL, device_id TEXT NOT NULL, recipe_id TEXT NOT NULL,
+                    quantity REAL NOT NULL, note TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    PRIMARY KEY(order_id, device_id, recipe_id),
+                    FOREIGN KEY(order_id) REFERENCES meal_orders(id),
+                    FOREIGN KEY(device_id) REFERENCES devices(id)
+                );
+                CREATE TABLE IF NOT EXISTS meal_dish_states (
+                    order_id TEXT NOT NULL, recipe_id TEXT NOT NULL, sort_order INTEGER NOT NULL,
+                    completed INTEGER NOT NULL, updated_at TEXT NOT NULL,
+                    PRIMARY KEY(order_id, recipe_id), FOREIGN KEY(order_id) REFERENCES meal_orders(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_meal_selections_order ON meal_selections(order_id, recipe_id);
                 """
             )
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            recipe_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(recipes)")}
+            if "published" not in recipe_columns:
+                connection.execute("ALTER TABLE recipes ADD COLUMN published INTEGER NOT NULL DEFAULT 1")
+            connection.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
             connection.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('revision', '0')")
             connection.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('server_id', ?)", (str(uuid.uuid4()),))
+            connection.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('self_join_enabled', '1')")
+        self._migrate_legacy_meal_plans()
+
+    def _migrate_legacy_meal_plans(self) -> None:
+        path = self.project_root / CONFIG_DIR_NAME / "meal-plans.json"
+        if not path.is_file():
+            return
+        with self._write_connection() as connection:
+            if connection.execute("SELECT 1 FROM meal_plans LIMIT 1").fetchone():
+                return
+            source = _read_object(path)
+            plans = source.get("plans") if source.get("schema_version") == 1 else None
+            if not isinstance(plans, list):
+                return
+            now = utc_now()
+            migrated = 0
+            for raw in plans:
+                if not isinstance(raw, dict):
+                    continue
+                plan_id = str(raw.get("id") or "").strip()
+                name = str(raw.get("name") or "").strip()
+                if not plan_id or not name:
+                    continue
+                created_at = str(raw.get("created_at") or now)
+                updated_at = str(raw.get("updated_at") or created_at)
+                payload = {**raw, "id": plan_id, "version": 1, "deleted_at": None}
+                connection.execute(
+                    "INSERT INTO meal_plans VALUES (?,?,?,?,?,NULL)",
+                    (plan_id, _canonical_json(payload), 1, created_at, updated_at),
+                )
+                self._record_change(connection, "meal_plan", plan_id, "upsert", payload)
+                migrated += 1
+        if migrated:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = path.with_name(f"meal-plans.migrated-{stamp}.json.bak")
+            if not backup.exists():
+                shutil.copy2(path, backup)
 
     @property
     def server_id(self) -> str:
@@ -222,17 +292,20 @@ class MobileSyncStore:
         return revision
 
     # Pairing and device management
-    def issue_pairing_credential(self, base_url: str) -> PairingCredential:
-        token = secrets.token_urlsafe(32)
-        expires = datetime.now(timezone.utc) + timedelta(minutes=PAIRING_TTL_MINUTES)
-        with self._write_connection() as connection:
-            connection.execute("DELETE FROM pairing_tokens WHERE expires_at < ? OR used_at IS NOT NULL", (utc_now(),))
-            connection.execute(
-                "INSERT INTO pairing_tokens VALUES (?, ?, NULL)", (token_hash(token), expires.isoformat())
-            )
-        return PairingCredential(self.server_id, base_url.rstrip("/"), token, expires.isoformat())
+    def self_join_enabled(self) -> bool:
+        with self._connect() as connection:
+            row = connection.execute("SELECT value FROM meta WHERE key='self_join_enabled'").fetchone()
+        return row is None or str(row["value"]) == "1"
 
-    def pair_device(self, pairing_token: str, device_name: str, requested_device_id: str | None = None) -> dict[str, Any]:
+    def set_self_join_enabled(self, enabled: bool) -> None:
+        with self._write_connection() as connection:
+            connection.execute(
+                "INSERT INTO meta(key,value) VALUES ('self_join_enabled',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("1" if enabled else "0",),
+            )
+
+    def _register_device(self, device_name: str, requested_device_id: str | None = None) -> dict[str, Any]:
         name = device_name.strip()[:80]
         if not name:
             raise ValidationError("device_name is required")
@@ -244,12 +317,6 @@ class MobileSyncStore:
         now = utc_now()
         access_token = secrets.token_urlsafe(48)
         with self._write_connection() as connection:
-            row = connection.execute(
-                "SELECT expires_at, used_at FROM pairing_tokens WHERE token_hash=?", (token_hash(pairing_token),)
-            ).fetchone()
-            if not row or row["used_at"] or str(row["expires_at"]) < now:
-                raise AuthenticationError("Pairing token is invalid or expired")
-            connection.execute("UPDATE pairing_tokens SET used_at=? WHERE token_hash=?", (now, token_hash(pairing_token)))
             connection.execute(
                 "INSERT INTO devices VALUES (?, ?, ?, ?, ?, NULL) "
                 "ON CONFLICT(id) DO UPDATE SET name=excluded.name, token_hash=excluded.token_hash, "
@@ -260,8 +327,43 @@ class MobileSyncStore:
             "schema_version": SCHEMA_VERSION,
             "server_id": self.server_id,
             "device_id": device_id,
+            "device_name": name,
             "access_token": access_token,
         }
+
+    def join_device(self, device_name: str, requested_device_id: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            if not self.self_join_enabled():
+                raise AuthenticationError("New device joining is currently disabled")
+            return self._register_device(device_name, requested_device_id)
+
+    def issue_pairing_credential(self, base_url: str) -> PairingCredential:
+        token = secrets.token_urlsafe(32)
+        expires = datetime.now(timezone.utc) + timedelta(minutes=PAIRING_TTL_MINUTES)
+        with self._write_connection() as connection:
+            connection.execute("DELETE FROM pairing_tokens WHERE expires_at < ? OR used_at IS NOT NULL", (utc_now(),))
+            connection.execute(
+                "INSERT INTO pairing_tokens VALUES (?, ?, NULL)", (token_hash(token), expires.isoformat())
+            )
+        return PairingCredential(self.server_id, base_url.rstrip("/"), token, expires.isoformat())
+
+    def pair_device(self, pairing_token: str, device_name: str, requested_device_id: str | None = None) -> dict[str, Any]:
+        if not device_name.strip():
+            raise ValidationError("device_name is required")
+        if requested_device_id:
+            try:
+                uuid.UUID(requested_device_id.strip())
+            except ValueError as exc:
+                raise ValidationError("device_id must be a UUID") from exc
+        now = utc_now()
+        with self._write_connection() as connection:
+            row = connection.execute(
+                "SELECT expires_at, used_at FROM pairing_tokens WHERE token_hash=?", (token_hash(pairing_token),)
+            ).fetchone()
+            if not row or row["used_at"] or str(row["expires_at"]) < now:
+                raise AuthenticationError("Pairing token is invalid or expired")
+            connection.execute("UPDATE pairing_tokens SET used_at=? WHERE token_hash=?", (now, token_hash(pairing_token)))
+        return self._register_device(device_name, requested_device_id)
 
     def authenticate(self, access_token: str) -> dict[str, str]:
         candidate = token_hash(access_token)
@@ -387,12 +489,18 @@ class MobileSyncStore:
                 old = existing.get(recipe_id)
                 if old and old["content_hash"] == content_hash and old["deleted_at"] is None:
                     continue
-                revision = self._record_change(connection, "recipe", recipe_id, "upsert", payload)
+                published = bool(old["published"]) if old is not None else True
+                public_payload = {**payload, "published": published}
+                revision = (
+                    self._record_change(connection, "recipe", recipe_id, "upsert", public_payload)
+                    if published else int(old["revision"])
+                )
                 connection.execute(
-                    "INSERT INTO recipes VALUES (?, ?, ?, ?, ?, NULL, ?) ON CONFLICT(id) DO UPDATE SET "
+                    "INSERT INTO recipes(id,output_folder,payload_json,content_hash,updated_at,deleted_at,revision,published) "
+                    "VALUES (?, ?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(id) DO UPDATE SET "
                     "output_folder=excluded.output_folder,payload_json=excluded.payload_json,"
                     "content_hash=excluded.content_hash,updated_at=excluded.updated_at,deleted_at=NULL,revision=excluded.revision",
-                    (recipe_id, str(folder), _canonical_json(payload), content_hash, now, revision),
+                    (recipe_id, str(folder), _canonical_json(payload), content_hash, now, revision, int(published)),
                 )
                 for asset in assets:
                     connection.execute(
@@ -404,14 +512,36 @@ class MobileSyncStore:
             for recipe_id, old in existing.items():
                 if recipe_id in chosen or old["deleted_at"] is not None:
                     continue
-                payload = {"schema_version": SCHEMA_VERSION, "id": recipe_id, "deleted_at": now}
-                revision = self._record_change(connection, "recipe", recipe_id, "delete", payload)
+                revision = int(old["revision"])
+                if bool(old["published"]):
+                    payload = {"schema_version": SCHEMA_VERSION, "id": recipe_id, "deleted_at": now}
+                    revision = self._record_change(connection, "recipe", recipe_id, "delete", payload)
                 connection.execute(
                     "UPDATE recipes SET deleted_at=?,updated_at=?,revision=? WHERE id=?",
                     (now, now, revision, recipe_id),
                 )
                 deleted += 1
         return {"indexed": len(chosen), "changed": changed, "deleted": deleted, "duplicates": duplicates}
+
+    def set_recipe_publications(self, updates: dict[str, bool]) -> int:
+        changed = 0
+        with self._write_connection() as connection:
+            now = utc_now()
+            for recipe_id, published in updates.items():
+                row = connection.execute(
+                    "SELECT * FROM recipes WHERE id=? AND deleted_at IS NULL", (str(recipe_id),)
+                ).fetchone()
+                if row is None or bool(row["published"]) == bool(published):
+                    continue
+                payload = json.loads(str(row["payload_json"]))
+                payload["published"] = bool(published)
+                revision = self._record_change(connection, "recipe", str(recipe_id), "upsert", payload)
+                connection.execute(
+                    "UPDATE recipes SET published=?,updated_at=?,revision=? WHERE id=?",
+                    (int(bool(published)), now, revision, str(recipe_id)),
+                )
+                changed += 1
+        return changed
 
     # Binary assets
     def store_asset(self, digest: str, content: bytes, mime_type: str) -> dict[str, Any]:
@@ -482,6 +612,356 @@ class MobileSyncStore:
             "outcome": outcome or None, "rating": rating, "notes": notes, "photo_sha256": photo,
         }
 
+    @staticmethod
+    def _order_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "id": str(row["id"]),
+            "status": str(row["status"]),
+            "version": int(row["version"]),
+            "epoch": int(row["epoch"]),
+            "created_at": str(row["created_at"]),
+            "completed_at": row["completed_at"],
+        }
+
+    @staticmethod
+    def _selection_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "order_id": str(row["order_id"]),
+            "device_id": str(row["device_id"]),
+            "device_name": str(row["device_name"]),
+            "recipe_id": str(row["recipe_id"]),
+            "quantity": float(row["quantity"]),
+            "note": str(row["note"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    @staticmethod
+    def _dish_state_payload(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "order_id": str(row["order_id"]),
+            "recipe_id": str(row["recipe_id"]),
+            "sort_order": int(row["sort_order"]),
+            "completed": bool(row["completed"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def _active_order_row(self, connection: sqlite3.Connection) -> sqlite3.Row | None:
+        return connection.execute("SELECT * FROM meal_orders WHERE status='active' LIMIT 1").fetchone()
+
+    def _create_order(self, connection: sqlite3.Connection) -> sqlite3.Row:
+        order_id = str(uuid.uuid4())
+        now = utc_now()
+        connection.execute(
+            "INSERT INTO meal_orders VALUES (?, 'active', 1, 1, ?, NULL)",
+            (order_id, now),
+        )
+        row = connection.execute("SELECT * FROM meal_orders WHERE id=?", (order_id,)).fetchone()
+        self._record_change(connection, "meal_order", order_id, "upsert", self._order_payload(row))
+        return row
+
+    def current_meal_order(self, *, create: bool = True) -> dict[str, Any] | None:
+        with self._write_connection() as connection:
+            order = self._active_order_row(connection)
+            if order is None and create:
+                order = self._create_order(connection)
+            if order is None:
+                return None
+            return self._meal_snapshot(connection, order)
+
+    def _meal_snapshot(self, connection: sqlite3.Connection, order: sqlite3.Row) -> dict[str, Any]:
+        selections = connection.execute(
+            "SELECT s.*,d.name AS device_name FROM meal_selections s JOIN devices d ON d.id=s.device_id "
+            "WHERE s.order_id=? ORDER BY s.updated_at,s.recipe_id",
+            (order["id"],),
+        ).fetchall()
+        states = connection.execute(
+            "SELECT * FROM meal_dish_states WHERE order_id=? ORDER BY sort_order,recipe_id",
+            (order["id"],),
+        ).fetchall()
+        return {
+            "order": self._order_payload(order),
+            "selections": [self._selection_payload(row) for row in selections],
+            "dish_states": [self._dish_state_payload(row) for row in states],
+        }
+
+    def _validate_meal_target(
+        self, connection: sqlite3.Connection, operation: dict[str, Any]
+    ) -> tuple[sqlite3.Row | None, dict[str, Any] | None]:
+        active = self._active_order_row(connection)
+        requested_id = str(operation.get("order_id") or "")
+        try:
+            requested_epoch = int(operation.get("epoch"))
+        except (TypeError, ValueError):
+            raise ValidationError("Meal operations require an integer epoch")
+        if active is None:
+            return None, {"status": "conflict", "reason": "order_completed", "message": "本餐已结束"}
+        if requested_id != str(active["id"]) or requested_epoch != int(active["epoch"]):
+            requested = connection.execute("SELECT status FROM meal_orders WHERE id=?", (requested_id,)).fetchone()
+            if requested is not None and str(requested["status"]) == "completed":
+                return None, {
+                    "status": "conflict", "reason": "order_completed",
+                    "message": "本餐已结束，请在新本餐中重新选择",
+                    "current_order": self._order_payload(active),
+                }
+            return None, {
+                "status": "conflict",
+                "reason": "stale_order",
+                "message": "本餐已清空或结束，请刷新后重新选择",
+                "current_order": self._order_payload(active),
+            }
+        return active, None
+
+    def _meal_selection_row(
+        self, connection: sqlite3.Connection, order_id: str, device_id: str, recipe_id: str
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT s.*,d.name AS device_name FROM meal_selections s JOIN devices d ON d.id=s.device_id "
+            "WHERE s.order_id=? AND s.device_id=? AND s.recipe_id=?",
+            (order_id, device_id, recipe_id),
+        ).fetchone()
+
+    def _record_selection_delete(
+        self, connection: sqlite3.Connection, order_id: str, device_id: str, recipe_id: str
+    ) -> None:
+        entity_id = f"{order_id}:{device_id}:{recipe_id}"
+        self._record_change(
+            connection,
+            "meal_selection",
+            entity_id,
+            "delete",
+            {"order_id": order_id, "device_id": device_id, "recipe_id": recipe_id},
+        )
+
+    def _ensure_dish_state(self, connection: sqlite3.Connection, order_id: str, recipe_id: str) -> None:
+        if connection.execute(
+            "SELECT 1 FROM meal_dish_states WHERE order_id=? AND recipe_id=?", (order_id, recipe_id)
+        ).fetchone():
+            return
+        next_order = int(connection.execute(
+            "SELECT COALESCE(MAX(sort_order),-1)+1 FROM meal_dish_states WHERE order_id=?", (order_id,)
+        ).fetchone()[0])
+        now = utc_now()
+        connection.execute(
+            "INSERT INTO meal_dish_states VALUES (?,?,?,?,?)", (order_id, recipe_id, next_order, 0, now)
+        )
+        row = connection.execute(
+            "SELECT * FROM meal_dish_states WHERE order_id=? AND recipe_id=?", (order_id, recipe_id)
+        ).fetchone()
+        self._record_change(
+            connection, "meal_dish_state", f"{order_id}:{recipe_id}", "upsert", self._dish_state_payload(row)
+        )
+
+    def _apply_meal_operation(
+        self, connection: sqlite3.Connection, device_id: str, operation: dict[str, Any], op_id: str
+    ) -> dict[str, Any]:
+        action = str(operation.get("action") or "")
+        allowed = {
+            "add_quantity", "set_quantity", "set_note", "remove_selection",
+            "set_dish_completed", "clear_order", "complete_order", "load_plan",
+        }
+        if action not in allowed:
+            raise ValidationError(f"Unsupported meal action: {action}")
+        order, conflict = self._validate_meal_target(connection, operation)
+        if conflict:
+            return {"op_id": op_id, **conflict}
+        assert order is not None
+        order_id = str(order["id"])
+        epoch = int(order["epoch"])
+        now = utc_now()
+
+        if action in {"clear_order", "complete_order"}:
+            old_selections = connection.execute(
+                "SELECT device_id,recipe_id FROM meal_selections WHERE order_id=?", (order_id,)
+            ).fetchall()
+            old_states = connection.execute(
+                "SELECT recipe_id FROM meal_dish_states WHERE order_id=?", (order_id,)
+            ).fetchall()
+            for row in old_selections:
+                self._record_selection_delete(connection, order_id, str(row["device_id"]), str(row["recipe_id"]))
+            for row in old_states:
+                recipe_id = str(row["recipe_id"])
+                self._record_change(
+                    connection, "meal_dish_state", f"{order_id}:{recipe_id}", "delete",
+                    {"order_id": order_id, "recipe_id": recipe_id},
+                )
+            connection.execute("DELETE FROM meal_selections WHERE order_id=?", (order_id,))
+            connection.execute("DELETE FROM meal_dish_states WHERE order_id=?", (order_id,))
+            if action == "clear_order":
+                connection.execute(
+                    "UPDATE meal_orders SET epoch=epoch+1,version=version+1 WHERE id=?", (order_id,)
+                )
+                updated = connection.execute("SELECT * FROM meal_orders WHERE id=?", (order_id,)).fetchone()
+                self._record_change(connection, "meal_order", order_id, "upsert", self._order_payload(updated))
+                return {"op_id": op_id, "status": "accepted", "order": self._order_payload(updated)}
+            connection.execute(
+                "UPDATE meal_orders SET status='completed',version=version+1,completed_at=? WHERE id=?", (now, order_id)
+            )
+            updated = connection.execute("SELECT * FROM meal_orders WHERE id=?", (order_id,)).fetchone()
+            self._record_change(connection, "meal_order", order_id, "upsert", self._order_payload(updated))
+            return {"op_id": op_id, "status": "accepted", "order": self._order_payload(updated)}
+
+        if action == "load_plan":
+            plan_id = str(operation.get("plan_id") or "")
+            plan = connection.execute(
+                "SELECT payload_json FROM meal_plans WHERE id=? AND deleted_at IS NULL", (plan_id,)
+            ).fetchone()
+            if plan is None:
+                raise ValidationError("Meal plan not found")
+            items = json.loads(str(plan["payload_json"])).get("items") or []
+            loaded = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                recipe_id = str(item.get("recipe_id") or "")
+                if not recipe_id:
+                    continue
+                quantity = max(0.25, min(20.0, float(item.get("servings_multiplier") or 1)))
+                note = str(item.get("note") or "")[:500]
+                connection.execute(
+                    "INSERT INTO meal_selections VALUES (?,?,?,?,?,?) ON CONFLICT(order_id,device_id,recipe_id) "
+                    "DO UPDATE SET quantity=excluded.quantity,note=excluded.note,updated_at=excluded.updated_at",
+                    (order_id, device_id, recipe_id, quantity, note, now),
+                )
+                row = self._meal_selection_row(connection, order_id, device_id, recipe_id)
+                self._record_change(
+                    connection, "meal_selection", f"{order_id}:{device_id}:{recipe_id}", "upsert",
+                    self._selection_payload(row),
+                )
+                self._ensure_dish_state(connection, order_id, recipe_id)
+                loaded += 1
+            return {"op_id": op_id, "status": "accepted", "loaded": loaded, "order_id": order_id, "epoch": epoch}
+
+        recipe_id = str(operation.get("recipe_id") or "")
+        recipe_row = connection.execute(
+            "SELECT published FROM recipes WHERE id=? AND deleted_at IS NULL", (recipe_id,)
+        ).fetchone() if recipe_id else None
+        if recipe_row is None:
+            raise ValidationError("Meal operation references an unknown recipe")
+        target_device = str(operation.get("device_id") or device_id)
+        if connection.execute(
+            "SELECT 1 FROM devices WHERE id=? AND revoked_at IS NULL", (target_device,)
+        ).fetchone() is None:
+            raise ValidationError("Target device is unknown or revoked")
+        existing = self._meal_selection_row(connection, order_id, target_device, recipe_id)
+        if not bool(recipe_row["published"]) and existing is None and action in {"add_quantity", "set_quantity"}:
+            return {"op_id": op_id, "status": "conflict", "reason": "recipe_unpublished"}
+
+        if action == "set_dish_completed":
+            completed = bool(operation.get("completed"))
+            self._ensure_dish_state(connection, order_id, recipe_id)
+            connection.execute(
+                "UPDATE meal_dish_states SET completed=?,updated_at=? WHERE order_id=? AND recipe_id=?",
+                (int(completed), now, order_id, recipe_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM meal_dish_states WHERE order_id=? AND recipe_id=?", (order_id, recipe_id)
+            ).fetchone()
+            payload = self._dish_state_payload(row)
+            self._record_change(connection, "meal_dish_state", f"{order_id}:{recipe_id}", "upsert", payload)
+            return {"op_id": op_id, "status": "accepted", "dish_state": payload}
+
+        if action == "remove_selection":
+            if existing:
+                connection.execute(
+                    "DELETE FROM meal_selections WHERE order_id=? AND device_id=? AND recipe_id=?",
+                    (order_id, target_device, recipe_id),
+                )
+                self._record_selection_delete(connection, order_id, target_device, recipe_id)
+            remaining = connection.execute(
+                "SELECT 1 FROM meal_selections WHERE order_id=? AND recipe_id=? LIMIT 1", (order_id, recipe_id)
+            ).fetchone()
+            if not remaining:
+                connection.execute(
+                    "DELETE FROM meal_dish_states WHERE order_id=? AND recipe_id=?", (order_id, recipe_id)
+                )
+                self._record_change(
+                    connection, "meal_dish_state", f"{order_id}:{recipe_id}", "delete",
+                    {"order_id": order_id, "recipe_id": recipe_id},
+                )
+            return {"op_id": op_id, "status": "accepted", "removed": bool(existing)}
+
+        current_quantity = float(existing["quantity"]) if existing else 0.0
+        if action == "add_quantity":
+            quantity = current_quantity + float(operation.get("quantity") or 0)
+        elif action == "set_quantity":
+            quantity = float(operation.get("quantity") or 0)
+        else:
+            quantity = current_quantity
+        if action == "set_note" and existing is None:
+            raise ValidationError("Cannot add a note before selecting the dish")
+        if quantity <= 0 and action != "set_note":
+            return self._apply_meal_operation(
+                connection, device_id,
+                {**operation, "action": "remove_selection", "device_id": target_device}, op_id,
+            )
+        if quantity > 20:
+            raise ValidationError("quantity must not exceed 20")
+        note = str(operation.get("note") if action == "set_note" else (existing["note"] if existing else ""))[:500]
+        connection.execute(
+            "INSERT INTO meal_selections VALUES (?,?,?,?,?,?) ON CONFLICT(order_id,device_id,recipe_id) "
+            "DO UPDATE SET quantity=excluded.quantity,note=excluded.note,updated_at=excluded.updated_at",
+            (order_id, target_device, recipe_id, quantity, note, now),
+        )
+        row = self._meal_selection_row(connection, order_id, target_device, recipe_id)
+        payload = self._selection_payload(row)
+        self._record_change(
+            connection, "meal_selection", f"{order_id}:{target_device}:{recipe_id}", "upsert", payload
+        )
+        self._ensure_dish_state(connection, order_id, recipe_id)
+        return {"op_id": op_id, "status": "accepted", "selection": payload}
+
+    def _apply_meal_plan_operation(
+        self, connection: sqlite3.Connection, device_id: str, operation: dict[str, Any], op_id: str
+    ) -> dict[str, Any]:
+        del device_id
+        action = str(operation.get("action") or "")
+        if action not in {"upsert", "delete"}:
+            raise ValidationError("Meal plan action must be upsert or delete")
+        payload = dict(operation.get("payload") or {})
+        entity_id = str(payload.get("id") or operation.get("entity_id") or "").strip()
+        if not entity_id or len(entity_id) > 80:
+            raise ValidationError("Meal plan id is required")
+        existing = connection.execute("SELECT * FROM meal_plans WHERE id=?", (entity_id,)).fetchone()
+        base_version = int(operation.get("base_version") or 0)
+        if existing is not None and int(existing["version"]) != base_version:
+            return {
+                "op_id": op_id, "status": "conflict", "reason": "version_mismatch",
+                "server": json.loads(str(existing["payload_json"])),
+            }
+        if existing is None and base_version:
+            return {"op_id": op_id, "status": "conflict", "reason": "missing_server_record"}
+        now = utc_now()
+        version = base_version + 1
+        if action == "delete":
+            if existing is None:
+                return {"op_id": op_id, "status": "accepted", "entity_id": entity_id, "version": 0}
+            deleted = {**json.loads(str(existing["payload_json"])), "version": version, "deleted_at": now}
+            connection.execute(
+                "UPDATE meal_plans SET payload_json=?,version=?,updated_at=?,deleted_at=? WHERE id=?",
+                (_canonical_json(deleted), version, now, now, entity_id),
+            )
+            self._record_change(connection, "meal_plan", entity_id, "delete", deleted)
+            return {"op_id": op_id, "status": "accepted", "entity_id": entity_id, "version": version}
+        name = str(payload.get("name") or "").strip()
+        items = payload.get("items")
+        if not name or not isinstance(items, list) or not items:
+            raise ValidationError("Meal plan requires a name and at least one item")
+        created_at = str(existing["created_at"]) if existing else now
+        clean = {
+            **payload, "id": entity_id, "name": name[:120], "items": items,
+            "version": version, "created_at": created_at, "updated_at": now, "deleted_at": None,
+        }
+        connection.execute(
+            "INSERT INTO meal_plans VALUES (?,?,?,?,?,NULL) ON CONFLICT(id) DO UPDATE SET "
+            "payload_json=excluded.payload_json,version=excluded.version,updated_at=excluded.updated_at,deleted_at=NULL",
+            (entity_id, _canonical_json(clean), version, created_at, now),
+        )
+        self._record_change(connection, "meal_plan", entity_id, "upsert", clean)
+        return {"op_id": op_id, "status": "accepted", "entity_id": entity_id, "version": version}
+
     def _apply_operation(self, connection: sqlite3.Connection, device_id: str, operation: dict[str, Any]) -> dict[str, Any]:
         try:
             op_id = str(uuid.UUID(str(operation.get("op_id") or "")))
@@ -494,8 +974,23 @@ class MobileSyncStore:
             if str(receipt["device_id"]) != device_id:
                 raise ValidationError("op_id was already used by another device")
             return json.loads(str(receipt["result_json"]))
+        entity_type = str(operation.get("entity_type") or "")
+        if entity_type in {"meal_order", "meal_selection", "meal_dish_state"}:
+            result = self._apply_meal_operation(connection, device_id, operation, op_id)
+            connection.execute(
+                "INSERT INTO operation_receipts VALUES (?,?,?,?)",
+                (op_id, device_id, _canonical_json(result), utc_now()),
+            )
+            return result
+        if entity_type == "meal_plan":
+            result = self._apply_meal_plan_operation(connection, device_id, operation, op_id)
+            connection.execute(
+                "INSERT INTO operation_receipts VALUES (?,?,?,?)",
+                (op_id, device_id, _canonical_json(result), utc_now()),
+            )
+            return result
         if operation.get("entity_type") != "practice_log":
-            raise ValidationError("Only practice_log operations are supported")
+            raise ValidationError("Unsupported entity_type")
         action = str(operation.get("action") or "")
         if action not in {"upsert", "delete", "resolve_conflict"}:
             raise ValidationError("action must be upsert, delete, or resolve_conflict")
@@ -617,34 +1112,99 @@ class MobileSyncStore:
         )
         return result
 
-    def sync(self, device_id: str, cursor: int, operations: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    def sync(
+        self,
+        device_id: str,
+        cursor: int,
+        operations: Iterable[dict[str, Any]],
+        capabilities: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
         operation_list = list(operations)
         if len(operation_list) > MAX_SYNC_OPERATIONS:
             raise ValidationError(f"A sync request accepts at most {MAX_SYNC_OPERATIONS} operations")
         if cursor < 0:
             raise ValidationError("cursor cannot be negative")
+        requested = set(capabilities) if capabilities is not None else set(LEGACY_CAPABILITIES)
+        unknown = requested - SUPPORTED_CAPABILITIES
+        if unknown:
+            raise ValidationError(f"Unsupported capabilities: {', '.join(sorted(unknown))}")
         with self._write_connection() as connection:
+            if requested & {"meal_order", "meal_selection", "meal_dish_state"}:
+                if self._active_order_row(connection) is None:
+                    self._create_order(connection)
             results = [self._apply_operation(connection, device_id, operation) for operation in operation_list]
-            rows = connection.execute(
-                "SELECT * FROM change_log WHERE revision>? ORDER BY revision LIMIT ?",
-                (cursor, MAX_SYNC_CHANGES + 1),
-            ).fetchall()
-            visible = rows[:MAX_SYNC_CHANGES]
-            changes = [
-                {
-                    "revision": int(row["revision"]), "entity_type": str(row["entity_type"]),
-                    "entity_id": str(row["entity_id"]), "action": str(row["action"]),
-                    "payload": json.loads(str(row["payload_json"])),
-                }
-                for row in visible
-            ]
-            return {
+            bootstrap = cursor == 0 and capabilities is not None and "recipe" in requested
+            if bootstrap:
+                revision = int(connection.execute("SELECT value FROM meta WHERE key='revision'").fetchone()[0])
+                changes: list[dict[str, Any]] = []
+
+                def add_snapshot(entity_type: str, payload: dict[str, Any]) -> None:
+                    changes.append({
+                        "revision": revision,
+                        "entity_type": entity_type,
+                        "entity_id": str(payload.get("id") or payload.get("order_id") or ""),
+                        "action": "upsert",
+                        "payload": payload,
+                    })
+
+                if "recipe" in requested:
+                    for row in connection.execute(
+                        "SELECT payload_json,published FROM recipes WHERE deleted_at IS NULL ORDER BY updated_at DESC"
+                    ):
+                        payload = json.loads(str(row["payload_json"]))
+                        payload["published"] = bool(row["published"])
+                        add_snapshot("recipe", payload)
+                if "practice_log" in requested:
+                    for row in connection.execute("SELECT * FROM practice_logs WHERE deleted_at IS NULL ORDER BY cooked_on DESC,created_at DESC"):
+                        add_snapshot("practice_log", self._practice_payload(row))
+                if "meal_plan" in requested:
+                    for row in connection.execute("SELECT payload_json FROM meal_plans WHERE deleted_at IS NULL ORDER BY updated_at DESC"):
+                        add_snapshot("meal_plan", json.loads(str(row["payload_json"])))
+                visible = changes
+                has_more = False
+                next_cursor = revision
+            else:
+                placeholders = ",".join("?" for _ in requested)
+                rows = connection.execute(
+                    f"SELECT * FROM change_log WHERE revision>? AND entity_type IN ({placeholders}) "
+                    "ORDER BY revision LIMIT ?",
+                    (cursor, *sorted(requested), MAX_SYNC_CHANGES + 1),
+                ).fetchall() if requested else []
+                visible = [
+                    {
+                        "revision": int(row["revision"]), "entity_type": str(row["entity_type"]),
+                        "entity_id": str(row["entity_id"]), "action": str(row["action"]),
+                        "payload": json.loads(str(row["payload_json"])),
+                    }
+                    for row in rows[:MAX_SYNC_CHANGES]
+                ]
+                has_more = len(rows) > MAX_SYNC_CHANGES
+                next_cursor = int(visible[-1]["revision"]) if visible else int(
+                    connection.execute("SELECT value FROM meta WHERE key='revision'").fetchone()[0]
+                )
+            response = {
                 "schema_version": SCHEMA_VERSION,
                 "operation_results": results,
-                "changes": changes,
-                "next_cursor": int(visible[-1]["revision"]) if visible else cursor,
-                "has_more": len(rows) > MAX_SYNC_CHANGES,
+                "changes": visible,
+                "next_cursor": next_cursor,
+                "has_more": has_more,
+                "capabilities": sorted(requested),
+                "capability_key": hashlib.sha256(",".join(sorted(requested)).encode()).hexdigest()[:16],
             }
+            if bootstrap:
+                response["bootstrap"] = True
+            if requested & {"meal_order", "meal_selection", "meal_dish_state"}:
+                order = self._active_order_row(connection)
+                response["meal"] = self._meal_snapshot(connection, order) if order else None
+            return response
+
+    def list_meal_plans(self, include_deleted: bool = False) -> list[dict[str, Any]]:
+        where = "" if include_deleted else "WHERE deleted_at IS NULL"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT payload_json FROM meal_plans {where} ORDER BY updated_at DESC"
+            ).fetchall()
+        return [json.loads(str(row["payload_json"])) for row in rows]
 
     def list_practice_logs(self, recipe_id: str | None = None, include_deleted: bool = False) -> list[dict[str, Any]]:
         clauses: list[str] = []
@@ -665,7 +1225,7 @@ class MobileSyncStore:
         where = "" if include_deleted else "WHERE deleted_at IS NULL"
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT id,payload_json,updated_at,deleted_at FROM recipes {where}"
+                f"SELECT id,payload_json,updated_at,deleted_at,published FROM recipes {where}"
             ).fetchall()
         result = []
         for row in rows:
@@ -673,8 +1233,10 @@ class MobileSyncStore:
             result.append({
                 "id": str(row["id"]),
                 "title": str(payload.get("title") or row["id"]),
+                "category": str(payload.get("category") or ""),
                 "updated_at": str(row["updated_at"]),
                 "deleted_at": row["deleted_at"],
+                "published": bool(row["published"]),
             })
         return sorted(result, key=lambda item: item["title"])
 
@@ -710,8 +1272,15 @@ class MobileSyncStore:
     def list_recipes(self, include_deleted: bool = False) -> list[dict[str, Any]]:
         where = "" if include_deleted else "WHERE deleted_at IS NULL"
         with self._connect() as connection:
-            rows = connection.execute(f"SELECT payload_json FROM recipes {where} ORDER BY updated_at DESC").fetchall()
-        return [json.loads(str(row["payload_json"])) for row in rows]
+            rows = connection.execute(
+                f"SELECT payload_json,published FROM recipes {where} ORDER BY updated_at DESC"
+            ).fetchall()
+        result = []
+        for row in rows:
+            payload = json.loads(str(row["payload_json"]))
+            payload["published"] = bool(row["published"])
+            result.append(payload)
+        return result
 
     def list_conflicts(self, open_only: bool = True) -> list[dict[str, Any]]:
         where = "WHERE resolved_at IS NULL" if open_only else ""
