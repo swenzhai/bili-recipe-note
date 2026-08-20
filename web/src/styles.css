@@ -2,7 +2,12 @@
 
 .recipe{display:grid;grid-template-columns:88px minmax(0,1fr) 42px;gap:12px;padding:10px}
 .recipeInfo{min-width:0}
+.recipe.recommendedDish{border-color:rgba(196,73,50,.55);box-shadow:inset 3px 0 0 var(--red);background:#fff7eb}
+.recipeTitle{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:7px}
+.recipeTitle b{margin:0}
+.recipeTitle span{background:var(--red);color:#fff;padding:3px 7px;border-radius:999px;font-size:10px;font-weight:800;letter-spacing:.04em}
 .recipe>button:last-child{width:42px;height:42px;padding:0;font-size:22px}
+.recipe>button:last-child:disabled{cursor:not-allowed;opacity:.32}
 .dishThumbnail{width:88px;aspect-ratio:4/3;overflow:hidden;background:#e8e3d9;border:1px solid rgba(40,34,27,.08)}
 .dishThumbnail img{display:block;width:100%;height:100%;object-fit:cover}
 .mealDish{display:grid;grid-template-columns:88px minmax(0,1fr) auto;gap:12px;align-items:start;padding:10px}
@@ -16,6 +21,54 @@
 .categoryBar button.active small{background:rgba(255,255,255,.18)}
 .menuSummary{display:flex;align-items:center;justify-content:space-between;color:var(--muted);font-size:12px;padding:1px 2px}
 .menuSummary b{color:var(--ink);font-size:14px}
+.mealLoading button{border:0;background:var(--deep);color:#fff;padding:10px 16px}
+.phaseNotice{padding:11px 13px;background:#eee5d5;border-left:3px solid var(--red);color:var(--muted);font-size:13px;line-height:1.5}
+.phasePanel{background:var(--deep);color:#fff;padding:16px;margin-bottom:2px}
+.phasePanel p{margin:14px 0 0;color:rgba(255,255,255,.72);font-size:13px;line-height:1.65}
+.phaseHeader{display:flex;justify-content:space-between;align-items:center;font-size:13px;color:rgba(255,255,255,.7)}
+.phaseHeader b{color:#fff}
+.phaseHeader>div{display:flex;align-items:center;gap:9px}
+.phaseHeader button{border:1px solid rgba(255,255,255,.3);background:transparent;color:#fff;padding:4px 8px}
+.phaseSteps{display:grid;grid-template-columns:repeat(4,1fr);list-style:none;padding:0;margin:16px 0 0;position:relative}
+.phaseSteps:before{content:"";position:absolute;left:12.5%;right:12.5%;top:13px;height:2px;background:rgba(255,255,255,.18)}
+.phaseSteps li{display:grid;justify-items:center;gap:6px;position:relative;color:rgba(255,255,255,.45);font-size:12px}
+.phaseSteps i{display:grid;place-items:center;width:28px;height:28px;border-radius:50%;background:#526158;border:2px solid #526158;color:#fff;font-style:normal;font-weight:700}
+.phaseSteps li.active,.phaseSteps li.complete{color:#fff}
+.phaseSteps li.active i{background:var(--red);border-color:#ef8a73}
+.phaseSteps li.complete i{background:#4b8364;border-color:#78a88c}
+.dishHeading{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap}
+.dishHeading span{font-size:11px;color:#2d7354;background:#e2efe6;padding:4px 7px;white-space:nowrap}
+.dishHeading .guestDishStatus{color:var(--muted);background:#eee5d5}
+.dishHeading .guestDishStatus.done{color:#2d7354;background:#e2efe6}
+.dishStageAction{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}
+.mealDish.stageDone{border-color:rgba(45,115,84,.45);background:#f4faF4}
+.stageContent{grid-column:1/-1;margin-top:12px;padding-top:12px;border-top:1px solid var(--line);font-size:13px;line-height:1.6}
+.stageContent h3{font-size:13px;margin:0 0 7px;color:var(--red)}
+.stageContent p{margin:4px 0;color:var(--muted)}
+.stageContent ul,.stageContent ol{margin:5px 0;padding-left:20px}
+.stageContent li{padding:3px 0}
+.stageContent ol li{padding:7px 0;border-bottom:1px solid var(--line)}
+.stageContent ol li:last-child{border-bottom:0}
+.stageContent ol span,.stageContent ol small{display:block;color:var(--muted);margin-top:2px}
+.stageContent summary{cursor:pointer;color:var(--deep);font-weight:700;margin-top:8px}
+.cookingSteps>summary{padding:8px 10px;background:#eee5d5}
+.servingInfo{font-size:14px}
+.stageToggle{border:0;background:var(--deep);color:#fff;padding:10px 12px;min-width:88px}
+.stageToggle.done{background:#4b8364}
+.stageToggle:disabled,.phaseFooter button:disabled,.mealActions button:disabled{cursor:wait;opacity:.58}
+.phaseFooter{position:sticky;bottom:68px;z-index:3;display:grid;gap:5px;padding:12px;background:rgba(245,239,227,.96);border:1px solid var(--line);box-shadow:0 -8px 20px rgba(40,34,27,.08)}
+.phaseFooter .primaryAction{border:0;background:var(--red);color:#fff;padding:14px;font-weight:800}
+.phaseFooter .findNextAction{border:1px solid var(--deep);background:#fffaf1;color:var(--deep);padding:13px;font-weight:800}
+.phaseFooter small{text-align:center;color:var(--muted)}
+.guestFooter{position:sticky;bottom:68px;z-index:3;display:flex;justify-content:space-between;gap:12px;align-items:center;padding:13px;background:rgba(40,58,50,.96);color:#fff;box-shadow:0 -8px 20px rgba(40,34,27,.08)}
+.guestFooter span{font-size:12px;color:rgba(255,255,255,.72);text-align:right}
+.historyModal .historyMeal{border:1px solid var(--line);background:#fffaf1;padding:14px;margin:10px 0}
+.historyMeal h2{font-size:17px;margin:0 0 5px}
+.historyMeal>small{color:var(--muted)}
+.historyMeal>div{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-top:1px solid var(--line);font-size:13px}
+.historyMeal>div:first-of-type{margin-top:10px}
+.historyMeal span{color:var(--muted);text-align:right}
+.historyError{color:var(--red)}
 
 @media (max-width:520px){
   .shell{padding-left:12px;padding-right:12px}
@@ -23,4 +76,9 @@
   .dishThumbnail{width:72px}
   .mealDish{grid-template-columns:72px minmax(0,1fr)}
   .mealDish .controls{grid-column:2;justify-content:flex-start}
+  .dishStageAction{width:100%;justify-content:space-between}
+  .dishStageAction .stageToggle{flex:1}
+  .guestFooter{display:grid;text-align:center}
+  .guestFooter span{text-align:center}
+  .phasePanel{margin-left:-1px;margin-right:-1px}
 }

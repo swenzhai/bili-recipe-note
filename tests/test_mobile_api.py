@@ -26,6 +26,10 @@ def test_health_pair_auth_and_asset_roundtrip(tmp_path: Path) -> None:
         headers = {"Authorization": f"Bearer {paired.json()['access_token']}"}
         assert client.post("/api/v1/sync", json={"cursor": 0, "operations": []}).status_code == 401
         assert client.post("/api/v1/sync", headers=headers, json={"cursor": 0, "operations": []}).status_code == 200
+        assert client.get("/api/v1/meal-history").status_code == 401
+        history = client.get("/api/v1/meal-history", headers=headers)
+        assert history.status_code == 200
+        assert history.json() == {"meals": []}
 
         compressed = client.post(
             "/api/v1/sync",

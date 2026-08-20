@@ -69,7 +69,7 @@ def create_app(
                 with suppress(asyncio.CancelledError):
                     await task
 
-    app = FastAPI(title="Bili Recipe Notes Mobile API", version=str(PROTOCOL_VERSION), lifespan=lifespan)
+    app = FastAPI(title="Chef Zhai Family Kitchen API", version=str(PROTOCOL_VERSION), lifespan=lifespan)
     app.add_middleware(GZipMiddleware, minimum_size=1000)
     app.state.store = store
 
@@ -155,6 +155,14 @@ def create_app(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    @app.get("/api/v1/meal-history")
+    def meal_history(
+        limit: int = 20,
+        device: dict[str, Any] = Depends(authenticated_device),
+    ) -> dict[str, Any]:
+        del device
+        return {"meals": store.list_meal_history(limit)}
 
     @app.put("/api/v1/assets/{digest}")
     async def upload_asset(

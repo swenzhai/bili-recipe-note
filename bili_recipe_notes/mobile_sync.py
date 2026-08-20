@@ -22,7 +22,7 @@ from .storage import atomic_write_json
 
 
 SCHEMA_VERSION = 1
-DATABASE_SCHEMA_VERSION = 3
+DATABASE_SCHEMA_VERSION = 6
 PROTOCOL_VERSION = 2
 MAX_SYNC_OPERATIONS = 100
 MAX_SYNC_CHANGES = 200
@@ -169,7 +169,7 @@ class MobileSyncStore:
                 CREATE TABLE IF NOT EXISTS recipes (
                     id TEXT PRIMARY KEY, output_folder TEXT NOT NULL, payload_json TEXT NOT NULL,
                     content_hash TEXT NOT NULL, updated_at TEXT NOT NULL, deleted_at TEXT, revision INTEGER NOT NULL,
-                    published INTEGER NOT NULL DEFAULT 1
+                    published INTEGER NOT NULL DEFAULT 1, recommended INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS assets (
                     sha256 TEXT PRIMARY KEY, recipe_id TEXT, path TEXT NOT NULL, mime_type TEXT NOT NULL,
@@ -202,7 +202,8 @@ class MobileSyncStore:
                 );
                 CREATE TABLE IF NOT EXISTS meal_orders (
                     id TEXT PRIMARY KEY, status TEXT NOT NULL, version INTEGER NOT NULL, epoch INTEGER NOT NULL,
-                    created_at TEXT NOT NULL, completed_at TEXT
+                    created_at TEXT NOT NULL, completed_at TEXT, phase TEXT NOT NULL DEFAULT 'ordering',
+                    chef_device_id TEXT
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_single_active_meal
                     ON meal_orders(status) WHERE status='active';
@@ -216,6 +217,9 @@ class MobileSyncStore:
                 CREATE TABLE IF NOT EXISTS meal_dish_states (
                     order_id TEXT NOT NULL, recipe_id TEXT NOT NULL, sort_order INTEGER NOT NULL,
                     completed INTEGER NOT NULL, updated_at TEXT NOT NULL,
+                    prep_completed INTEGER NOT NULL DEFAULT 0,
+                    cook_completed INTEGER NOT NULL DEFAULT 0,
+                    served INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(order_id, recipe_id), FOREIGN KEY(order_id) REFERENCES meal_orders(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_meal_selections_order ON meal_selections(order_id, recipe_id);
@@ -224,6 +228,27 @@ class MobileSyncStore:
             recipe_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(recipes)")}
             if "published" not in recipe_columns:
                 connection.execute("ALTER TABLE recipes ADD COLUMN published INTEGER NOT NULL DEFAULT 1")
+            if "recommended" not in recipe_columns:
+                connection.execute("ALTER TABLE recipes ADD COLUMN recommended INTEGER NOT NULL DEFAULT 0")
+            order_columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(meal_orders)")}
+            if "phase" not in order_columns:
+                connection.execute("ALTER TABLE meal_orders ADD COLUMN phase TEXT NOT NULL DEFAULT 'ordering'")
+            if "chef_device_id" not in order_columns:
+                connection.execute("ALTER TABLE meal_orders ADD COLUMN chef_device_id TEXT")
+            dish_state_columns = {
+                str(row["name"]) for row in connection.execute("PRAGMA table_info(meal_dish_states)")
+            }
+            if "prep_completed" not in dish_state_columns:
+                connection.execute(
+                    "ALTER TABLE meal_dish_states ADD COLUMN prep_completed INTEGER NOT NULL DEFAULT 0"
+                )
+            if "cook_completed" not in dish_state_columns:
+                connection.execute(
+                    "ALTER TABLE meal_dish_states ADD COLUMN cook_completed INTEGER NOT NULL DEFAULT 0"
+                )
+                connection.execute("UPDATE meal_dish_states SET cook_completed=completed")
+            if "served" not in dish_state_columns:
+                connection.execute("ALTER TABLE meal_dish_states ADD COLUMN served INTEGER NOT NULL DEFAULT 0")
             connection.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
             connection.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('revision', '0')")
             connection.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('server_id', ?)", (str(uuid.uuid4()),))
@@ -490,17 +515,22 @@ class MobileSyncStore:
                 if old and old["content_hash"] == content_hash and old["deleted_at"] is None:
                     continue
                 published = bool(old["published"]) if old is not None else True
-                public_payload = {**payload, "published": published}
+                recommended = bool(old["recommended"]) if old is not None else False
+                public_payload = {**payload, "published": published, "recommended": recommended}
                 revision = (
                     self._record_change(connection, "recipe", recipe_id, "upsert", public_payload)
                     if published else int(old["revision"])
                 )
                 connection.execute(
-                    "INSERT INTO recipes(id,output_folder,payload_json,content_hash,updated_at,deleted_at,revision,published) "
-                    "VALUES (?, ?, ?, ?, ?, NULL, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                    "INSERT INTO recipes("
+                    "id,output_folder,payload_json,content_hash,updated_at,deleted_at,revision,published,recommended"
+                    ") VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
                     "output_folder=excluded.output_folder,payload_json=excluded.payload_json,"
                     "content_hash=excluded.content_hash,updated_at=excluded.updated_at,deleted_at=NULL,revision=excluded.revision",
-                    (recipe_id, str(folder), _canonical_json(payload), content_hash, now, revision, int(published)),
+                    (
+                        recipe_id, str(folder), _canonical_json(payload), content_hash, now, revision,
+                        int(published), int(recommended),
+                    ),
                 )
                 for asset in assets:
                     connection.execute(
@@ -524,21 +554,36 @@ class MobileSyncStore:
         return {"indexed": len(chosen), "changed": changed, "deleted": deleted, "duplicates": duplicates}
 
     def set_recipe_publications(self, updates: dict[str, bool]) -> int:
+        return self.set_recipe_menu_states({recipe_id: {"published": value} for recipe_id, value in updates.items()})
+
+    def set_recipe_recommendations(self, updates: dict[str, bool]) -> int:
+        return self.set_recipe_menu_states({recipe_id: {"recommended": value} for recipe_id, value in updates.items()})
+
+    def set_recipe_menu_states(self, updates: dict[str, dict[str, bool]]) -> int:
         changed = 0
         with self._write_connection() as connection:
             now = utc_now()
-            for recipe_id, published in updates.items():
+            for recipe_id, state in updates.items():
                 row = connection.execute(
                     "SELECT * FROM recipes WHERE id=? AND deleted_at IS NULL", (str(recipe_id),)
                 ).fetchone()
-                if row is None or bool(row["published"]) == bool(published):
+                if row is None:
+                    continue
+                published = bool(state.get("published", row["published"]))
+                recommended = bool(state.get("recommended", row["recommended"]))
+                if "published" in state and not published:
+                    recommended = False
+                elif recommended:
+                    published = True
+                if bool(row["published"]) == published and bool(row["recommended"]) == recommended:
                     continue
                 payload = json.loads(str(row["payload_json"]))
-                payload["published"] = bool(published)
+                payload["published"] = published
+                payload["recommended"] = recommended
                 revision = self._record_change(connection, "recipe", str(recipe_id), "upsert", payload)
                 connection.execute(
-                    "UPDATE recipes SET published=?,updated_at=?,revision=? WHERE id=?",
-                    (int(bool(published)), now, revision, str(recipe_id)),
+                    "UPDATE recipes SET published=?,recommended=?,updated_at=?,revision=? WHERE id=?",
+                    (int(published), int(recommended), now, revision, str(recipe_id)),
                 )
                 changed += 1
         return changed
@@ -618,6 +663,8 @@ class MobileSyncStore:
             "schema_version": SCHEMA_VERSION,
             "id": str(row["id"]),
             "status": str(row["status"]),
+            "phase": str(row["phase"]),
+            "chef_device_id": row["chef_device_id"],
             "version": int(row["version"]),
             "epoch": int(row["epoch"]),
             "created_at": str(row["created_at"]),
@@ -644,7 +691,10 @@ class MobileSyncStore:
             "order_id": str(row["order_id"]),
             "recipe_id": str(row["recipe_id"]),
             "sort_order": int(row["sort_order"]),
-            "completed": bool(row["completed"]),
+            "prep_completed": bool(row["prep_completed"]),
+            "cook_completed": bool(row["cook_completed"]),
+            "served": bool(row["served"]),
+            "completed": bool(row["cook_completed"]),
             "updated_at": str(row["updated_at"]),
         }
 
@@ -655,7 +705,8 @@ class MobileSyncStore:
         order_id = str(uuid.uuid4())
         now = utc_now()
         connection.execute(
-            "INSERT INTO meal_orders VALUES (?, 'active', 1, 1, ?, NULL)",
+            "INSERT INTO meal_orders(id,status,version,epoch,created_at,completed_at,phase) "
+            "VALUES (?, 'active', 1, 1, ?, NULL, 'ordering')",
             (order_id, now),
         )
         row = connection.execute("SELECT * FROM meal_orders WHERE id=?", (order_id,)).fetchone()
@@ -712,6 +763,14 @@ class MobileSyncStore:
                 "message": "本餐已清空或结束，请刷新后重新选择",
                 "current_order": self._order_payload(active),
             }
+        requested_phase = operation.get("phase")
+        if requested_phase is not None and str(requested_phase) != str(active["phase"]):
+            return None, {
+                "status": "conflict",
+                "reason": "meal_phase_changed",
+                "message": "本餐已进入下一阶段，请刷新后继续",
+                "current_order": self._order_payload(active),
+            }
         return active, None
 
     def _meal_selection_row(
@@ -745,7 +804,10 @@ class MobileSyncStore:
         ).fetchone()[0])
         now = utc_now()
         connection.execute(
-            "INSERT INTO meal_dish_states VALUES (?,?,?,?,?)", (order_id, recipe_id, next_order, 0, now)
+            "INSERT INTO meal_dish_states("
+            "order_id,recipe_id,sort_order,completed,updated_at,prep_completed,cook_completed,served"
+            ") VALUES (?,?,?,?,?,?,?,?)",
+            (order_id, recipe_id, next_order, 0, now, 0, 0, 0),
         )
         row = connection.execute(
             "SELECT * FROM meal_dish_states WHERE order_id=? AND recipe_id=?", (order_id, recipe_id)
@@ -760,7 +822,8 @@ class MobileSyncStore:
         action = str(operation.get("action") or "")
         allowed = {
             "add_quantity", "set_quantity", "set_note", "remove_selection",
-            "set_dish_completed", "clear_order", "complete_order", "load_plan",
+            "set_dish_completed", "set_dish_stage_completed", "advance_meal_phase",
+            "clear_order", "complete_order", "load_plan",
         }
         if action not in allowed:
             raise ValidationError(f"Unsupported meal action: {action}")
@@ -770,9 +833,67 @@ class MobileSyncStore:
         assert order is not None
         order_id = str(order["id"])
         epoch = int(order["epoch"])
+        phase = str(order["phase"])
+        chef_device_id = str(order["chef_device_id"] or "")
         now = utc_now()
 
-        if action in {"clear_order", "complete_order"}:
+        if action == "advance_meal_phase":
+            next_phase = {
+                "ordering": "prep",
+                "prep": "cooking",
+                "cooking": "serving",
+            }.get(phase)
+            if next_phase is None:
+                return {
+                    "op_id": op_id, "status": "conflict", "reason": "meal_phase_changed",
+                    "message": "当前阶段不能继续推进",
+                }
+            if phase != "ordering" and chef_device_id != device_id:
+                return {
+                    "op_id": op_id, "status": "conflict", "reason": "chef_only",
+                    "message": "只有本餐主厨可以推进烹饪阶段",
+                }
+            dish_count = int(connection.execute(
+                "SELECT COUNT(DISTINCT recipe_id) FROM meal_selections WHERE order_id=?", (order_id,)
+            ).fetchone()[0])
+            if dish_count == 0:
+                return {
+                    "op_id": op_id, "status": "conflict", "reason": "meal_empty",
+                    "message": "请先选择至少一道菜",
+                }
+            completion_column = {"prep": "prep_completed", "cooking": "cook_completed"}.get(phase)
+            if completion_column is not None:
+                incomplete = int(connection.execute(
+                    f"SELECT COUNT(*) FROM (SELECT DISTINCT recipe_id FROM meal_selections WHERE order_id=?) s "
+                    f"LEFT JOIN meal_dish_states d ON d.order_id=? AND d.recipe_id=s.recipe_id "
+                    f"WHERE COALESCE(d.{completion_column},0)=0",
+                    (order_id, order_id),
+                ).fetchone()[0])
+                if incomplete:
+                    return {
+                        "op_id": op_id, "status": "conflict", "reason": "phase_incomplete",
+                        "message": f"还有 {incomplete} 道菜未完成当前阶段",
+                    }
+            if phase == "ordering":
+                connection.execute(
+                    "UPDATE meal_orders SET phase=?,chef_device_id=?,version=version+1 WHERE id=?",
+                    (next_phase, device_id, order_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE meal_orders SET phase=?,version=version+1 WHERE id=?", (next_phase, order_id)
+                )
+            updated = connection.execute("SELECT * FROM meal_orders WHERE id=?", (order_id,)).fetchone()
+            payload = self._order_payload(updated)
+            self._record_change(connection, "meal_order", order_id, "upsert", payload)
+            return {"op_id": op_id, "status": "accepted", "order": payload}
+
+        if action == "clear_order":
+            if phase != "ordering":
+                return {
+                    "op_id": op_id, "status": "conflict", "reason": "meal_phase_locked",
+                    "message": "烹饪已经开始，不能再清空本餐",
+                }
             old_selections = connection.execute(
                 "SELECT device_id,recipe_id FROM meal_selections WHERE order_id=?", (order_id,)
             ).fetchall()
@@ -789,13 +910,36 @@ class MobileSyncStore:
                 )
             connection.execute("DELETE FROM meal_selections WHERE order_id=?", (order_id,))
             connection.execute("DELETE FROM meal_dish_states WHERE order_id=?", (order_id,))
-            if action == "clear_order":
-                connection.execute(
-                    "UPDATE meal_orders SET epoch=epoch+1,version=version+1 WHERE id=?", (order_id,)
-                )
-                updated = connection.execute("SELECT * FROM meal_orders WHERE id=?", (order_id,)).fetchone()
-                self._record_change(connection, "meal_order", order_id, "upsert", self._order_payload(updated))
-                return {"op_id": op_id, "status": "accepted", "order": self._order_payload(updated)}
+            connection.execute(
+                "UPDATE meal_orders SET epoch=epoch+1,version=version+1,phase='ordering',chef_device_id=NULL "
+                "WHERE id=?", (order_id,)
+            )
+            updated = connection.execute("SELECT * FROM meal_orders WHERE id=?", (order_id,)).fetchone()
+            self._record_change(connection, "meal_order", order_id, "upsert", self._order_payload(updated))
+            return {"op_id": op_id, "status": "accepted", "order": self._order_payload(updated)}
+
+        if action == "complete_order":
+            if chef_device_id != device_id:
+                return {
+                    "op_id": op_id, "status": "conflict", "reason": "chef_only",
+                    "message": "只有本餐主厨可以完成并归档本餐",
+                }
+            if phase != "serving":
+                return {
+                    "op_id": op_id, "status": "conflict", "reason": "meal_phase_locked",
+                    "message": "请按顺序完成备餐、烹饪和上桌",
+                }
+            incomplete = int(connection.execute(
+                "SELECT COUNT(*) FROM (SELECT DISTINCT recipe_id FROM meal_selections WHERE order_id=?) s "
+                "LEFT JOIN meal_dish_states d ON d.order_id=? AND d.recipe_id=s.recipe_id "
+                "WHERE COALESCE(d.served,0)=0",
+                (order_id, order_id),
+            ).fetchone()[0])
+            if incomplete:
+                return {
+                    "op_id": op_id, "status": "conflict", "reason": "phase_incomplete",
+                    "message": f"还有 {incomplete} 道菜未上桌",
+                }
             connection.execute(
                 "UPDATE meal_orders SET status='completed',version=version+1,completed_at=? WHERE id=?", (now, order_id)
             )
@@ -803,13 +947,24 @@ class MobileSyncStore:
             self._record_change(connection, "meal_order", order_id, "upsert", self._order_payload(updated))
             return {"op_id": op_id, "status": "accepted", "order": self._order_payload(updated)}
 
+        if phase != "ordering" and action in {
+            "add_quantity", "set_quantity", "set_note", "remove_selection", "load_plan",
+        }:
+            return {
+                "op_id": op_id, "status": "conflict", "reason": "meal_phase_locked",
+                "message": "本餐已开始烹饪，点餐内容已经锁定",
+            }
+
         if action == "load_plan":
             plan_id = str(operation.get("plan_id") or "")
             plan = connection.execute(
                 "SELECT payload_json FROM meal_plans WHERE id=? AND deleted_at IS NULL", (plan_id,)
             ).fetchone()
             if plan is None:
-                raise ValidationError("Meal plan not found")
+                return {
+                    "op_id": op_id, "status": "conflict", "reason": "plan_unavailable",
+                    "message": "套餐已删除或不可用",
+                }
             items = json.loads(str(plan["payload_json"])).get("items") or []
             loaded = 0
             for item in items:
@@ -818,7 +973,15 @@ class MobileSyncStore:
                 recipe_id = str(item.get("recipe_id") or "")
                 if not recipe_id:
                     continue
-                quantity = max(0.25, min(20.0, float(item.get("servings_multiplier") or 1)))
+                recipe = connection.execute(
+                    "SELECT 1 FROM recipes WHERE id=? AND deleted_at IS NULL AND published=1", (recipe_id,)
+                ).fetchone()
+                if recipe is None:
+                    continue
+                try:
+                    quantity = max(0.25, min(20.0, float(item.get("servings_multiplier") or 1)))
+                except (TypeError, ValueError):
+                    continue
                 note = str(item.get("note") or "")[:500]
                 connection.execute(
                     "INSERT INTO meal_selections VALUES (?,?,?,?,?,?) ON CONFLICT(order_id,device_id,recipe_id) "
@@ -832,30 +995,96 @@ class MobileSyncStore:
                 )
                 self._ensure_dish_state(connection, order_id, recipe_id)
                 loaded += 1
-            return {"op_id": op_id, "status": "accepted", "loaded": loaded, "order_id": order_id, "epoch": epoch}
+            skipped = len(items) - loaded
+            return {
+                "op_id": op_id, "status": "accepted", "loaded": loaded, "skipped": skipped,
+                "message": f"已跳过 {skipped} 道下架或失效菜品" if skipped else None,
+                "order_id": order_id, "epoch": epoch,
+            }
 
         recipe_id = str(operation.get("recipe_id") or "")
         recipe_row = connection.execute(
             "SELECT published FROM recipes WHERE id=? AND deleted_at IS NULL", (recipe_id,)
         ).fetchone() if recipe_id else None
-        if recipe_row is None:
-            raise ValidationError("Meal operation references an unknown recipe")
         target_device = str(operation.get("device_id") or device_id)
-        if connection.execute(
-            "SELECT 1 FROM devices WHERE id=? AND revoked_at IS NULL", (target_device,)
-        ).fetchone() is None:
-            raise ValidationError("Target device is unknown or revoked")
+        target = connection.execute(
+            "SELECT revoked_at FROM devices WHERE id=?", (target_device,)
+        ).fetchone()
+        if target is None:
+            return {
+                "op_id": op_id, "status": "conflict", "reason": "device_unavailable",
+                "message": "点餐设备已不存在",
+            }
         existing = self._meal_selection_row(connection, order_id, target_device, recipe_id)
-        if not bool(recipe_row["published"]) and existing is None and action in {"add_quantity", "set_quantity"}:
-            return {"op_id": op_id, "status": "conflict", "reason": "recipe_unpublished"}
+        if target["revoked_at"] and existing is None:
+            return {
+                "op_id": op_id, "status": "conflict", "reason": "device_unavailable",
+                "message": "点餐设备已被撤销",
+            }
+        dish_selected = connection.execute(
+            "SELECT 1 FROM meal_selections WHERE order_id=? AND recipe_id=? LIMIT 1", (order_id, recipe_id)
+        ).fetchone() is not None
+        if recipe_row is None:
+            can_manage_existing = dish_selected and action in {
+                "set_dish_completed", "set_dish_stage_completed", "remove_selection",
+            }
+            if not can_manage_existing and existing is None:
+                return {
+                    "op_id": op_id, "status": "conflict", "reason": "recipe_unavailable",
+                    "message": "这道菜已被删除，没有提交该操作",
+                }
+        if (
+            recipe_row is not None
+            and not bool(recipe_row["published"])
+            and existing is None
+            and action in {"add_quantity", "set_quantity"}
+        ):
+            return {
+                "op_id": op_id, "status": "conflict", "reason": "recipe_unpublished",
+                "message": "这道菜已下架，没有加入本餐",
+            }
 
-        if action == "set_dish_completed":
+        if action in {"set_dish_completed", "set_dish_stage_completed"}:
+            if chef_device_id != device_id:
+                return {
+                    "op_id": op_id, "status": "conflict", "reason": "chef_only",
+                    "message": "只有本餐主厨可以更新烹饪进度",
+                }
+            stage = "cooking" if action == "set_dish_completed" else str(operation.get("stage") or "")
+            stage_column = {
+                "prep": "prep_completed",
+                "cooking": "cook_completed",
+                "serving": "served",
+            }.get(stage)
+            if stage_column is None:
+                raise ValidationError("Dish stage must be prep, cooking, or serving")
+            if phase != stage:
+                return {
+                    "op_id": op_id, "status": "conflict", "reason": "meal_phase_changed",
+                    "message": "只能更新本餐当前阶段的进度",
+                }
+            if connection.execute(
+                "SELECT 1 FROM meal_selections WHERE order_id=? AND recipe_id=? LIMIT 1",
+                (order_id, recipe_id),
+            ).fetchone() is None:
+                return {
+                    "op_id": op_id, "status": "conflict", "reason": "selection_missing",
+                    "message": "这道菜已不在本餐中",
+                }
             completed = bool(operation.get("completed"))
             self._ensure_dish_state(connection, order_id, recipe_id)
-            connection.execute(
-                "UPDATE meal_dish_states SET completed=?,updated_at=? WHERE order_id=? AND recipe_id=?",
-                (int(completed), now, order_id, recipe_id),
-            )
+            if stage == "cooking":
+                connection.execute(
+                    "UPDATE meal_dish_states SET cook_completed=?,completed=?,updated_at=? "
+                    "WHERE order_id=? AND recipe_id=?",
+                    (int(completed), int(completed), now, order_id, recipe_id),
+                )
+            else:
+                connection.execute(
+                    f"UPDATE meal_dish_states SET {stage_column}=?,updated_at=? "
+                    "WHERE order_id=? AND recipe_id=?",
+                    (int(completed), now, order_id, recipe_id),
+                )
             row = connection.execute(
                 "SELECT * FROM meal_dish_states WHERE order_id=? AND recipe_id=?", (order_id, recipe_id)
             ).fetchone()
@@ -891,14 +1120,20 @@ class MobileSyncStore:
         else:
             quantity = current_quantity
         if action == "set_note" and existing is None:
-            raise ValidationError("Cannot add a note before selecting the dish")
+            return {
+                "op_id": op_id, "status": "conflict", "reason": "selection_missing",
+                "message": "对应点餐已不存在，备注没有提交",
+            }
         if quantity <= 0 and action != "set_note":
             return self._apply_meal_operation(
                 connection, device_id,
                 {**operation, "action": "remove_selection", "device_id": target_device}, op_id,
             )
         if quantity > 20:
-            raise ValidationError("quantity must not exceed 20")
+            return {
+                "op_id": op_id, "status": "conflict", "reason": "invalid_quantity",
+                "message": "单人单道菜最多为 20 份",
+            }
         note = str(operation.get("note") if action == "set_note" else (existing["note"] if existing else ""))[:500]
         connection.execute(
             "INSERT INTO meal_selections VALUES (?,?,?,?,?,?) ON CONFLICT(order_id,device_id,recipe_id) "
@@ -1133,6 +1368,9 @@ class MobileSyncStore:
                 if self._active_order_row(connection) is None:
                     self._create_order(connection)
             results = [self._apply_operation(connection, device_id, operation) for operation in operation_list]
+            if requested & {"meal_order", "meal_selection", "meal_dish_state"}:
+                if self._active_order_row(connection) is None:
+                    self._create_order(connection)
             bootstrap = cursor == 0 and capabilities is not None and "recipe" in requested
             if bootstrap:
                 revision = int(connection.execute("SELECT value FROM meta WHERE key='revision'").fetchone()[0])
@@ -1149,10 +1387,12 @@ class MobileSyncStore:
 
                 if "recipe" in requested:
                     for row in connection.execute(
-                        "SELECT payload_json,published FROM recipes WHERE deleted_at IS NULL ORDER BY updated_at DESC"
+                        "SELECT payload_json,published,recommended FROM recipes "
+                        "WHERE deleted_at IS NULL ORDER BY updated_at DESC"
                     ):
                         payload = json.loads(str(row["payload_json"]))
                         payload["published"] = bool(row["published"])
+                        payload["recommended"] = bool(row["recommended"])
                         add_snapshot("recipe", payload)
                 if "practice_log" in requested:
                     for row in connection.execute("SELECT * FROM practice_logs WHERE deleted_at IS NULL ORDER BY cooked_on DESC,created_at DESC"):
@@ -1206,6 +1446,16 @@ class MobileSyncStore:
             ).fetchall()
         return [json.loads(str(row["payload_json"])) for row in rows]
 
+    def list_meal_history(self, limit: int = 20) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(100, int(limit)))
+        with self._connect() as connection:
+            orders = connection.execute(
+                "SELECT * FROM meal_orders WHERE status='completed' "
+                "ORDER BY completed_at DESC,created_at DESC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+            return [self._meal_snapshot(connection, order) for order in orders]
+
     def list_practice_logs(self, recipe_id: str | None = None, include_deleted: bool = False) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -1225,7 +1475,7 @@ class MobileSyncStore:
         where = "" if include_deleted else "WHERE deleted_at IS NULL"
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT id,payload_json,updated_at,deleted_at,published FROM recipes {where}"
+                f"SELECT id,payload_json,updated_at,deleted_at,published,recommended FROM recipes {where}"
             ).fetchall()
         result = []
         for row in rows:
@@ -1237,6 +1487,7 @@ class MobileSyncStore:
                 "updated_at": str(row["updated_at"]),
                 "deleted_at": row["deleted_at"],
                 "published": bool(row["published"]),
+                "recommended": bool(row["recommended"]),
             })
         return sorted(result, key=lambda item: item["title"])
 
@@ -1273,12 +1524,13 @@ class MobileSyncStore:
         where = "" if include_deleted else "WHERE deleted_at IS NULL"
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT payload_json,published FROM recipes {where} ORDER BY updated_at DESC"
+                f"SELECT payload_json,published,recommended FROM recipes {where} ORDER BY updated_at DESC"
             ).fetchall()
         result = []
         for row in rows:
             payload = json.loads(str(row["payload_json"]))
             payload["published"] = bool(row["published"])
+            payload["recommended"] = bool(row["recommended"])
             result.append(payload)
         return result
 

@@ -77,6 +77,7 @@ try:
         record_meal_plan_practice,
         save_meal_plan,
     )
+    from .menu_image import MenuImageOptions, generate_menu_images, menu_image_zip
     from .markdown_writer import upsert_rating_block
     from .optimizer import OptimizeOptions, optimize_existing_note
     from .obsidian_archive import (
@@ -174,6 +175,7 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
         record_meal_plan_practice,
         save_meal_plan,
     )
+    from bili_recipe_notes.menu_image import MenuImageOptions, generate_menu_images, menu_image_zip
     from bili_recipe_notes.markdown_writer import upsert_rating_block
     from bili_recipe_notes.optimizer import OptimizeOptions, optimize_existing_note
     from bili_recipe_notes.obsidian_archive import (
@@ -2524,8 +2526,8 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
         st.error(f"同步服务数据初始化失败：{_clean_error(exc)}")
         return
 
-    st.markdown("#### 局域网多人点餐（推荐）")
-    st.caption("手机直接打开 8765 端口，输入设备名称即可加入当前共享本餐。")
+    st.markdown("#### Chef Zhai 家庭厨房（推荐）")
+    st.caption("手机直接打开 8765 端口即可加入家庭餐桌；完成点餐后由一台设备认领本餐主厨。")
     with st.expander("高级功能：旧网页版菜谱包"):
         st.caption("仅用于旧离线网页版兼容；新局域网客户端无需手动导入。")
         image_mode_labels = {"all": "全部步骤图", "first": "每道菜仅一张（推荐）", "none": "只导出文字"}
@@ -2562,11 +2564,11 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
         st.success("新设备可直接打开下方网址，输入设备名称后加入。")
     else:
         st.info("新设备加入已锁定；已加入设备仍可正常点餐。")
-    st.link_button("打开移动点餐客户端", base_url, type="primary")
+    st.link_button("打开 Chef Zhai 家庭厨房", base_url, type="primary")
     try:
         import qrcode
 
-        st.image(qrcode.make(base_url), caption="二维码只包含点餐网址，可直接分享", width=240)
+        st.image(qrcode.make(base_url), caption="二维码只包含家庭厨房网址，可直接分享", width=240)
     except Exception as exc:  # noqa: BLE001
         st.warning(f"网址二维码生成失败：{_clean_error(exc)}")
     try:
@@ -2587,19 +2589,23 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
         st.warning("发现重复菜谱身份，手机客户端只发布最近修改的一份。")
         st.json(index_result["duplicates"])
 
-    st.markdown("#### 点餐菜谱上下架")
+    st.markdown("#### 点餐菜单管理")
     indexed_recipes = store.list_indexed_recipes()
     published_count = len([item for item in indexed_recipes if item["published"]])
+    recommended_count = len([item for item in indexed_recipes if item["recommended"]])
     st.caption(
-        f"当前上架 {published_count} / {len(indexed_recipes)} 道。"
-        "下架后会立即从移动点餐菜单隐藏；已经点入本餐的菜仍保留名称和图片。"
+        f"当前上架 {published_count} / {len(indexed_recipes)} 道 · 主厨推荐 {recommended_count} 道。"
+        "标记推荐会自动上架；下架会自动取消推荐。已经点入本餐的菜仍保留名称和图片。"
     )
-    publication_filters = st.columns([3, 2])
+    publication_filters = st.columns([3, 2, 2])
     publication_query = publication_filters[0].text_input(
         "筛选菜谱", placeholder="输入菜名或原分类", key="mobile_publication_query"
     ).strip().lower()
     publication_status = publication_filters[1].selectbox(
         "上架状态", ["全部", "已上架", "已下架"], key="mobile_publication_status"
+    )
+    recommendation_status = publication_filters[2].selectbox(
+        "推荐状态", ["全部", "主厨推荐", "未推荐"], key="mobile_recommendation_status"
     )
     visible_recipes = [
         item for item in indexed_recipes
@@ -2611,12 +2617,16 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
             publication_status == "全部"
             or (publication_status == "已上架" and item["published"])
             or (publication_status == "已下架" and not item["published"])
+        ) and (
+            recommendation_status == "全部"
+            or (recommendation_status == "主厨推荐" and item["recommended"])
+            or (recommendation_status == "未推荐" and not item["recommended"])
         )
     ]
     editor_scope = hashlib.sha256(
         "\n".join(str(item["id"]) for item in visible_recipes).encode("utf-8")
     ).hexdigest()[:12]
-    bulk_publication_columns = st.columns(2)
+    bulk_publication_columns = st.columns(4)
     if visible_recipes and bulk_publication_columns[0].button(
         "当前筛选全部上架", key=f"mobile_publish_filtered_{editor_scope}", width="stretch"
     ):
@@ -2629,11 +2639,24 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
         changed = store.set_recipe_publications({str(item["id"]): False for item in visible_recipes})
         st.success(f"已下架 {changed} 道菜。")
         st.rerun()
+    if visible_recipes and bulk_publication_columns[2].button(
+        "设为主厨推荐", key=f"mobile_recommend_filtered_{editor_scope}", width="stretch"
+    ):
+        changed = store.set_recipe_recommendations({str(item["id"]): True for item in visible_recipes})
+        st.success(f"已推荐 {changed} 道菜，并确保它们处于上架状态。")
+        st.rerun()
+    if visible_recipes and bulk_publication_columns[3].button(
+        "取消主厨推荐", key=f"mobile_unrecommend_filtered_{editor_scope}", width="stretch"
+    ):
+        changed = store.set_recipe_recommendations({str(item["id"]): False for item in visible_recipes})
+        st.success(f"已取消 {changed} 道推荐。")
+        st.rerun()
     with st.form("mobile_recipe_publications"):
         edited_publications = st.data_editor(
             [
                 {
                     "上架": bool(item["published"]),
+                    "主厨推荐": bool(item["recommended"]),
                     "菜谱": item["title"],
                     "原分类": item.get("category") or "未分类",
                 }
@@ -2648,17 +2671,136 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
         save_publications = st.form_submit_button("保存上下架状态", type="primary")
     if save_publications:
         updates = {
-            str(recipe["id"]): bool(row.get("上架"))
+            str(recipe["id"]): {
+                "published": bool(row.get("上架")),
+                "recommended": bool(row.get("主厨推荐")),
+            }
             for recipe, row in zip(visible_recipes, edited_publications)
-            if bool(row.get("上架")) != bool(recipe["published"])
+            if (
+                bool(row.get("上架")) != bool(recipe["published"])
+                or bool(row.get("主厨推荐")) != bool(recipe["recommended"])
+            )
         }
-        changed = store.set_recipe_publications(updates)
-        st.success(f"已更新 {changed} 道菜，移动点餐端会自动同步。")
+        changed = store.set_recipe_menu_states(updates)
+        st.success(f"已更新 {changed} 道菜的菜单状态，移动端会自动同步。")
         st.rerun()
     if published_count < len(indexed_recipes) and st.button("恢复全部上架", key="mobile_publish_all"):
         changed = store.set_recipe_publications({str(item["id"]): True for item in indexed_recipes})
         st.success(f"已恢复 {changed} 道菜。")
         st.rerun()
+
+    st.markdown("##### 导出常用菜单图片")
+    st.caption(
+        "当前已上架菜品就是本阶段的常用菜单。可生成适合微信转发的精美长图，或生成 300 DPI 的 A4 分页图片用于打印。"
+    )
+    if published_count > 40:
+        st.info(
+            f"当前上架 {published_count} 道，导出的菜单会比较长。"
+            "如需给客户使用，建议先通过上方筛选和批量下架精简到 15–30 道。"
+        )
+    with st.form("mobile_menu_image_generator"):
+        menu_text_columns = st.columns(2)
+        menu_title = menu_text_columns[0].text_input(
+            "菜单标题", value="Chef Zhai · 本周菜单", key="mobile_menu_image_title"
+        )
+        menu_subtitle = menu_text_columns[1].text_input(
+            "副标题", value="主厨精选 · 新鲜现做", key="mobile_menu_image_subtitle"
+        )
+        menu_footer = st.text_input(
+            "页脚说明",
+            value="请直接回复菜名预订 · 菜品以当日供应为准",
+            help="可以改为联系电话、取餐说明或菜单有效期。",
+            key="mobile_menu_image_footer",
+        )
+        menu_option_columns = st.columns(2)
+        menu_image_format = menu_option_columns[0].radio(
+            "图片用途",
+            ["share", "print"],
+            format_func={"share": "分享长图", "print": "A4 高清打印"}.get,
+            horizontal=True,
+            key="mobile_menu_image_format",
+        )
+        include_menu_photos = menu_option_columns[1].toggle(
+            "显示菜品缩略图",
+            value=True,
+            help="没有可用图片的菜品会使用统一的文字占位图。",
+            key="mobile_menu_image_photos",
+        )
+        generate_menu_image = st.form_submit_button("生成常用菜单图片", type="primary", width="stretch")
+
+    menu_signature = hashlib.sha256(
+        "\n".join(
+            f"{item['id']}:{int(item['published'])}:{int(item['recommended'])}:{item['updated_at']}"
+            for item in indexed_recipes
+        ).encode("utf-8")
+    ).hexdigest()
+    if generate_menu_image:
+        try:
+            asset_cache: dict[str, tuple[Path, str] | None] = {}
+
+            def resolve_menu_asset(digest: str) -> tuple[Path, str] | None:
+                if digest not in asset_cache:
+                    asset_cache[digest] = store.asset_path(digest)
+                return asset_cache[digest]
+
+            result = generate_menu_images(
+                store.list_recipes(),
+                resolve_menu_asset,
+                MenuImageOptions(
+                    title=menu_title.strip() or "Chef Zhai 常用菜单",
+                    subtitle=menu_subtitle.strip(),
+                    footer=menu_footer.strip(),
+                    image_format=menu_image_format,
+                    include_photos=include_menu_photos,
+                ),
+            )
+            st.session_state["mobile_menu_image_result"] = {
+                "signature": menu_signature,
+                "result": result,
+            }
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"菜单图片生成失败：{_clean_error(exc)}")
+
+    generated_menu = st.session_state.get("mobile_menu_image_result")
+    if isinstance(generated_menu, dict) and generated_menu.get("signature") == menu_signature:
+        result = generated_menu.get("result")
+        if result and result.files:
+            st.success(
+                f"已生成 {result.recipe_count} 道菜、{result.category_count} 个分类、"
+                f"{len(result.files)} 张图片。"
+            )
+            preview_columns = st.columns(min(2, len(result.files)))
+            for index, file in enumerate(result.files[:2]):
+                preview_columns[index].image(file.content, caption=f"预览 · 第 {index + 1} 张", width="stretch")
+            if len(result.files) == 1:
+                file = result.files[0]
+                st.download_button(
+                    "下载菜单图片",
+                    data=file.content,
+                    file_name=file.name,
+                    mime=file.mime_type,
+                    width="stretch",
+                )
+            else:
+                st.download_button(
+                    f"打包下载全部 {len(result.files)} 张 A4 图片",
+                    data=menu_image_zip(result),
+                    file_name="chef-zhai-menu-a4.zip",
+                    mime="application/zip",
+                    width="stretch",
+                )
+                with st.expander("单独下载每一页"):
+                    for file in result.files:
+                        st.download_button(
+                            f"下载 {file.name}",
+                            data=file.content,
+                            file_name=file.name,
+                            mime=file.mime_type,
+                            key=f"download_{file.name}",
+                            width="stretch",
+                        )
+    elif generated_menu:
+        st.warning("上架或推荐状态已变化，请重新生成菜单图片以使用最新菜品。")
 
     with st.expander("兼容功能：为旧 Flutter 客户端生成一次性配对数据"):
         if st.button("生成 10 分钟配对数据"):

@@ -287,6 +287,7 @@ def test_recipe_publication_persists_and_syncs_without_losing_details(tmp_path: 
     cursor = bootstrap["next_cursor"]
 
     assert bootstrap["changes"][0]["payload"]["published"] is True
+    assert bootstrap["changes"][0]["payload"]["recommended"] is False
     assert store.set_recipe_publications({recipe_id: False}) == 1
     hidden = store.sync(device_id, cursor, [], capabilities)
 
@@ -339,9 +340,34 @@ def test_database_v2_migration_defaults_existing_recipes_to_published(tmp_path: 
 
     assert migrated.list_indexed_recipes()[0]["published"] is True
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
-        assert "published" in {row[1] for row in connection.execute("PRAGMA table_info(recipes)")}
-    assert list(database.parent.glob("mobile-sync.before-v2-to-v3-*.bak"))
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(recipes)")}
+        assert {"published", "recommended"} <= columns
+        assert connection.execute("SELECT recommended FROM recipes").fetchone()[0] == 0
+    assert list(database.parent.glob("mobile-sync.before-v2-to-v6-*.bak"))
+
+
+def test_recipe_recommendation_auto_publishes_and_unpublish_clears_it(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "主厨推荐菜", cid="151")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    recipe_id = json.loads((folder / "sync-meta.json").read_text(encoding="utf-8"))["recipe_id"]
+    device_id, _ = _paired(store)
+    capabilities = ["recipe", "meal_order", "meal_selection", "meal_dish_state"]
+    cursor = store.sync(device_id, 0, [], capabilities)["next_cursor"]
+    store.set_recipe_publications({recipe_id: False})
+
+    assert store.set_recipe_recommendations({recipe_id: True}) == 1
+    recommended = store.sync(device_id, cursor, [], capabilities)
+    recommended_change = [change for change in recommended["changes"] if change["entity_id"] == recipe_id][-1]
+    assert recommended_change["payload"]["published"] is True
+    assert recommended_change["payload"]["recommended"] is True
+    assert store.list_indexed_recipes()[0]["recommended"] is True
+
+    assert store.set_recipe_publications({recipe_id: False}) == 1
+    state = store.list_indexed_recipes()[0]
+    assert state["published"] is False
+    assert state["recommended"] is False
 
 
 def test_private_network_filter() -> None:
@@ -355,6 +381,7 @@ def _meal_op(snapshot: dict, action: str, recipe_id: str | None = None, **values
         "action": action,
         "order_id": snapshot["order"]["id"],
         "epoch": snapshot["order"]["epoch"],
+        "phase": snapshot["order"].get("phase", "ordering"),
         **({"recipe_id": recipe_id} if recipe_id else {}),
         **values,
     }
@@ -396,11 +423,215 @@ def test_clear_and_complete_reject_stale_offline_operations(tmp_path: Path) -> N
     assert store.sync(device_id, 0, [clear], capabilities)["operation_results"][0]["status"] == "accepted"
     assert store.sync(device_id, 0, [stale], capabilities)["operation_results"][0]["reason"] == "stale_order"
     current = store.current_meal_order()
+    store.sync(device_id, 0, [_meal_op(current, "add_quantity", recipe_id, quantity=1)], capabilities)
+    ordering = store.current_meal_order()
+    advance = _meal_op(ordering, "advance_meal_phase")
+    advance["entity_type"] = "meal_order"
+    assert store.sync(device_id, 0, [advance], capabilities)["operation_results"][0]["status"] == "accepted"
+    stale_ordering_op = _meal_op(ordering, "add_quantity", recipe_id, quantity=1)
+    assert store.sync(device_id, 0, [stale_ordering_op], capabilities)["operation_results"][0]["reason"] == "meal_phase_changed"
+
+    for phase in ("prep", "cooking", "serving"):
+        snapshot = store.current_meal_order()
+        stage = _meal_op(snapshot, "set_dish_stage_completed", recipe_id, stage=phase, completed=True)
+        stage["entity_type"] = "meal_dish_state"
+        assert store.sync(device_id, 0, [stage], capabilities)["operation_results"][0]["status"] == "accepted"
+        if phase != "serving":
+            snapshot = store.current_meal_order()
+            advance = _meal_op(snapshot, "advance_meal_phase")
+            advance["entity_type"] = "meal_order"
+            assert store.sync(device_id, 0, [advance], capabilities)["operation_results"][0]["status"] == "accepted"
+
+    current = store.current_meal_order()
     complete = _meal_op(current, "complete_order")
     complete["entity_type"] = "meal_order"
-    store.sync(device_id, 0, [complete], capabilities)
+    completed_sync = store.sync(device_id, 0, [complete], capabilities)
+    assert completed_sync["operation_results"][0]["status"] == "accepted"
+    assert completed_sync["meal"]["order"]["id"] != current["order"]["id"]
+    assert completed_sync["meal"]["order"]["phase"] == "ordering"
+    assert completed_sync["meal"]["selections"] == []
     result = store.sync(device_id, 0, [_meal_op(current, "add_quantity", recipe_id, quantity=1)], capabilities)
     assert result["operation_results"][0]["reason"] == "order_completed"
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM meal_selections WHERE order_id=?", (current["order"]["id"],)
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT served FROM meal_dish_states WHERE order_id=?", (current["order"]["id"],)
+        ).fetchone()[0] == 1
+    history = store.list_meal_history()
+    assert history[0]["order"]["id"] == current["order"]["id"]
+    assert len(history[0]["selections"]) == 1
+
+
+def test_deleted_recipe_operation_does_not_block_valid_outbox_items(tmp_path: Path) -> None:
+    deleted_folder = _recipe(tmp_path, "离线删除菜", cid="301")
+    valid_folder = _recipe(tmp_path, "正常菜", cid="302")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    deleted_id = json.loads((deleted_folder / "sync-meta.json").read_text(encoding="utf-8"))["recipe_id"]
+    valid_id = json.loads((valid_folder / "sync-meta.json").read_text(encoding="utf-8"))["recipe_id"]
+    device_id, _ = _paired(store)
+    capabilities = ["recipe", "meal_order", "meal_selection", "meal_dish_state"]
+    meal = store.sync(device_id, 0, [], capabilities)["meal"]
+    deleted_folder.rename(tmp_path / "deleted-recipe")
+    store.index_recipes()
+
+    result = store.sync(
+        device_id,
+        store.current_revision(),
+        [
+            _meal_op(meal, "add_quantity", deleted_id, quantity=1),
+            _meal_op(meal, "add_quantity", valid_id, quantity=1),
+        ],
+        capabilities,
+    )
+
+    assert result["operation_results"][0]["reason"] == "recipe_unavailable"
+    assert result["operation_results"][1]["status"] == "accepted"
+    assert [item["recipe_id"] for item in store.current_meal_order()["selections"]] == [valid_id]
+    valid_folder.rename(tmp_path / "deleted-after-selection")
+    store.index_recipes()
+    selected = store.current_meal_order()
+    advance = _meal_op(selected, "advance_meal_phase")
+    advance["entity_type"] = "meal_order"
+    assert store.sync(device_id, 0, [advance], capabilities)["operation_results"][0]["status"] == "accepted"
+    prep = store.current_meal_order()
+    stage = _meal_op(prep, "set_dish_stage_completed", valid_id, stage="prep", completed=True)
+    stage["entity_type"] = "meal_dish_state"
+    assert store.sync(device_id, 0, [stage], capabilities)["operation_results"][0]["status"] == "accepted"
+
+
+def test_loading_plan_skips_unpublished_and_missing_recipes(tmp_path: Path) -> None:
+    published_folder = _recipe(tmp_path, "套餐上架菜", cid="311")
+    hidden_folder = _recipe(tmp_path, "套餐下架菜", cid="312")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    published_id = json.loads((published_folder / "sync-meta.json").read_text(encoding="utf-8"))["recipe_id"]
+    hidden_id = json.loads((hidden_folder / "sync-meta.json").read_text(encoding="utf-8"))["recipe_id"]
+    device_id, _ = _paired(store)
+    capabilities = ["recipe", "meal_plan", "meal_order", "meal_selection", "meal_dish_state"]
+    meal = store.sync(device_id, 0, [], capabilities)["meal"]
+    plan_id = str(uuid.uuid4())
+    create_plan = {
+        "op_id": str(uuid.uuid4()), "entity_type": "meal_plan", "action": "upsert", "base_version": 0,
+        "payload": {
+            "id": plan_id, "name": "过滤套餐", "items": [
+                {"recipe_id": published_id, "servings_multiplier": 1},
+                {"recipe_id": hidden_id, "servings_multiplier": 1},
+                {"recipe_id": str(uuid.uuid4()), "servings_multiplier": 1},
+            ],
+        },
+    }
+    store.sync(device_id, 0, [create_plan], capabilities)
+    store.set_recipe_publications({hidden_id: False})
+    load = _meal_op(meal, "load_plan", plan_id=plan_id)
+    load["entity_type"] = "meal_order"
+
+    result = store.sync(device_id, 0, [load], capabilities)["operation_results"][0]
+
+    assert result["status"] == "accepted"
+    assert result["loaded"] == 1
+    assert result["skipped"] == 2
+    assert [item["recipe_id"] for item in store.current_meal_order()["selections"]] == [published_id]
+
+
+def test_meal_phase_requires_every_dish_before_advancing(tmp_path: Path) -> None:
+    first_folder = _recipe(tmp_path, "阶段菜一", cid="201")
+    second_folder = _recipe(tmp_path, "阶段菜二", cid="202")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    recipe_ids = [
+        json.loads((folder / "sync-meta.json").read_text(encoding="utf-8"))["recipe_id"]
+        for folder in (first_folder, second_folder)
+    ]
+    device_id, _ = _paired(store)
+    capabilities = ["recipe", "meal_order", "meal_selection", "meal_dish_state"]
+    meal = store.sync(device_id, 0, [], capabilities)["meal"]
+    store.sync(device_id, 0, [_meal_op(meal, "add_quantity", recipe_id, quantity=1) for recipe_id in recipe_ids], capabilities)
+    meal = store.current_meal_order()
+    advance = _meal_op(meal, "advance_meal_phase")
+    advance["entity_type"] = "meal_order"
+    store.sync(device_id, 0, [advance], capabilities)
+
+    prep = store.current_meal_order()
+    first_done = _meal_op(prep, "set_dish_stage_completed", recipe_ids[0], stage="prep", completed=True)
+    first_done["entity_type"] = "meal_dish_state"
+    store.sync(device_id, 0, [first_done], capabilities)
+    too_early = _meal_op(store.current_meal_order(), "advance_meal_phase")
+    too_early["entity_type"] = "meal_order"
+    result = store.sync(device_id, 0, [too_early], capabilities)["operation_results"][0]
+
+    assert result["reason"] == "phase_incomplete"
+    snapshot = store.current_meal_order()
+    assert snapshot["order"]["phase"] == "prep"
+    assert sum(state["prep_completed"] for state in snapshot["dish_states"]) == 1
+
+
+def test_device_starting_prep_becomes_only_meal_chef(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "主厨权限菜", cid="401")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    recipe_id = json.loads((folder / "sync-meta.json").read_text(encoding="utf-8"))["recipe_id"]
+    chef_device, _ = _paired(store)
+    guest_device, _ = _paired(store)
+    capabilities = ["recipe", "meal_order", "meal_selection", "meal_dish_state"]
+    meal = store.sync(chef_device, 0, [], capabilities)["meal"]
+    store.sync(guest_device, 0, [_meal_op(meal, "add_quantity", recipe_id, quantity=1)], capabilities)
+    ordering = store.current_meal_order()
+    start = _meal_op(ordering, "advance_meal_phase")
+    start["entity_type"] = "meal_order"
+
+    started = store.sync(chef_device, 0, [start], capabilities)
+
+    assert started["operation_results"][0]["status"] == "accepted"
+    assert started["meal"]["order"]["chef_device_id"] == chef_device
+    prep = store.current_meal_order()
+    guest_stage = _meal_op(prep, "set_dish_stage_completed", recipe_id, stage="prep", completed=True)
+    guest_stage["entity_type"] = "meal_dish_state"
+    assert store.sync(guest_device, 0, [guest_stage], capabilities)["operation_results"][0]["reason"] == "chef_only"
+    chef_stage = _meal_op(prep, "set_dish_stage_completed", recipe_id, stage="prep", completed=True)
+    chef_stage["entity_type"] = "meal_dish_state"
+    assert store.sync(chef_device, 0, [chef_stage], capabilities)["operation_results"][0]["status"] == "accepted"
+    ready = store.current_meal_order()
+    guest_advance = _meal_op(ready, "advance_meal_phase")
+    guest_advance["entity_type"] = "meal_order"
+    assert store.sync(guest_device, 0, [guest_advance], capabilities)["operation_results"][0]["reason"] == "chef_only"
+    guest_add = _meal_op(ready, "add_quantity", recipe_id, quantity=1)
+    assert store.sync(guest_device, 0, [guest_add], capabilities)["operation_results"][0]["reason"] == "meal_phase_locked"
+
+
+def test_database_v3_migration_adds_meal_stages(tmp_path: Path) -> None:
+    database = tmp_path / ".bili-recipe-notes" / "mobile-sync.sqlite3"
+    database.parent.mkdir(parents=True)
+    order_id = str(uuid.uuid4())
+    recipe_id = str(uuid.uuid4())
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE meal_orders (id TEXT PRIMARY KEY,status TEXT NOT NULL,version INTEGER NOT NULL,"
+            "epoch INTEGER NOT NULL,created_at TEXT NOT NULL,completed_at TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE meal_dish_states (order_id TEXT NOT NULL,recipe_id TEXT NOT NULL,sort_order INTEGER NOT NULL,"
+            "completed INTEGER NOT NULL,updated_at TEXT NOT NULL,PRIMARY KEY(order_id,recipe_id))"
+        )
+        connection.execute("INSERT INTO meal_orders VALUES (?, 'active', 1, 1, 'now', NULL)", (order_id,))
+        connection.execute("INSERT INTO meal_dish_states VALUES (?, ?, 0, 1, 'now')", (order_id, recipe_id))
+        connection.execute("PRAGMA user_version = 3")
+
+    MobileSyncStore(tmp_path, database_path=database)
+
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        order = connection.execute("SELECT * FROM meal_orders").fetchone()
+        state = connection.execute("SELECT * FROM meal_dish_states").fetchone()
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert order["phase"] == "ordering"
+        assert order["chef_device_id"] is None
+        assert state["prep_completed"] == 0
+        assert state["cook_completed"] == 1
+        assert state["served"] == 0
+    assert list(database.parent.glob("mobile-sync.before-v3-to-v6-*.bak"))
 
 
 def test_legacy_capabilities_hide_shared_meal_changes(tmp_path: Path) -> None:

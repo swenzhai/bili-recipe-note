@@ -536,6 +536,10 @@ def test_mobile_web_export_exposes_image_size_options() -> None:
     image_mode = at.radio(key="web_library_image_mode")
     assert image_mode.value == "first"
     assert image_mode.options == ["每道菜仅一张（推荐）", "只导出文字", "全部步骤图"]
+    assert at.text_input(key="mobile_menu_image_title").value == "Chef Zhai · 本周菜单"
+    assert at.radio(key="mobile_menu_image_format").value == "share"
+    assert at.toggle(key="mobile_menu_image_photos").value is True
+    assert any(button.label == "生成常用菜单图片" for button in at.button)
 
 
 def test_review_page_can_create_item_by_item_review(tmp_path: Path) -> None:

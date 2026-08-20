@@ -1,7 +1,7 @@
 {
-  "name": "Bili 家庭共享点餐",
-  "short_name": "家庭点餐",
-  "description": "局域网多人共享点餐与菜谱客户端",
+  "name": "Chef Zhai 家庭厨房",
+  "short_name": "Chef Zhai",
+  "description": "Chef Zhai 家庭厨房多人点餐与主厨烹饪客户端",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#f5efe3",
