@@ -805,17 +805,25 @@ def _batch_source_store(options: BatchJobOptions):
     )
 
 
-def _exclude_known_non_recipes(state, options: BatchJobOptions) -> int:
+def _exclude_known_non_recipe_sources(state, options: BatchJobOptions) -> int:
     store = _batch_source_store(options)
     if store is None:
         return 0
-    blocked = store.known_non_recipe_urls(item.url for item in state.items)
+    blocked = store.known_video_urls(item.url for item in state.items)
+    from .mobile_sync import normalize_source_url
+
+    source_by_url = {
+        normalize_source_url(str(row.get("source_url") or "")): str(row.get("classification") or "")
+        for row in store.list_video_sources()
+        if row.get("classification") in {"non_recipe", "technique"}
+    }
     changed = 0
     for item in state.items:
         if item.url not in blocked:
             continue
-        item.status = "non_recipe"
-        item.error = "已在来源数据库中归类为非菜谱"
+        classification = source_by_url.get(normalize_source_url(item.url), "non_recipe")
+        item.status = classification
+        item.error = "已在来源数据库中归类为烹饪技巧" if classification == "technique" else "已在来源数据库中归类为非菜谱"
         item.finished_at = _now()
         for stage in item.stages.values():
             stage.status = "done"
@@ -857,9 +865,9 @@ def _run_persistent_batch(options: BatchJobOptions, log: LogCallback | None = No
             item.error = None
             item.note_path = None
             item.finished_at = None
-    excluded = _exclude_known_non_recipes(state, options)
+    excluded = _exclude_known_non_recipe_sources(state, options)
     if excluded:
-        _emit(log, f"Skipped {excluded} source(s) already classified as non-recipe.")
+        _emit(log, f"Skipped {excluded} source(s) already classified as non-recipe or cooking-technique material.")
     save_batch_state(state)
 
     items_to_process = selectable_items(state, options.resume_mode, options.target_stage)
@@ -925,13 +933,31 @@ def run_batch(options: BatchJobOptions, log: LogCallback | None = None) -> Batch
             urls.append(cleaned)
 
     source_store = _batch_source_store(options)
-    blocked = source_store.known_non_recipe_urls(urls) if source_store is not None else set()
+    blocked = source_store.known_video_urls(urls) if source_store is not None else set()
+    source_classifications: dict[str, str] = {}
+    if source_store is not None:
+        from .mobile_sync import normalize_source_url
+
+        source_classifications = {
+            normalize_source_url(str(row.get("source_url") or "")): str(row.get("classification") or "")
+            for row in source_store.list_video_sources()
+            if row.get("classification") in {"non_recipe", "technique"}
+        }
     items: list[BatchJobItemResult] = []
     for idx, url in enumerate(urls, start=1):
         _emit(log, f"[{idx}/{len(urls)}] {url}")
         if url in blocked:
-            _emit(log, "Skipped source already classified as non-recipe.")
-            items.append(BatchJobItemResult(url=url, status="non_recipe", error="已归类为非菜谱"))
+            _emit(log, "Skipped source already classified as non-recipe or cooking-technique material.")
+            classification = "technique"
+            if source_store is not None:
+                classification = source_classifications.get(normalize_source_url(url), "non_recipe")
+            items.append(
+                BatchJobItemResult(
+                    url=url,
+                    status=classification,
+                    error="已归类为烹饪技巧" if classification == "technique" else "已归类为非菜谱",
+                )
+            )
             continue
         items.append(_process_batch_url(options, url, log=log))
     if source_store is not None:

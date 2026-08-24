@@ -20,12 +20,13 @@ from typing import Any, Iterable
 from urllib.parse import unquote
 from urllib.request import urlopen
 
-from PIL import Image
+from PIL import Image, ImageOps
 from streamlit_cropper import st_cropper
 
 try:
     from .batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state
     from .batch_runner import get_background_batch_status, read_batch_log, start_background_batch
+    from .branding import default_logo_path, remove_logo, save_logo
     from .config import UIConfig, load_config, save_config
     from .content_analysis import ContentAnalysisOptions, analyze_video_content
     from .curation import (
@@ -123,11 +124,13 @@ try:
         recipe_from_completed_review,
         review_path,
     )
+    from .screenshot import crop_screenshot_box_content, scale_crop_box
     from .storage import atomic_write_json, atomic_write_text
     from .web_export import build_web_library_payload, web_library_bytes
 except ImportError:  # pragma: no cover - supports direct streamlit script execution
     from bili_recipe_notes.batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state
     from bili_recipe_notes.batch_runner import get_background_batch_status, read_batch_log, start_background_batch
+    from bili_recipe_notes.branding import default_logo_path, remove_logo, save_logo
     from bili_recipe_notes.config import UIConfig, load_config, save_config
     from bili_recipe_notes.content_analysis import ContentAnalysisOptions, analyze_video_content
     from bili_recipe_notes.curation import (
@@ -225,6 +228,7 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
         recipe_from_completed_review,
         review_path,
     )
+    from bili_recipe_notes.screenshot import crop_screenshot_box_content, scale_crop_box
     from bili_recipe_notes.storage import atomic_write_json, atomic_write_text
     from bili_recipe_notes.web_export import build_web_library_payload, web_library_bytes
 
@@ -247,6 +251,7 @@ PAGES = [
     "本餐点菜",
     "烹饪模式",
     "草稿与归档",
+    "快速审核",
     "审核确认",
     "最终菜谱整理",
     "批量处理",
@@ -260,7 +265,7 @@ PAGES = [
 ]
 PAGE_GROUPS = {
     "采集与生成": ["任务仪表盘", "单视频生成", "批量处理", "UP 主链接"],
-    "审阅与成稿": ["草稿与归档", "审核确认", "编辑修复", "最终菜谱整理"],
+    "审阅与成稿": ["草稿与归档", "快速审核", "审核确认", "编辑修复", "最终菜谱整理"],
     "使用与知识": ["菜谱库全览", "菜谱详情", "本餐点菜", "烹饪模式", "知识库", "二次分析", "手机客户端"],
     "系统与迁移": ["工作交接", "环境检查"],
 }
@@ -556,6 +561,7 @@ BATCH_STATUS_LABELS = {
     "skipped": "已跳过",
     "failed": "失败",
     "non_recipe": "非菜谱（已忽略）",
+    "technique": "烹饪技巧（学习资料）",
 }
 
 
@@ -582,7 +588,7 @@ def _batch_progress_summary(state: Any) -> dict[str, int]:
     completed = failed = running = 0
     for item in state.items:
         status = str(getattr(item, "status", "pending") or "pending")
-        if status in {"done", "skipped", "non_recipe"}:
+        if status in {"done", "skipped", "non_recipe", "technique"}:
             completed += 1
         elif status == "failed":
             failed += 1
@@ -2565,51 +2571,82 @@ def _video_url_at(source_url: str, timestamp: Any) -> str:
     return f"{source_url}{separator}t={max(0, int(float(timestamp)))}"
 
 
-def _render_recipe_cover_review(st, store: MobileSyncStore, config: UIConfig) -> None:
+@lru_cache(maxsize=16)
+def _cover_crop_preview(content: bytes) -> tuple[bytes, tuple[int, int], tuple[int, int]]:
+    with Image.open(io.BytesIO(content)) as raw_image:
+        source_image = ImageOps.exif_transpose(raw_image).convert("RGB")
+    source_size = source_image.size
+    source_image.thumbnail((480, 480), Image.Resampling.LANCZOS)
+    preview_size = source_image.size
+    output = io.BytesIO()
+    source_image.save(output, format="JPEG", quality=84, optimize=True)
+    return output.getvalue(), source_size, preview_size
+
+
+def _render_recipe_cover_review(
+    st,
+    store: MobileSyncStore,
+    config: UIConfig,
+    *,
+    fixed_output_folder: Path | None = None,
+    advance_state_key: str | None = None,
+) -> None:
     reviews = store.list_recipe_cover_reviews()
     if not reviews:
         st.info("还没有可审核的菜谱。")
         return
-    state_counts = Counter(_cover_review_state(str(item["cover_status"])) for item in reviews)
-    metrics = st.columns(3)
-    metrics[0].metric("待审核", state_counts["待审核"])
-    metrics[1].metric("已确认", state_counts["已确认"])
-    metrics[2].metric("暂无图片", state_counts["暂无合适图片"])
+    if fixed_output_folder is not None:
+        fixed_folder = fixed_output_folder.resolve()
+        visible = [
+            item
+            for item in reviews
+            if Path(str(item["output_folder"])).resolve() == fixed_folder
+        ]
+    else:
+        state_counts = Counter(_cover_review_state(str(item["cover_status"])) for item in reviews)
+        metrics = st.columns(3)
+        metrics[0].metric("待审核", state_counts["待审核"])
+        metrics[1].metric("已确认", state_counts["已确认"])
+        metrics[2].metric("暂无图片", state_counts["暂无合适图片"])
 
-    filter_columns = st.columns([2, 1])
-    review_filter = filter_columns[0].selectbox(
-        "审核状态",
-        ["待审核", "已确认", "暂无合适图片", "全部"],
-        key="mobile_cover_review_filter",
-    )
-    published_only = filter_columns[1].toggle(
-        "只看已上架",
-        value=True,
-        key="mobile_cover_published_only",
-    )
-    visible = [
-        item for item in reviews
-        if (not published_only or item["published"])
-        and (review_filter == "全部" or _cover_review_state(str(item["cover_status"])) == review_filter)
-    ]
+        filter_columns = st.columns([2, 1])
+        review_filter = filter_columns[0].selectbox(
+            "审核状态",
+            ["待审核", "已确认", "暂无合适图片", "全部"],
+            key="mobile_cover_review_filter",
+        )
+        published_only = filter_columns[1].toggle(
+            "只看已上架",
+            value=True,
+            key="mobile_cover_published_only",
+        )
+        visible = [
+            item for item in reviews
+            if (not published_only or item["published"])
+            and (review_filter == "全部" or _cover_review_state(str(item["cover_status"])) == review_filter)
+        ]
     if not visible:
-        st.success("这个范围已经全部处理完成。")
+        st.info("当前菜谱不在可审核列表中。")
         return
 
-    visible_ids = [str(item["id"]) for item in visible]
-    next_recipe_id = st.session_state.pop("_next_mobile_cover_recipe", None)
-    if next_recipe_id in visible_ids:
-        st.session_state["mobile_cover_recipe_select"] = next_recipe_id
-    elif st.session_state.get("mobile_cover_recipe_select") not in visible_ids:
-        st.session_state["mobile_cover_recipe_select"] = visible_ids[0]
-    by_id = {str(item["id"]): item for item in visible}
-    selected_id = st.selectbox(
-        "选择菜品",
-        visible_ids,
-        format_func=lambda value: f"{by_id[value]['title']} · {_cover_review_state(str(by_id[value]['cover_status']))}",
-        key="mobile_cover_recipe_select",
-    )
-    selected = by_id[selected_id]
+    if fixed_output_folder is not None:
+        selected = visible[0]
+        selected_id = str(selected["id"])
+    else:
+        visible_ids = [str(item["id"]) for item in visible]
+        next_recipe_id = st.session_state.pop("_next_mobile_cover_recipe", None)
+        if next_recipe_id in visible_ids:
+            st.session_state["mobile_cover_recipe_select"] = next_recipe_id
+        elif st.session_state.get("mobile_cover_recipe_select") not in visible_ids:
+            st.session_state["mobile_cover_recipe_select"] = visible_ids[0]
+        by_id = {str(item["id"]): item for item in visible}
+        selected_id = st.selectbox(
+            "选择菜品",
+            visible_ids,
+            format_func=lambda value: f"{by_id[value]['title']} · {_cover_review_state(str(by_id[value]['cover_status']))}",
+            key="mobile_cover_recipe_select",
+        )
+        selected = by_id[selected_id]
     folder = Path(str(selected["output_folder"]))
     candidate_state_key = f"mobile_cover_candidates_{selected_id}"
     crop_state_key = f"mobile_cover_crop_{selected_id}"
@@ -2618,6 +2655,17 @@ def _render_recipe_cover_review(st, store: MobileSyncStore, config: UIConfig) ->
         store.index_recipes()
         st.session_state.pop(candidate_state_key, None)
         st.session_state.pop(crop_state_key, None)
+        if fixed_output_folder is not None:
+            remaining = [
+                item
+                for item in reviews
+                if str(item["id"]) != selected_id
+                and _cover_review_state(str(item["cover_status"])) == "待审核"
+            ]
+            if advance_state_key:
+                st.session_state[advance_state_key] = str(remaining[0]["id"]) if remaining else ""
+            _rerun_with_notice(st, message)
+            return
         remaining = [
             str(item["id"])
             for item in reviews
@@ -2724,39 +2772,46 @@ def _render_recipe_cover_review(st, store: MobileSyncStore, config: UIConfig) ->
                 "裁剪框锁定为手机菜单的 4:3 比例。"
             )
             try:
-                with Image.open(io.BytesIO(crop_source["content"])) as raw_image:
-                    source_image = raw_image.convert("RGB")
-                cropped_image, crop_box = st_cropper(
-                    source_image,
+                preview_content, source_dimensions, preview_dimensions = _cover_crop_preview(
+                    crop_source["content"]
+                )
+                with Image.open(io.BytesIO(preview_content)) as preview_file:
+                    preview_image = preview_file.convert("RGB")
+                preview_crop_box = st_cropper(
+                    preview_image,
                     realtime_update=True,
                     box_color="#c44932",
                     aspect_ratio=(4, 3),
-                    return_type="both",
+                    return_type="box",
                     key=f"mobile_cover_rectangle_{selected_id}_{crop_token}",
+                    should_resize_image=False,
                     stroke_width=4,
                 )
-                source_size = {"width": source_image.width, "height": source_image.height}
+                crop_box = scale_crop_box(
+                    preview_crop_box,
+                    from_size=preview_dimensions,
+                    to_size=source_dimensions,
+                )
+                source_size = {"width": source_dimensions[0], "height": source_dimensions[1]}
             except Exception as exc:  # noqa: BLE001
                 st.error(f"图片无法裁剪：{_clean_error(exc)}")
-                cropped_image = None
                 crop_box = None
                 source_size = None
-            if cropped_image is not None and crop_box is not None:
+            if crop_box is not None:
                 st.caption(
                     f"当前区域：{int(crop_box['width'])} × {int(crop_box['height'])} 像素；"
-                    "矩形框内就是手机菜单最终显示内容。"
+                    "这里只传输轻量预览，保存时会从原图高清裁剪。"
                 )
             crop_actions = st.columns(2)
             if crop_actions[0].button(
                 "确认裁剪并通过审核",
                 type="primary",
-                disabled=cropped_image is None,
+                disabled=crop_box is None,
                 key=f"mobile_cover_crop_confirm_{selected_id}_{crop_token}",
                 width="stretch",
             ):
                 try:
-                    output = io.BytesIO()
-                    cropped_image.convert("RGB").save(output, format="JPEG", quality=92)
+                    cropped_content = crop_screenshot_box_content(crop_source["content"], crop_box)
                     saved_original_size = source_size
                     saved_crop_box = {
                         key: int(round(float(crop_box[key])))
@@ -2795,7 +2850,7 @@ def _render_recipe_cover_review(st, store: MobileSyncStore, config: UIConfig) ->
                         }
                     save_recipe_cover_content(
                         folder,
-                        output.getvalue(),
+                        cropped_content,
                         timestamp=crop_source.get("timestamp"),
                         status=str(crop_source.get("status") or "manual_crop"),
                         source_kind=str(crop_source.get("source_kind") or "upload"),
@@ -2995,6 +3050,215 @@ def _render_recipe_cover_review(st, store: MobileSyncStore, config: UIConfig) ->
         finish_review(f"《{selected['title']}》暂时留空，后续可随时补图。")
 
 
+def _save_quick_review_identity(folder: Path, *, title: str, category: str) -> None:
+    recipe_path = folder / "recipe.json"
+    recipe_data = _recipe_to_data(recipe_path)
+    old_title = str(recipe_data.get("title") or "").strip()
+    recipe_data["title"] = title
+    recipe_data["category"] = category
+    atomic_write_json(recipe_path, recipe_data)
+    note_path = folder / "note.md"
+    if old_title != title and note_path.is_file():
+        note_lines = note_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        for index, line in enumerate(note_lines):
+            if line.startswith("# "):
+                newline = "\n" if line.endswith("\n") else ""
+                note_lines[index] = f"# {title}{newline}"
+                atomic_write_text(note_path, "".join(note_lines))
+                break
+
+
+def _render_quick_recipe_review(st, config: UIConfig) -> None:
+    st.subheader("快速审核")
+    st.caption(
+        "一条内容从左到右完成：确认是否为菜谱 → 修正菜名与分类 → 选择并裁剪成品图。"
+        "确认封面或选择暂时留空后，会自动进入下一条。"
+    )
+    try:
+        store = MobileSyncStore(Path.cwd(), out_dir=config.out_dir)
+        store.index_recipes()
+        reviews = store.list_recipe_cover_reviews()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"快速审核数据加载失败：{_clean_error(exc)}")
+        return
+    if not reviews:
+        st.info("目前没有可审核的菜谱。")
+        return
+
+    pending = [
+        item for item in reviews
+        if _cover_review_state(str(item["cover_status"])) == "待审核"
+    ]
+    metrics = st.columns(3)
+    metrics[0].metric("总数", len(reviews))
+    metrics[1].metric("已完成", len(reviews) - len(pending))
+    metrics[2].metric("待处理", len(pending))
+    st.progress(
+        (len(reviews) - len(pending)) / len(reviews),
+        text=f"快速审核进度 {len(reviews) - len(pending)}/{len(reviews)}",
+    )
+
+    status_filter = st.radio(
+        "显示范围",
+        ["待处理", "全部"],
+        horizontal=True,
+        key="quick_review_filter",
+    )
+    visible = pending if status_filter == "待处理" else reviews
+    if not visible:
+        st.success("所有菜谱都已完成快速审核。可切换到“全部”重新修改。")
+        return
+    visible_ids = [str(item["id"]) for item in visible]
+    preferred_folder = st.session_state.pop("_quick_review_preferred_folder", None)
+    preferred_recipe_id = next(
+        (
+            str(item["id"])
+            for item in visible
+            if preferred_folder
+            and Path(str(item["output_folder"])).resolve() == Path(str(preferred_folder)).resolve()
+        ),
+        None,
+    )
+    next_recipe_id = st.session_state.pop("_quick_review_next_recipe", None)
+    if preferred_recipe_id in visible_ids:
+        st.session_state["quick_review_select"] = preferred_recipe_id
+    elif next_recipe_id in visible_ids:
+        st.session_state["quick_review_select"] = next_recipe_id
+    elif st.session_state.get("quick_review_select") not in visible_ids:
+        st.session_state["quick_review_select"] = visible_ids[0]
+    review_by_id = {str(item["id"]): item for item in visible}
+    selected_id = st.selectbox(
+        "当前内容",
+        visible_ids,
+        format_func=lambda value: (
+            f"{review_by_id[value]['title']} · "
+            f"{_cover_review_state(str(review_by_id[value]['cover_status']))}"
+        ),
+        key="quick_review_select",
+    )
+    selected = review_by_id[selected_id]
+    folder = Path(str(selected["output_folder"]))
+    recipe_data, recipe_error = _safe_recipe_to_data(folder / "recipe.json")
+    if recipe_error or recipe_data is None:
+        st.error(f"菜谱文件无法读取：{recipe_error or '未知错误'}")
+        return
+
+    def next_pending_id() -> str:
+        return next(
+            (
+                str(item["id"])
+                for item in reviews
+                if str(item["id"]) != selected_id
+                and _cover_review_state(str(item["cover_status"])) == "待审核"
+            ),
+            "",
+        )
+
+    st.markdown("#### 1. 内容归类与标题")
+    source_details = " · ".join(
+        value
+        for value in (
+            str(recipe_data.get("creator_name") or recipe_data.get("uploader") or "").strip(),
+            str(recipe_data.get("video_title") or "").strip(),
+        )
+        if value
+    )
+    if source_details:
+        st.caption(source_details)
+    source_url = str(recipe_data.get("source_url") or selected.get("source_url") or "").strip()
+    if source_url:
+        st.link_button("打开原视频核对", source_url)
+
+    category_values = ["未分类", *RECIPE_CATEGORIES]
+    current_category = str(recipe_data.get("category") or "未分类")
+    if current_category not in category_values:
+        category_values.insert(1, current_category)
+    with st.form(f"quick_review_identity_{selected_id}"):
+        classification = st.radio(
+            "内容归类",
+            ["recipe", "technique", "non_recipe"],
+            format_func={
+                "recipe": "有效菜谱",
+                "technique": "烹饪技巧 / 学习资料",
+                "non_recipe": "非菜谱 / 广告 / 无用信息",
+            }.get,
+            horizontal=True,
+        )
+        corrected_title = st.text_input(
+            "最终菜名",
+            value=str(recipe_data.get("title") or selected["title"]),
+            help="会同步修正菜单标题和笔记一级标题。",
+        ).strip()
+        corrected_category = st.selectbox(
+            "菜品分类",
+            category_values,
+            index=category_values.index(current_category),
+        )
+        save_identity = st.form_submit_button(
+            (
+                "保存并继续选图"
+                if classification == "recipe"
+                else "标记烹饪技巧并进入下一条"
+                if classification == "technique"
+                else "标记非菜谱并进入下一条"
+            ),
+            type="primary",
+            width="stretch",
+        )
+    if save_identity:
+        try:
+            if classification in {"non_recipe", "technique"}:
+                if not source_url:
+                    raise ValueError("缺少来源网址，无法建立来源分类去重记录")
+                store.set_video_classifications(
+                    [source_url],
+                    classification,
+                    creator_name=str(
+                        recipe_data.get("creator_name") or recipe_data.get("uploader") or ""
+                    ).strip() or None,
+                )
+                st.session_state["_quick_review_next_recipe"] = next_pending_id()
+                store.index_recipes()
+                label = "烹饪技巧学习资料" if classification == "technique" else "非菜谱"
+                _rerun_with_notice(
+                    st,
+                    f"已将《{recipe_data.get('title') or selected['title']}》归类为{label}，并从点餐菜单移除。",
+                )
+            if not corrected_title:
+                raise ValueError("最终菜名不能为空")
+            _save_quick_review_identity(
+                folder,
+                title=corrected_title,
+                category=corrected_category,
+            )
+            if source_url:
+                store.set_video_classifications([source_url], "recipe")
+            store.index_recipes()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"保存归类和标题失败：{_clean_error(exc)}")
+        else:
+            _rerun_with_notice(st, f"已保存《{corrected_title}》的归类和标题，请继续确认成品图。")
+
+    skip_columns = st.columns([1, 3])
+    if skip_columns[0].button("跳过这一条", key=f"quick_review_skip_{selected_id}"):
+        st.session_state["_quick_review_next_recipe"] = next_pending_id()
+        st.rerun()
+    skip_columns[1].caption("跳过不会修改任何数据，下次仍会出现在待处理列表。")
+
+    if classification in {"non_recipe", "technique"}:
+        st.warning("选择非菜谱或烹饪技巧后无需选图；点击上方确认即可移出菜单并保留来源记录。")
+        return
+    st.divider()
+    st.markdown("#### 2. 选择并裁剪成品图")
+    _render_recipe_cover_review(
+        st,
+        store,
+        config,
+        fixed_output_folder=folder,
+        advance_state_key="_quick_review_next_recipe",
+    )
+
+
 def _render_mobile_client_admin(st, config: UIConfig) -> None:
     st.subheader("手机客户端")
     try:
@@ -3006,6 +3270,50 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
 
     st.markdown("#### Chef Zhai 家庭厨房（推荐）")
     st.caption("手机直接打开 8765 端口即可加入家庭餐桌；完成点餐后由一台设备认领本餐主厨。")
+    st.markdown("#### 餐厅品牌设置")
+    st.caption("Logo 会自动压缩为透明 PNG 并保存到工作区。以后只需替换这里的文件，点餐网页和菜单长图都会同步更新。")
+    branding_columns = st.columns([1, 1, 1.2])
+    with branding_columns[0]:
+        config.restaurant_name = st.text_input("餐厅名称", value=config.restaurant_name, key="restaurant_name")
+    with branding_columns[1]:
+        config.restaurant_subtitle = st.text_input("副标题", value=config.restaurant_subtitle, key="restaurant_subtitle")
+    with branding_columns[2]:
+        uploaded_logo = st.file_uploader(
+            "上传 Logo（PNG/JPG/WebP，≤5 MiB）",
+            type=["png", "jpg", "jpeg", "webp"],
+            key="restaurant_logo_upload",
+        )
+    logo_path = default_logo_path()
+    if logo_path.is_file():
+        preview_columns = st.columns([1, 2, 2])
+        preview_columns[0].image(str(logo_path), caption="当前 Logo", width=150)
+        if preview_columns[1].button("替换 Logo", type="primary", key="restaurant_logo_replace", disabled=uploaded_logo is None):
+            try:
+                save_logo(uploaded_logo.getvalue(), Path.cwd())
+                config.restaurant_logo_path = "logo.png"
+                save_config(config)
+                st.success("Logo 已更新，点餐页刷新后立即生效。")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+        if preview_columns[2].button("清除 Logo，恢复文字版", key="restaurant_logo_clear"):
+            remove_logo(Path.cwd())
+            config.restaurant_logo_path = None
+            save_config(config)
+            st.success("已恢复文字版品牌标识。")
+            st.rerun()
+    elif uploaded_logo is not None and st.button("上传并启用 Logo", type="primary", key="restaurant_logo_upload_button"):
+        try:
+            save_logo(uploaded_logo.getvalue(), Path.cwd())
+            config.restaurant_logo_path = "logo.png"
+            save_config(config)
+            st.success("Logo 已启用，点餐页刷新后立即生效。")
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+    if st.button("保存品牌文字", key="restaurant_branding_save"):
+        save_config(config)
+        st.success("品牌名称和副标题已保存。")
     with st.expander("高级功能：旧网页版菜谱包"):
         st.caption("仅用于旧离线网页版兼容；新局域网客户端无需手动导入。")
         image_mode_labels = {"all": "全部步骤图", "first": "每道菜仅一张（推荐）", "none": "只导出文字"}
@@ -3167,17 +3475,11 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
         st.success(f"已恢复 {changed} 道菜。")
         st.rerun()
 
-    st.markdown("##### 成品图审核")
-    st.caption("人工确认菜单封面：优先复用已有步骤图，不合适时再从原视频补充候选或上传真实照片。")
-    cover_review_open = st.toggle(
-        "打开成品图审核台",
-        value=False,
-        key="mobile_cover_review_open",
-        help="打开状态会在生成候选图、裁剪和页面刷新后保持，不需要重复展开。",
-    )
-    if cover_review_open:
-        with st.container(border=True):
-            _render_recipe_cover_review(st, store, config)
+    st.markdown("##### 菜谱快速审核")
+    st.caption("归类、标题修正、菜品分类、选图和裁剪已集中到快速审核，不再在菜单管理页重复操作。")
+    if st.button("打开快速审核", type="primary", key="mobile_open_quick_review"):
+        st.session_state["_next_page"] = "快速审核"
+        st.rerun()
 
     st.markdown("##### 导出常用菜单图片")
     st.caption(
@@ -3239,9 +3541,12 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
                 MenuImageOptions(
                     title=menu_title.strip() or "Chef Zhai 常用菜单",
                     subtitle=menu_subtitle.strip(),
+                    brand_name=config.restaurant_name,
+                    brand_subtitle=config.restaurant_subtitle,
                     footer=menu_footer.strip(),
                     image_format=menu_image_format,
                     include_photos=include_menu_photos,
+                    logo_path=str(default_logo_path()) if default_logo_path().is_file() else None,
                 ),
             )
             st.session_state["mobile_menu_image_result"] = {
@@ -4287,6 +4592,9 @@ def main() -> None:
     if active_page == "审核确认":
         _render_recipe_review(st, config)
 
+    if active_page == "快速审核":
+        _render_quick_recipe_review(st, config)
+
     if active_page == "最终菜谱整理":
         _render_curation_review(st, config)
 
@@ -4549,27 +4857,37 @@ def main() -> None:
                 st.dataframe([_batch_item_row(item) for item in visible_batch_items], width="stretch")
                 markable_items = [
                     item for item in selected_state.items
-                    if item.status not in {"raw_running", "recipe_running", "running", "non_recipe"}
+                    if item.status not in {"raw_running", "recipe_running", "running", "non_recipe", "technique"}
                 ]
                 if markable_items and batch_source_store is not None:
-                    with st.expander("归类广告或无用视频为非菜谱"):
+                    with st.expander("归类来源：非菜谱或烹饪技巧"):
                         st.caption(
-                            "被标记的视频会保留来源记录，但从点餐菜单移除；以后再次导入相同链接时会自动跳过。"
+                            "两类来源都会保留并从点餐菜单移除；烹饪技巧视频可在知识库页面继续提取和沉淀学习内容。"
+                        )
+                        source_classification = st.radio(
+                            "归类类型",
+                            ["non_recipe", "technique"],
+                            format_func={
+                                "non_recipe": "非菜谱 / 广告 / 无用信息",
+                                "technique": "烹饪技巧 / 学习资料",
+                            }.get,
+                            horizontal=True,
+                            key=f"batch_source_classification_{selected_batch_id}",
                         )
                         non_recipe_urls = st.multiselect(
-                            "选择非菜谱视频",
+                            "选择视频",
                             [item.url for item in markable_items],
-                            key=f"batch_non_recipe_urls_{selected_batch_id}",
+                            key=f"batch_classification_urls_{selected_batch_id}",
                         )
                         if st.button(
-                            "确认归类为非菜谱",
+                            "确认归类",
                             disabled=not non_recipe_urls,
-                            key=f"batch_mark_non_recipe_{selected_batch_id}",
+                            key=f"batch_mark_source_{selected_batch_id}",
                         ):
                             creator = str(selected_state.options.get("creator_name") or "").strip() or None
                             batch_source_store.set_video_classifications(
                                 non_recipe_urls,
-                                "non_recipe",
+                                source_classification,
                                 creator_name=creator,
                                 batch_id=selected_batch_id,
                             )
@@ -4578,8 +4896,12 @@ def main() -> None:
                             for item in selected_state.items:
                                 if item.url not in selected_urls:
                                     continue
-                                item.status = "non_recipe"
-                                item.error = "人工归类为非菜谱"
+                                item.status = source_classification
+                                item.error = (
+                                    "人工归类为烹饪技巧"
+                                    if source_classification == "technique"
+                                    else "人工归类为非菜谱"
+                                )
                                 item.finished_at = stamp
                                 for stage in item.stages.values():
                                     stage.status = "done"
@@ -4589,7 +4911,9 @@ def main() -> None:
                             batch_source_store.index_recipes()
                             _rerun_with_notice(
                                 st,
-                                f"已将 {len(non_recipe_urls)} 条视频归类为非菜谱，并从点餐菜单中移除。",
+                                f"已将 {len(non_recipe_urls)} 条视频归类为"
+                                f"{'烹饪技巧学习资料' if source_classification == 'technique' else '非菜谱'}，"
+                                "并从点餐菜单中移除。",
                             )
                 batch_log = read_batch_log(selected_batch_id)
                 if batch_log:
@@ -4620,10 +4944,15 @@ def main() -> None:
                         batch_folder / "recipe.json",
                         key_prefix=f"batch_{selected_state.batch_id}_{_record_key(batch_folder)}_rating_",
                     )
-                    col_detail, col_edit, col_review, col_archive = st.columns(4)
+                    col_detail, col_quick, col_edit, col_review, col_archive = st.columns(5)
                     with col_detail:
                         if st.button("查看这条", key=f"batch_detail_{selected_state.batch_id}"):
                             _navigate_to_record(st, "菜谱详情", batch_folder)
+                    with col_quick:
+                        if st.button("快速审核", key=f"batch_quick_{selected_state.batch_id}"):
+                            st.session_state["_quick_review_preferred_folder"] = str(batch_folder)
+                            st.session_state["_next_page"] = "快速审核"
+                            st.rerun()
                     with col_edit:
                         if st.button("编辑这条", key=f"batch_edit_{selected_state.batch_id}"):
                             _navigate_to_record(st, "编辑修复", batch_folder)
@@ -4669,16 +4998,21 @@ def main() -> None:
                         )
 
         if batch_source_store is not None:
-            excluded_sources = batch_source_store.list_video_sources("non_recipe")
+            excluded_sources = [
+                item
+                for item in batch_source_store.list_video_sources()
+                if item.get("classification") in {"non_recipe", "technique"}
+            ]
             if excluded_sources:
-                with st.expander(f"已排除的非菜谱来源（{len(excluded_sources)}）"):
-                    st.caption("这里保留的是去重记录。若误判，可恢复后在下一次批处理中重新生成。")
+                with st.expander(f"已归档的非菜谱/烹饪技巧来源（{len(excluded_sources)}）"):
+                    st.caption("这里保留来源去重记录；烹饪技巧可前往知识库提取干货，误判时可恢复为菜谱。")
                     st.dataframe(
                         [
                             {
                                 "UP 主": item.get("creator_name") or "",
                                 "视频": item.get("title") or item.get("source_url") or "",
                                 "来源": item.get("source_url") or "",
+                                "归类": "烹饪技巧" if item.get("classification") == "technique" else "非菜谱",
                                 "更新时间": item.get("updated_at") or "",
                             }
                             for item in excluded_sources[:200]
@@ -4687,14 +5021,14 @@ def main() -> None:
                         width="stretch",
                     )
                     restore_urls = st.multiselect(
-                        "恢复为待识别来源",
+                        "恢复为菜谱来源",
                         [str(item["source_url"]) for item in excluded_sources],
-                        key="batch_restore_non_recipe_urls",
+                        key="batch_restore_excluded_urls",
                     )
                     if st.button(
                         "恢复所选来源",
                         disabled=not restore_urls,
-                        key="batch_restore_non_recipe",
+                        key="batch_restore_excluded",
                     ):
                         batch_source_store.set_video_classifications(restore_urls, "recipe")
                         batch_source_store.index_recipes()
@@ -5677,13 +6011,79 @@ def main() -> None:
             else:
                 st.success(f"已同步 {len(synced)} 条技巧到 {_vault_path(config) / '烹饪技巧'}")
 
-        st.markdown("#### 从历史视频提取")
         items = scan_history(config.out_dir)
+        history_by_source = {item.source_url: item for item in items if item.source_url}
+        try:
+            technique_sources = MobileSyncStore(Path.cwd(), out_dir=config.out_dir).list_video_sources("technique")
+        except Exception:
+            technique_sources = []
+        if technique_sources:
+            with st.expander(f"已归类的烹饪技巧视频（{len(technique_sources)}）", expanded=True):
+                st.caption("这些视频不会进入点餐菜单，但会保留在这里作为学习资料；可直接选中并提取通用技巧。")
+                technique_rows = [
+                    {
+                        "视频": (
+                            item.get("title")
+                            or (
+                                history_by_source[item.get("source_url")].title
+                                if item.get("source_url") in history_by_source
+                                else ""
+                            )
+                            or item.get("source_url")
+                            or ""
+                        ),
+                        "UP 主": item.get("creator_name") or "",
+                        "来源": item.get("source_url") or "",
+                    }
+                    for item in technique_sources[:200]
+                ]
+                st.dataframe(technique_rows, hide_index=True, width="stretch")
+                technique_labels = {}
+                for item in technique_sources:
+                    history_item = history_by_source.get(str(item.get("source_url") or ""))
+                    label = (
+                        f"{item.get('title') or (history_item.title if history_item else '') or item.get('source_url') or '未命名'}"
+                        f" | {item.get('source_url') or ''}"
+                    )
+                    technique_labels[label] = {
+                        **item,
+                        "output_folder": str(
+                            item.get("output_folder")
+                            or (history_item.output_folder if history_item else "")
+                        ),
+                    }
+                selected_technique_label = st.selectbox(
+                    "选择一条技巧视频",
+                    [""] + list(technique_labels),
+                    key="kb_technique_source_select",
+                )
+                if selected_technique_label and st.button(
+                    "载入下方提取器",
+                    key="kb_load_technique_source",
+                ):
+                    st.session_state["_kb_preferred_folder"] = technique_labels[selected_technique_label].get(
+                        "output_folder"
+                    )
+                    st.rerun()
+
+        st.markdown("#### 从历史视频提取")
         analyzable = [item for item in items if item.note_path or item.transcript_path or item.recipe_path]
         if not analyzable:
             st.info("没有可提取知识的视频记录。")
         else:
             video_options = _history_options(analyzable)
+            preferred_folder = st.session_state.pop("_kb_preferred_folder", None)
+            if preferred_folder:
+                preferred_label = next(
+                    (
+                        label
+                        for label, history_item in video_options.items()
+                        if history_item.output_folder.resolve() == Path(str(preferred_folder)).resolve()
+                    ),
+                    None,
+                )
+                if preferred_label:
+                    st.session_state["kb_video_select"] = preferred_label
             selected_video = video_options[st.selectbox("选择视频", list(video_options), key="kb_video_select")]
             col_one, col_all = st.columns(2)
             with col_one:
@@ -5930,7 +6330,7 @@ def main() -> None:
             processable_urls = [url for url in selected_urls if url not in known_non_recipe_urls]
             if known_non_recipe_urls:
                 st.info(
-                    f"其中 {len(known_non_recipe_urls)} 条已归类为非菜谱，创建批次时会自动排除。"
+                    f"其中 {len(known_non_recipe_urls)} 条已归类为非菜谱或烹饪技巧，创建批次时会自动排除。"
                 )
             creator_target_label = st.radio(
                 "立即运行时的目标阶段",

@@ -123,6 +123,24 @@ def test_non_recipe_sources_are_remembered_excluded_and_reversible(tmp_path: Pat
     assert len(store.list_indexed_recipes()) == 1
 
 
+def test_technique_sources_are_retained_but_excluded_from_menu(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "火候技巧")
+    recipe_data = json.loads((folder / "recipe.json").read_text(encoding="utf-8"))
+    source_url = str(recipe_data["source_url"])
+    store = MobileSyncStore(tmp_path)
+
+    assert store.index_recipes()["indexed"] == 1
+    assert store.set_video_classifications([source_url], "technique") == 1
+    assert store.known_non_recipe_urls([source_url]) == {source_url}
+    assert store.index_recipes()["indexed"] == 0
+    technique_sources = store.list_video_sources("technique")
+    assert len(technique_sources) == 1
+    assert technique_sources[0]["source_url"] == source_url
+
+    store.set_video_classifications([source_url], "recipe")
+    assert store.index_recipes()["indexed"] == 1
+
+
 def test_recipe_cover_is_published_as_the_preferred_asset(tmp_path: Path) -> None:
     folder = _recipe(tmp_path, "成品图菜谱")
     cover = folder / "images" / "cover.jpg"

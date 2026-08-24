@@ -187,7 +187,7 @@ def selectable_items(
     resume_mode: str,
     target_stage: str = "recipe",
 ) -> list[BatchQueueItem]:
-    eligible = [item for item in state.items if item.status != "non_recipe"]
+    eligible = [item for item in state.items if item.status not in {"non_recipe", "technique"}]
     if resume_mode == "retry-failed":
         return [
             item

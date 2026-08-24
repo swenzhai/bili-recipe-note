@@ -33,9 +33,12 @@ CATEGORY_ORDER = ("主厨推荐", "海鲜", "面条", "主食", "糕点", "汤�
 class MenuImageOptions:
     title: str = "Chef Zhai · 本周菜单"
     subtitle: str = "主厨精选 · 新鲜现做"
+    brand_name: str = "Chef Zhai"
+    brand_subtitle: str = "家庭厨房"
     footer: str = "请直接回复菜名预订 · 菜品以当日供应为准"
     image_format: MenuImageFormat = "share"
     include_photos: bool = True
+    logo_path: str | Path | None = None
 
 
 @dataclass(frozen=True)
@@ -180,23 +183,36 @@ def _draw_header(
     draw.ellipse((width - 370, -190, width + 150, 330), outline="#8A4E42", width=3)
     draw.ellipse((width - 270, -90, width + 45, 225), outline="#8A4E42", width=2)
     margin = 110 if width > 1500 else 52
+    logo_width = 0
+    if options.logo_path:
+        try:
+            with Image.open(options.logo_path) as source:
+                logo = source.convert("RGBA")
+                logo.thumbnail((190 if width > 1500 else 120, height - 100), Image.Resampling.LANCZOS)
+                logo_x = margin
+                logo_y = max(24, (height - logo.height) // 2)
+                image.paste(logo, (logo_x, logo_y), logo)
+                logo_width = logo.width + (30 if width > 1500 else 22)
+        except (OSError, ValueError):
+            logo_width = 0
     brand_size = 29 if width > 1500 else 20
-    draw.text((margin, 54 if compact else 70), "C H E F   Z H A I", font=_font(brand_size, "bold"), fill=GOLD)
+    brand_x = margin + logo_width
+    draw.text((brand_x, 54 if compact else 70), "  ".join(options.brand_name.upper()), font=_font(brand_size, "bold"), fill=GOLD)
     title_size = 78 if width > 1500 else 52
     title_y = 100 if compact else (130 if width > 1500 else 120)
-    max_title_width = width - margin * 2 - (250 if width > 1500 else 80)
-    title = _fit_text(draw, options.title or "Chef Zhai 常用菜单", _font(title_size, "serif"), max_title_width)
-    draw.text((margin, title_y), title, font=_font(title_size, "serif"), fill="#FFF8EC")
+    max_title_width = width - brand_x - margin - (250 if width > 1500 else 80)
+    title = _fit_text(draw, options.title or f"{options.brand_name} 常用菜单", _font(title_size, "serif"), max_title_width)
+    draw.text((brand_x, title_y), title, font=_font(title_size, "serif"), fill="#FFF8EC")
     if not compact:
         subtitle_size = 31 if width > 1500 else 26
         subtitle = _fit_text(draw, options.subtitle, _font(subtitle_size), max_title_width)
-        draw.text((margin, title_y + title_size + 28), subtitle, font=_font(subtitle_size), fill="#E7D3C0")
+        draw.text((brand_x, title_y + title_size + 28), subtitle, font=_font(subtitle_size), fill="#E7D3C0")
         badge_text = f"当季常用菜单  ·  {recipe_count} 道"
         badge_font = _font(28 if width > 1500 else 21, "bold")
         badge_width = int(_text_width(draw, badge_text, badge_font)) + 46
         badge_y = height - (90 if width > 1500 else 72)
-        draw.rounded_rectangle((margin, badge_y, margin + badge_width, badge_y + 48), radius=24, fill=GOLD)
-        draw.text((margin + 23, badge_y + 8), badge_text, font=badge_font, fill=DARK_RED)
+        draw.rounded_rectangle((brand_x, badge_y, brand_x + badge_width, badge_y + 48), radius=24, fill=GOLD)
+        draw.text((brand_x + 23, badge_y + 8), badge_text, font=badge_font, fill=DARK_RED)
 
 
 def _draw_category_header(draw: ImageDraw.ImageDraw, category: str, y: int, width: int, margin: int, *, large: bool) -> int:

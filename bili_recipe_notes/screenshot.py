@@ -176,6 +176,44 @@ def crop_screenshot_content(
         return _optimize_image(cropped)
 
 
+def scale_crop_box(
+    crop_box: dict[str, int | float],
+    *,
+    from_size: tuple[int, int],
+    to_size: tuple[int, int],
+) -> dict[str, int]:
+    """Translate preview crop coordinates to the source image without exceeding its bounds."""
+
+    from_width, from_height = (int(value) for value in from_size)
+    to_width, to_height = (int(value) for value in to_size)
+    if min(from_width, from_height, to_width, to_height) <= 0:
+        raise ValueError("crop dimensions must be positive")
+    scale_x = to_width / from_width
+    scale_y = to_height / from_height
+    left = min(to_width - 1, max(0, int(round(float(crop_box["left"]) * scale_x))))
+    top = min(to_height - 1, max(0, int(round(float(crop_box["top"]) * scale_y))))
+    width = max(1, int(round(float(crop_box["width"]) * scale_x)))
+    height = max(1, int(round(float(crop_box["height"]) * scale_y)))
+    return {
+        "left": left,
+        "top": top,
+        "width": min(width, to_width - left),
+        "height": min(height, to_height - top),
+    }
+
+
+def crop_screenshot_box_content(content: bytes, crop_box: dict[str, int]) -> bytes:
+    """Crop the original image at an explicit pixel box, preserving source resolution."""
+
+    with Image.open(io.BytesIO(content)) as source:
+        image = ImageOps.exif_transpose(source).convert("RGB")
+        left = min(image.width - 1, max(0, int(crop_box["left"])))
+        top = min(image.height - 1, max(0, int(crop_box["top"])))
+        right = min(image.width, left + max(1, int(crop_box["width"])))
+        bottom = min(image.height, top + max(1, int(crop_box["height"])))
+        return _encoded_jpeg(image.crop((left, top, right, bottom)), 94)
+
+
 def score_screenshot(content: bytes) -> float:
     """Estimate whether a frame is readable, detailed and visually informative."""
 

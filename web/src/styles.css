@@ -70,6 +70,7 @@
 .historyMeal span{color:var(--muted);text-align:right}
 .historyError{color:var(--red)}
 
+ .brandLockup{display:flex;align-items:center;gap:11px;min-height:42px}.brandLockup small{display:block;color:var(--muted);font-size:11px;margin-top:3px}.brandLogo{width:48px;height:48px;object-fit:contain;border-radius:10px;background:#fffaf1;border:1px solid var(--line)}.brandLogoFallback{display:grid;place-items:center;width:48px;height:48px;border-radius:10px;background:var(--deep);color:#f5d08a;font:700 9px Georgia,serif;letter-spacing:.08em;text-align:center;padding:4px}
 @media (max-width:520px){
   .shell{padding-left:12px;padding-right:12px}
   .recipe{grid-template-columns:72px minmax(0,1fr) 42px;gap:10px}

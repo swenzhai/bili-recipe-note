@@ -20,6 +20,8 @@ from .mobile_sync import (
     ValidationError,
     is_private_client,
 )
+from .branding import branding_payload, configured_logo_path
+from .config import load_config
 
 
 class PairRequest(BaseModel):
@@ -97,6 +99,17 @@ def create_app(
             "revision": store.current_revision(),
             "self_join_enabled": store.self_join_enabled(),
         }
+
+    @app.get("/api/v1/branding")
+    def branding() -> dict[str, Any]:
+        return branding_payload(load_config(store.project_root), store.project_root, logo_url="/api/v1/branding/logo")
+
+    @app.get("/api/v1/branding/logo")
+    def branding_logo():
+        path = configured_logo_path(load_config(store.project_root), store.project_root)
+        if path is None:
+            raise HTTPException(status_code=404, detail="Logo not configured")
+        return FileResponse(path, media_type="image/png", filename=path.name)
 
     @app.post("/api/v1/join")
     def join(payload: JoinRequest) -> dict[str, Any]:

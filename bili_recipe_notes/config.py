@@ -31,6 +31,9 @@ class UIConfig:
     obsidian_vault_dir: str = "obsidian-vault"
     auto_archive_after_generation: bool = False
     archive_knowledge_with_recipe: bool = True
+    restaurant_name: str = "Chef Zhai"
+    restaurant_subtitle: str = "家庭厨房"
+    restaurant_logo_path: str | None = None
 
 
 def config_path(project_root: Path | None = None) -> Path:

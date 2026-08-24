@@ -17,6 +17,7 @@ from bili_recipe_notes.screenshot import (
     MIN_AUTOMATIC_SCREENSHOT_SCORE,
     capture_screenshot_at,
     crop_screenshot_content,
+    crop_screenshot_box_content,
     finished_dish_candidate_timestamps,
     capture_step_screenshots,
     optimize_screenshot,
@@ -26,6 +27,7 @@ from bili_recipe_notes.screenshot import (
     generate_screenshot_candidates,
     subtitle_likelihood,
     select_key_step_indices,
+    scale_crop_box,
     step_candidate_timestamps,
 )
 
@@ -175,6 +177,25 @@ def test_menu_crop_rejects_invalid_controls() -> None:
 
     with pytest.raises(ValueError, match="zoom"):
         crop_screenshot_content(buffer.getvalue(), zoom=0.5)
+
+
+def test_preview_crop_coordinates_preserve_high_resolution_source() -> None:
+    source = Image.new("RGB", (1920, 1080), "black")
+    source.paste((230, 40, 20), (480, 0, 1920, 1080))
+    buffer = io.BytesIO()
+    source.save(buffer, format="JPEG", quality=95)
+
+    crop_box = scale_crop_box(
+        {"left": 120, "top": 0, "width": 360, "height": 270},
+        from_size=(480, 270),
+        to_size=(1920, 1080),
+    )
+    cropped_content = crop_screenshot_box_content(buffer.getvalue(), crop_box)
+
+    assert crop_box == {"left": 480, "top": 0, "width": 1440, "height": 1080}
+    with Image.open(io.BytesIO(cropped_content)) as cropped:
+        assert cropped.size == (1440, 1080)
+        assert cropped.width / cropped.height == pytest.approx(4 / 3)
 
 
 def test_cover_optimization_preserves_more_detail_than_step_images() -> None:

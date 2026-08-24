@@ -174,6 +174,32 @@ def test_persistent_batch_skips_database_non_recipe_sources(monkeypatch, tmp_pat
     assert state.items[0].stages["recipe"].status == "done"
 
 
+def test_persistent_batch_skips_database_technique_sources(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    source_url = "https://www.bilibili.com/video/BV1technique"
+    database = tmp_path / ".bili-recipe-notes" / "mobile-sync.sqlite3"
+    store = MobileSyncStore(tmp_path, out_dir=tmp_path / "outputs", database_path=database)
+    store.set_video_classifications([source_url], "technique")
+    processed: list[str] = []
+    monkeypatch.setattr(pipeline, "generate_recipe_note", lambda options, log=None: processed.append(options.url))
+
+    result = run_batch(
+        BatchJobOptions(
+            urls=[source_url],
+            out=str(tmp_path / "outputs"),
+            batch_id="technique-batch",
+            source_database_path=str(database),
+        )
+    )
+    state = load_batch_state("technique-batch", project_root=tmp_path)
+
+    assert result.items == []
+    assert processed == []
+    assert state.items[0].status == "technique"
+    assert state.items[0].stages["raw"].status == "done"
+    assert state.items[0].stages["recipe"].status == "done"
+
+
 def test_run_batch_resume_unfinished_processes_pending_and_failed(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
     state = create_batch_state(["https://x/done", "https://x/pending", "https://x/failed"], {}, batch_id="batch2", project_root=tmp_path)

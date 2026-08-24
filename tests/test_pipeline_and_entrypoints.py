@@ -715,6 +715,29 @@ def test_ui_cleans_ansi_error_text() -> None:
     assert ui._clean_error(Exception("\x1b[0;31mERROR:\x1b[0m failed")) == "ERROR: failed"
 
 
+def test_quick_review_updates_recipe_and_note_titles(tmp_path: Path) -> None:
+    import bili_recipe_notes.ui as ui
+
+    folder = tmp_path / "recipe"
+    folder.mkdir()
+    recipe_path = folder / "recipe.json"
+    note_path = folder / "note.md"
+    recipe_path.write_text(
+        json.dumps({"title": "旧菜名", "category": "未分类"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    note_path.write_text("# 旧菜名\n\n正文中的旧菜名保留。\n", encoding="utf-8")
+
+    ui._save_quick_review_identity(folder, title="修正菜名", category="主食")
+
+    updated = json.loads(recipe_path.read_text(encoding="utf-8"))
+    assert updated["title"] == "修正菜名"
+    assert updated["category"] == "主食"
+    assert note_path.read_text(encoding="utf-8") == "# 修正菜名\n\n正文中的旧菜名保留。\n"
+    assert (folder / "recipe.json.bak").is_file()
+    assert (folder / "note.md.bak").is_file()
+
+
 def test_capture_raw_material_stops_before_recipe_generation(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         pipeline,

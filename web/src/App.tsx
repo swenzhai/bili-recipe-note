@@ -24,6 +24,7 @@ type Practice = { id: string; recipe_id: string; cooked_on: string; rating?: num
 type Plan = { id: string; name: string; items: { recipe_id: string; title: string; servings_multiplier: number; note: string }[]; version: number };
 type Pair = { base_url: string; pairing_token: string };
 type Device = { id: string; name: string; token: string };
+type Branding = { name: string; subtitle: string; has_logo: boolean; logo_url?: string | null };
 type Operation = { op_id: string; entity_type: string; entity_id?: string; action: string; base_version?: number; order_id?: string; epoch?: number; phase?: MealPhase; stage?: Exclude<MealPhase, "ordering">; recipe_id?: string; device_id?: string; quantity?: number; note?: string; completed?: boolean; plan_id?: string; payload?: Record<string, unknown> };
 type QueuedOperation = Operation & { sequence?: number; queued_at?: number };
 type Change = { entity_type: string; action: string; payload: Record<string, unknown> };
@@ -292,6 +293,7 @@ export default function App() {
   const [deviceName, setDeviceName] = useState("");
   const [joinEnabled, setJoinEnabled] = useState(true);
   const [selected, setSelected] = useState<Recipe | null>(null);
+  const [branding, setBranding] = useState<Branding>({ name: "Chef Zhai", subtitle: "家庭厨房", has_logo: false });
   const mealRef = useRef<Meal | null>(null);
   const cursorRef = useRef(0);
   const syncing = useRef(false);
@@ -318,6 +320,7 @@ export default function App() {
       cursorRef.current = restoredCursor; setCursor(restoredCursor); void writeState("capability_key", CAPABILITY_KEY);
     });
     void fetch("/api/v1/health").then(response => response.json()).then(health => setJoinEnabled(Boolean(health.self_join_enabled))).catch(() => undefined);
+    void fetch("/api/v1/branding").then(response => response.ok ? response.json() : null).then(value => { if (value?.name) setBranding(value as Branding); }).catch(() => undefined);
     const updateOnline = () => setOnline(navigator.onLine);
     window.addEventListener("online", updateOnline); window.addEventListener("offline", updateOnline);
     return () => { window.removeEventListener("online", updateOnline); window.removeEventListener("offline", updateOnline); };
@@ -518,10 +521,11 @@ export default function App() {
     if (selectedCategory !== "全部" && !categoryCounts.get(selectedCategory)) setSelectedCategory("全部");
   }, [categoryCounts, selectedCategory]);
 
-  if (!device) return <main className="pairing"><div className="brand">CHEF ZHAI</div><h1>加入 Chef Zhai 家庭厨房</h1><p>首次使用只需取一个设备名称，以后打开这个网址会自动进入家庭餐桌。</p>{joinEnabled ? <><input value={deviceName} onChange={event => setDeviceName(event.target.value)} placeholder="例如：小王的手机" autoFocus /><button onClick={() => void pairDevice()}>进入家庭厨房</button></> : <p className="hint">管理员暂时关闭了新设备加入。已加入的设备仍可正常使用。</p>}{notice && <div className="notice">{notice}</div>}</main>;
+  const brandLockup = <div className="brandLockup">{branding.has_logo && branding.logo_url ? <img className="brandLogo" src={branding.logo_url} alt={branding.name} /> : <div className="brandLogoFallback">{branding.name.toUpperCase()}</div>}<div><span className="eyebrow">{branding.name}</span><small>{branding.subtitle}</small></div></div>;
+  if (!device) return <main className="pairing">{brandLockup}<h1>加入 {branding.name} {branding.subtitle}</h1><p>首次使用只需取一个设备名称，以后打开这个网址会自动进入家庭餐桌。</p>{joinEnabled ? <><input value={deviceName} onChange={event => setDeviceName(event.target.value)} placeholder="例如：小王的手机" autoFocus /><button onClick={() => void pairDevice()}>进入家庭厨房</button></> : <p className="hint">管理员暂时关闭了新设备加入。已加入的设备仍可正常使用。</p>}{notice && <div className="notice">{notice}</div>}</main>;
 
   return <main className="shell">
-    <header><div><span className="eyebrow">CHEF ZHAI · 家庭厨房</span><h1>{tab === "menu" ? "今日菜单" : isOrdering ? "家庭点餐" : isChef ? "主厨烹饪台" : "本餐进度"}</h1></div><span className={online ? "online" : "offline"}>{online ? "在线" : "断线重试"}</span></header>
+    <header><div>{brandLockup}<h1>{tab === "menu" ? "今日菜单" : isOrdering ? "家庭点餐" : isChef ? "主厨烹饪台" : "本餐进度"}</h1></div><span className={online ? "online" : "offline"}>{online ? "在线" : "断线重试"}</span></header>
     <div className="content">{tab === "menu" ? <>
       <input className="search" value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索当前分类中的菜名、食材…" />
       <div className="categoryBar" role="tablist" aria-label="菜品分类">

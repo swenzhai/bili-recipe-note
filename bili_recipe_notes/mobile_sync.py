@@ -527,10 +527,10 @@ class MobileSyncStore:
     def index_recipes(self) -> dict[str, Any]:
         candidates: dict[str, list[tuple[float, Path, dict[str, Any], list[dict[str, Any]], str]]] = {}
         with self._connect() as connection:
-            non_recipe_keys = {
+            excluded_source_keys = {
                 str(row["source_key"])
                 for row in connection.execute(
-                    "SELECT source_key FROM video_sources WHERE classification='non_recipe'"
+                    "SELECT source_key FROM video_sources WHERE classification IN ('non_recipe','technique')"
                 )
             }
         if self.out_dir.exists():
@@ -541,7 +541,7 @@ class MobileSyncStore:
                 recipe = _read_object(recipe_path)
                 if not recipe or not isinstance(recipe.get("steps"), list):
                     continue
-                if normalize_source_url(str(recipe.get("source_url") or "")) in non_recipe_keys:
+                if normalize_source_url(str(recipe.get("source_url") or "")) in excluded_source_keys:
                     continue
                 recipe_id = self._recipe_id(folder, recipe, _read_object(folder / "job.json"))
                 payload = {**recipe, "id": recipe_id, "schema_version": SCHEMA_VERSION}
@@ -620,14 +620,27 @@ class MobileSyncStore:
         return {"indexed": len(chosen), "changed": changed, "deleted": deleted, "duplicates": duplicates}
 
     def known_non_recipe_urls(self, urls: Iterable[str]) -> set[str]:
+        return self.known_video_urls(urls, classifications={"non_recipe", "technique"})
+
+    def known_video_urls(
+        self,
+        urls: Iterable[str],
+        *,
+        classifications: set[str] | frozenset[str] | None = None,
+    ) -> set[str]:
         keyed = {normalize_source_url(url): str(url) for url in urls if normalize_source_url(url)}
         if not keyed:
             return set()
+        selected_classifications = classifications or {"non_recipe", "technique"}
+        if not selected_classifications:
+            return set()
         placeholders = ",".join("?" for _ in keyed)
+        classification_placeholders = ",".join("?" for _ in selected_classifications)
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT source_key FROM video_sources WHERE classification='non_recipe' AND source_key IN ({placeholders})",
-                tuple(keyed),
+                "SELECT source_key FROM video_sources "
+                f"WHERE classification IN ({classification_placeholders}) AND source_key IN ({placeholders})",
+                (*selected_classifications, *keyed),
             ).fetchall()
         return {keyed[str(row["source_key"])] for row in rows}
 
@@ -639,8 +652,8 @@ class MobileSyncStore:
         creator_name: str | None = None,
         batch_id: str | None = None,
     ) -> int:
-        if classification not in {"recipe", "non_recipe"}:
-            raise ValidationError("classification must be recipe or non_recipe")
+        if classification not in {"recipe", "non_recipe", "technique"}:
+            raise ValidationError("classification must be recipe, non_recipe, or technique")
         values = [(normalize_source_url(url), str(url).strip()) for url in urls]
         values = [(key, url) for key, url in values if key and url]
         now = utc_now()
@@ -662,7 +675,10 @@ class MobileSyncStore:
         parameters = (classification,) if classification else ()
         with self._connect() as connection:
             rows = connection.execute(
-                f"SELECT * FROM video_sources {where} ORDER BY updated_at DESC", parameters
+                "SELECT video_sources.*, recipes.output_folder AS output_folder "
+                "FROM video_sources LEFT JOIN recipes ON recipes.id = video_sources.recipe_id "
+                f"{where} ORDER BY video_sources.updated_at DESC",
+                parameters,
             ).fetchall()
         return [dict(row) for row in rows]
 
