@@ -18,6 +18,7 @@ from typing import Any, Iterable, Iterator
 from urllib.parse import parse_qs, urlparse
 
 from .config import CONFIG_DIR_NAME, load_config
+from .cover_policy import has_manually_approved_cover
 from .storage import atomic_write_json
 
 
@@ -476,7 +477,12 @@ class MobileSyncStore:
     def _assets_for_recipe(self, folder: Path, payload: dict[str, Any], recipe_id: str) -> list[dict[str, Any]]:
         found: list[dict[str, Any]] = []
         root = folder.resolve()
-        cover_raw = str(payload.get("cover_image_path") or "").strip()
+        payload.pop("cover_image_sha256", None)
+        cover_raw = (
+            str(payload.get("cover_image_path") or "").strip()
+            if has_manually_approved_cover(payload)
+            else ""
+        )
         if cover_raw and "://" not in cover_raw:
             cover_path = (folder / cover_raw).resolve()
             try:

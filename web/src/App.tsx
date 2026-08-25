@@ -179,12 +179,9 @@ function pendingActionKey(operation: Partial<Operation>): string | undefined {
 }
 
 function recipeThumbnail(recipe?: Recipe): string | undefined {
-  if (recipe?.cover_image_status === "no_suitable") return undefined;
+  if (!recipe || !["manual_video", "manual_step", "manual_timestamp", "manual_crop", "uploaded"].includes(recipe.cover_image_status || "")) return undefined;
   return recipe?.cover_image_sha256
-    || recipe?.assets?.find(asset => asset.kind === "recipe_cover")?.sha256
-    || [...(recipe?.steps || [])].reverse().find(step => step.image_sha256)?.image_sha256
-    || recipe?.assets?.find(asset => asset.kind === "recipe_image")?.sha256
-    || recipe?.assets?.[0]?.sha256;
+    || recipe?.assets?.find(asset => asset.kind === "recipe_cover")?.sha256;
 }
 
 function recipeOrderCategories(recipe: Recipe): OrderCategory[] {
@@ -675,7 +672,7 @@ function DishThumbnail({ recipe, server, token }: { recipe?: Recipe; server: str
     if (root.current) observer.observe(root.current);
     return () => observer.disconnect();
   }, [digest]);
-  return <div className="dishThumbnail" ref={root}>{digest && visible && <AuthenticatedImage digest={digest} server={server} token={token} alt={recipe?.title || "菜品图片"} />}</div>;
+  return <div className={`dishThumbnail ${digest ? "" : "placeholder"}`} ref={root}>{digest && visible ? <AuthenticatedImage digest={digest} server={server} token={token} alt={recipe?.title || "菜品图片"} /> : !digest && <span aria-label="暂无人工确认封面">待选图</span>}</div>;
 }
 
 function AuthenticatedImage({ digest, server, token, alt = "实践照片" }: { digest: string; server: string; token: string; alt?: string }) {

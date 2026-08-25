@@ -16,6 +16,7 @@ def _recipe(
     published: bool = True,
     recommended: bool = False,
     digest: str = "",
+    cover_status: str | None = None,
 ) -> dict:
     return {
         "id": title,
@@ -25,6 +26,8 @@ def _recipe(
         "recommended": recommended,
         "ingredients": [],
         "steps": [{"image_sha256": digest}] if digest else [],
+        "cover_image_status": cover_status,
+        "cover_image_sha256": digest if cover_status else None,
     }
 
 
@@ -74,3 +77,21 @@ def test_generate_print_menu_paginates_and_zips() -> None:
     assert all(file.width == 2480 and file.height == 3508 for file in result.files)
     with zipfile.ZipFile(io.BytesIO(menu_image_zip(result))) as archive:
         assert archive.namelist() == [file.name for file in result.files]
+
+
+def test_menu_image_only_resolves_manually_approved_cover(tmp_path: Path) -> None:
+    photo_path = tmp_path / "dish.jpg"
+    Image.new("RGB", (640, 480), "#b95742").save(photo_path)
+    requested: list[str] = []
+
+    generate_menu_images(
+        [
+            _recipe("自动图", digest="auto", cover_status="auto_finished_dish"),
+            _recipe("步骤图", digest="step"),
+            _recipe("人工图", digest="manual", cover_status="manual_crop"),
+        ],
+        lambda digest: requested.append(digest) or (photo_path, "image/jpeg"),
+        MenuImageOptions(image_format="share"),
+    )
+
+    assert requested == ["manual"]

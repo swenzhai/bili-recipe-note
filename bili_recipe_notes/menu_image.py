@@ -13,6 +13,8 @@ from typing import Any, Callable, Iterable, Literal
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+from .cover_policy import has_manually_approved_cover
+
 
 MenuImageFormat = Literal["share", "print"]
 AssetResolver = Callable[[str], tuple[Path, str] | None]
@@ -224,18 +226,12 @@ def _draw_category_header(draw: ImageDraw.ImageDraw, category: str, y: int, widt
 
 
 def _recipe_digest(recipe: dict[str, Any]) -> str:
-    if recipe.get("cover_image_status") == "no_suitable":
+    if not has_manually_approved_cover(recipe):
         return ""
     if recipe.get("cover_image_sha256"):
         return str(recipe["cover_image_sha256"])
     for asset in recipe.get("assets") or []:
         if isinstance(asset, dict) and asset.get("kind") == "recipe_cover" and asset.get("sha256"):
-            return str(asset["sha256"])
-    for step in reversed(recipe.get("steps") or []):
-        if isinstance(step, dict) and step.get("image_sha256"):
-            return str(step["image_sha256"])
-    for asset in recipe.get("assets") or []:
-        if isinstance(asset, dict) and asset.get("sha256"):
             return str(asset["sha256"])
     return ""
 

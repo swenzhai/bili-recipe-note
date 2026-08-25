@@ -29,6 +29,7 @@ try:
     from .branding import default_logo_path, remove_logo, save_logo
     from .config import UIConfig, load_config, save_config
     from .content_analysis import ContentAnalysisOptions, analyze_video_content
+    from .cover_policy import MANUALLY_APPROVED_COVER_STATUSES
     from .curation import (
         CURATION_DECISION_VALUES,
         DEFAULT_CURATION_REVIEW_DIR,
@@ -133,6 +134,7 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
     from bili_recipe_notes.branding import default_logo_path, remove_logo, save_logo
     from bili_recipe_notes.config import UIConfig, load_config, save_config
     from bili_recipe_notes.content_analysis import ContentAnalysisOptions, analyze_video_content
+    from bili_recipe_notes.cover_policy import MANUALLY_APPROVED_COVER_STATUSES
     from bili_recipe_notes.curation import (
         CURATION_DECISION_VALUES,
         DEFAULT_CURATION_REVIEW_DIR,
@@ -2549,7 +2551,7 @@ def _lan_ip_address() -> str:
 def _cover_review_state(status: str) -> str:
     if status == "no_suitable":
         return "暂无合适图片"
-    if status in {"manual_video", "manual_step", "manual_timestamp", "manual_crop", "uploaded"}:
+    if status in MANUALLY_APPROVED_COVER_STATUSES:
         return "已确认"
     return "待审核"
 

@@ -10,6 +10,7 @@
 .recipe>button:last-child:disabled{cursor:not-allowed;opacity:.32}
 .dishThumbnail{width:88px;aspect-ratio:4/3;overflow:hidden;background:#e8e3d9;border:1px solid rgba(40,34,27,.08)}
 .dishThumbnail img{display:block;width:100%;height:100%;object-fit:cover}
+.dishThumbnail.placeholder{display:grid;place-items:center;background:linear-gradient(145deg,#eee6d9,#dfd5c5);color:#978c7b}.dishThumbnail.placeholder span{font-size:11px;font-weight:700;letter-spacing:.08em}
 .mealDish{display:grid;grid-template-columns:88px minmax(0,1fr) auto;gap:12px;align-items:start;padding:10px}
 .mealDishBody{min-width:0}
 .controls{flex-wrap:wrap;justify-content:flex-end}

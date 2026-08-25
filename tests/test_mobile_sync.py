@@ -148,6 +148,7 @@ def test_recipe_cover_is_published_as_the_preferred_asset(tmp_path: Path) -> Non
     recipe_path = folder / "recipe.json"
     recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
     recipe["cover_image_path"] = "images/cover.jpg"
+    recipe["cover_image_status"] = "manual_video"
     recipe["cover_image_time"] = 73.5
     recipe["cover_source_kind"] = "video_frame"
     recipe["cover_source_label"] = "原视频候选帧"
@@ -175,6 +176,25 @@ def test_recipe_cover_is_published_as_the_preferred_asset(tmp_path: Path) -> Non
     assert review["cover_original_size"] == {"width": 1920, "height": 1080}
     assert review["cover_crop_box"] == {"left": 240, "top": 0, "width": 1440, "height": 1080}
     assert review["cover_selected_at"] == "2026-08-20T10:00:00+00:00"
+
+
+def test_automatic_cover_is_not_published_as_menu_thumbnail(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "自动封面菜谱")
+    cover = folder / "images" / "cover.jpg"
+    cover.write_bytes(b"automatic-cover")
+    recipe_path = folder / "recipe.json"
+    recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
+    recipe["cover_image_path"] = "images/cover.jpg"
+    recipe["cover_image_status"] = "auto_finished_dish"
+    recipe_path.write_text(json.dumps(recipe, ensure_ascii=False), encoding="utf-8")
+    store = MobileSyncStore(tmp_path)
+
+    store.index_recipes()
+
+    published = store.list_recipes()[0]
+    assert "cover_image_sha256" not in published
+    assert not any(asset["kind"] == "recipe_cover" for asset in published["assets"])
+    assert any(asset["kind"] == "recipe_image" for asset in published["assets"])
 
 
 def test_recipe_identity_uses_part_number_and_persists_random_fallback(tmp_path: Path) -> None:
