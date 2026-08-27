@@ -249,6 +249,7 @@ PAGES = [
     "单视频生成",
     "任务仪表盘",
     "菜谱库全览",
+    "烹饪技巧",
     "菜谱详情",
     "本餐点菜",
     "烹饪模式",
@@ -268,7 +269,7 @@ PAGES = [
 PAGE_GROUPS = {
     "采集与生成": ["任务仪表盘", "单视频生成", "批量处理", "UP 主链接"],
     "审阅与成稿": ["草稿与归档", "快速审核", "审核确认", "编辑修复", "最终菜谱整理"],
-    "使用与知识": ["菜谱库全览", "菜谱详情", "本餐点菜", "烹饪模式", "知识库", "二次分析", "手机客户端"],
+    "使用与知识": ["菜谱库全览", "烹饪技巧", "菜谱详情", "本餐点菜", "烹饪模式", "知识库", "二次分析", "手机客户端"],
     "系统与迁移": ["工作交接", "环境检查"],
 }
 PAGE_GROUP_BY_PAGE = {
@@ -1552,6 +1553,83 @@ def _library_count_rows(
         }
         for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
     ]
+
+
+def _render_cooking_tips_column(st, config: UIConfig) -> None:
+    """Render the read-only cooking-technique column, separate from recipes."""
+    st.subheader("烹饪技巧专栏")
+    st.caption("这里仅整理和查看通用烹饪技巧；菜谱用料、步骤和点餐功能请前往菜谱相关页面。")
+    all_entries = load_knowledge_entries()
+    if not all_entries:
+        st.info("还没有烹饪技巧。可在“知识库”页面从历史视频提取并确认技巧。")
+        return
+
+    categories = sorted({entry.category for entry in all_entries if entry.category})
+    filter_columns = st.columns([3, 1, 1])
+    query = filter_columns[0].text_input(
+        "搜索技巧",
+        placeholder="火候、去腥、乳化、焯水...",
+        key="tips_column_query",
+    ).strip().casefold()
+    category = filter_columns[1].selectbox(
+        "分类",
+        ["全部", *categories],
+        key="tips_column_category",
+    )
+    sort_mode = filter_columns[2].selectbox(
+        "排序",
+        ["最近更新", "标题", "分类"],
+        key="tips_column_sort",
+    )
+
+    entries = [entry for entry in all_entries if category == "全部" or entry.category == category]
+    if query:
+        entries = [
+            entry
+            for entry in entries
+            if query in " ".join(
+                [entry.title, entry.category, entry.content, entry.rationale, *entry.tags]
+            ).casefold()
+        ]
+    if sort_mode == "标题":
+        entries.sort(key=lambda entry: (entry.title.casefold(), entry.id))
+    elif sort_mode == "分类":
+        entries.sort(key=lambda entry: (entry.category.casefold(), entry.title.casefold(), entry.id))
+    else:
+        entries.sort(key=lambda entry: (entry.updated_at or entry.created_at or "", entry.id), reverse=True)
+
+    approved_count = sum(entry.review_status == "approved" for entry in all_entries)
+    metric_columns = st.columns(3)
+    metric_columns[0].metric("技巧条目", len(entries))
+    metric_columns[1].metric("分类", len(categories))
+    metric_columns[2].metric("已确认", approved_count)
+    if not entries:
+        st.info("当前筛选条件下没有技巧条目。")
+        return
+
+    st.caption("点击条目查看做法要点、适用场景和来源证据。")
+    for entry in entries:
+        status = "已确认" if entry.review_status == "approved" else "待确认"
+        label = f"{entry.title} · {entry.category} · {status}"
+        with st.expander(label, expanded=len(entries) == 1):
+            st.markdown(entry.content)
+            if entry.rationale:
+                st.markdown("**原理**")
+                st.markdown(entry.rationale)
+            if entry.applicable_to:
+                st.markdown("**适用场景**")
+                st.markdown("\n".join(f"- {item}" for item in entry.applicable_to))
+            if entry.tags:
+                st.caption("标签：" + "、".join(entry.tags))
+            source_lines = [
+                f"来源：{entry.source_title}" if entry.source_title else "",
+                f"链接：{entry.source_url}" if entry.source_url else "",
+                f"依据：{entry.evidence}" if entry.evidence else "",
+            ]
+            source_text = "\n".join(line for line in source_lines if line)
+            if source_text:
+                st.markdown("**来源与证据**")
+                st.code(source_text, language="text")
 
 
 def _render_library_overview(st, config: UIConfig) -> None:
@@ -4335,6 +4413,9 @@ def main() -> None:
     if active_page == "菜谱库全览":
         _render_library_overview(st, config)
 
+    if active_page == "烹饪技巧":
+        _render_cooking_tips_column(st, config)
+
     if active_page == "菜谱详情":
         _render_recipe_detail(st, config)
 
@@ -5726,7 +5807,8 @@ def main() -> None:
                         )
 
     if active_page == "知识库":
-        st.subheader("个人厨艺知识库")
+        st.subheader("个人厨艺知识库（提取与管理）")
+        st.caption("这里负责提取、确认、编辑、去重和同步；只读查看请使用“烹饪技巧专栏”。")
         kb_path = knowledge_base_path()
         all_entries = load_knowledge_entries()
         categories = sorted({entry.category for entry in all_entries})

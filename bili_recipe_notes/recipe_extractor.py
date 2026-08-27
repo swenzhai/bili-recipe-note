@@ -90,6 +90,7 @@ class Recipe(BaseModel):
     summary_tips: list[str]
     uncertain_points: list[str]
     extraction_method: str = "rule"
+    review_status: str = "draft"
 
 
 STEP_KEYWORDS = [
