@@ -115,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         nargs="?",
         const="",
-        help="Export app source, recipe outputs, images, and curation state as a portable ZIP",
+        help="Export recipe and knowledge data as a portable migration ZIP (source/runtime stay in Git)",
     )
     parser.add_argument(
         "--handoff-destination",

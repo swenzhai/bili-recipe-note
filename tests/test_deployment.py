@@ -115,37 +115,38 @@ def test_deployment_bundle_contains_portable_app_outputs_and_curation_state(tmp_
 
     with zipfile.ZipFile(result.path) as archive:
         names = set(archive.namelist())
-        assert "bili-recipe-notes/bili_recipe_notes/ui.py" in names
-        assert "bili-recipe-notes/start-ui-linux.sh" in names
-        launcher_info = archive.getinfo("bili-recipe-notes/start-ui-linux.sh")
-        assert ((launcher_info.external_attr >> 16) & stat.S_IXUSR) != 0
-        assert "bili-recipe-notes/outputs/宫保鸡丁--BV1demo/recipe.json" in names
-        assert "bili-recipe-notes/outputs/宫保鸡丁--BV1demo/images/step_01.jpg" in names
-        assert "bili-recipe-notes/outputs/curation-review/curation-decisions.json" in names
-        assert "bili-recipe-notes/DEPLOYMENT.md" in names
-        assert "bili-recipe-notes/.bili-recipe-notes/meal-plans.json" in names
-        assert "bili-recipe-notes/.bili-recipe-notes/knowledge_base.json" in names
+        assert "bili-recipe-notes/bili_recipe_notes/ui.py" not in names
+        assert "bili-recipe-notes/start-ui-linux.sh" not in names
+        assert "bili-recipe-notes/data/outputs/宫保鸡丁--BV1demo/recipe.json" in names
+        assert "bili-recipe-notes/data/outputs/宫保鸡丁--BV1demo/images/step_01.jpg" in names
+        assert "bili-recipe-notes/data/outputs/curation-review/curation-decisions.json" in names
+        assert "bili-recipe-notes/DATA-MIGRATION.md" in names
+        assert "bili-recipe-notes/data/.bili-recipe-notes/meal-plans.json" in names
+        assert "bili-recipe-notes/data/.bili-recipe-notes/knowledge_base.json" in names
         assert not any(name.endswith("media.mp4") for name in names)
         assert not any(name.endswith("job.json.bak") for name in names)
         assert not any(name.endswith("run.sh") for name in names)
         assert not any(".venv" in name for name in names)
 
-        config = json.loads(archive.read("bili-recipe-notes/.bili-recipe-notes/config.json"))
+        config = json.loads(archive.read("bili-recipe-notes/data/.bili-recipe-notes/config.json"))
         assert config["out_dir"] == "outputs"
         assert config["cookies"] is None
         assert config["obsidian_vault_dir"] == "obsidian-vault"
         batch = json.loads(
-            archive.read("bili-recipe-notes/.bili-recipe-notes/batches/batch-demo.json")
+            archive.read("bili-recipe-notes/data/.bili-recipe-notes/batches/batch-demo.json")
         )
+        assert "data_only" in manifest and manifest["data_only"] is True
+        assert manifest["data_root"] == "data"
+        assert manifest["app_file_count"] == 0
         assert batch["options"]["out"] == "outputs"
         assert batch["options"]["cookies"] is None
         assert batch["items"][0]["output_folder"] == "outputs/宫保鸡丁--BV1demo"
         assert batch["items"][0]["note_path"] == "outputs/宫保鸡丁--BV1demo/note.md"
-        job = json.loads(archive.read("bili-recipe-notes/outputs/宫保鸡丁--BV1demo/job.json"))
+        job = json.loads(archive.read("bili-recipe-notes/data/outputs/宫保鸡丁--BV1demo/job.json"))
         assert job["output_folder"] == "outputs/宫保鸡丁--BV1demo"
         assert job["recipe_path"] == "outputs/宫保鸡丁--BV1demo/recipe.json"
         review = json.loads(
-            archive.read("bili-recipe-notes/outputs/curation-review/recipe-review.json")
+            archive.read("bili-recipe-notes/data/outputs/curation-review/recipe-review.json")
         )
         assert review["source_output_dir"] == "outputs"
         assert review["groups"][0]["items"][0]["output_folder"] == "outputs/宫保鸡丁--BV1demo"

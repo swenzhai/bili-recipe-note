@@ -19,8 +19,9 @@ from .storage import atomic_write_text, backup_path
 
 
 DEPLOYMENT_FORMAT = "bili-recipe-notes-deployment"
-DEPLOYMENT_VERSION = 1
+DEPLOYMENT_VERSION = 2
 DEPLOYMENT_ROOT = "bili-recipe-notes"
+DATA_ROOT = "data"
 MAX_DEPLOYMENT_FILES = 100_000
 MAX_DEPLOYMENT_TOTAL_SIZE = 20 * 1024**3
 
@@ -278,35 +279,16 @@ def _state_files(project_root: Path) -> list[tuple[str, bytes]]:
 
 
 def _deployment_guide() -> bytes:
-    return """# Bili Recipe Notes 部署包
+    return """# Bili Recipe Notes 数据迁移包
 
-本包包含应用源码、全部菜谱/字幕/步骤图片、同名菜谱审核报告、已保存套餐、烹饪技巧知识库以及人工决定。
-不包含 Cookie、虚拟环境、Git 历史、缓存、原始音视频、备份文件或移动端数据库。
+本包只包含菜谱数据、字幕、步骤图片、知识库、套餐、批次和整理记录。
+应用源码、运行环境、Git 历史、Cookie、缓存、原始音视频、备份文件和移动端数据库不会写入本包。
 
-## Windows
+## 恢复数据
 
-1. 安装 64 位 Python 3.10 或更新版本。
-2. 在 PowerShell 中进入本目录：`py -3 -m venv .venv`。
-3. 运行 `.\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt`。
-4. 双击 `start-ui-windows.bat`，浏览器打开 `http://127.0.0.1:8501`。
+在目标电脑先从 Git 获取同版本应用，再将本包解压到临时目录；包内统一的 `data/` 目录包含全部可迁移数据。将其中的 `outputs/` 和 `.bili-recipe-notes/` 合并到 Git 项目根目录即可。
 
-## Linux（可信局域网）
-
-1. 运行 `chmod +x start-ui-linux.sh`。
-2. 运行 `./start-ui-linux.sh`；脚本会自动创建 `.venv`、安装依赖并显示局域网访问地址。
-3. 当前网页没有登录认证，请勿把 8501 或 8765 端口暴露到公网或公共 Wi-Fi。
-
-## macOS
-
-1. 运行 `python3 -m venv .venv`。
-2. 运行 `.venv/bin/python -m pip install -r requirements.txt`。
-3. 运行 `ARROW_DEFAULT_MEMORY_POOL=system .venv/bin/python -m streamlit run bili_recipe_notes/ui.py --server.address=127.0.0.1 --server.port=8501 --server.headless=true`。
-
-## 恢复整理工作
-
-进入网页“最终菜谱整理”，先点击“重新扫描输出”刷新新电脑上的绝对路径。人工决定按稳定目录 ID 单独保存在 `outputs/curation-review/curation-decisions.json`，不会被重新扫描覆盖。
-
-远程使用时不要把无认证页面直接监听到公网。请保留 `127.0.0.1`，并在自己的电脑执行 `ssh -N -L 8501:127.0.0.1:8501 用户名@服务器地址`。
+如果目标项目已有同名数据，解压前请先备份；批次、菜谱和知识库中的绝对路径会在导出时转换为可移植路径。
 """.encode("utf-8")
 
 
@@ -357,7 +339,6 @@ def export_deployment_bundle(
     target = target.resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    app_files = _application_files(root)
     output_files = _output_files(output_root)
     state_files = _state_files(root)
     records: list[dict[str, Any]] = []
@@ -366,29 +347,20 @@ def export_deployment_bundle(
     temporary_path = Path(temporary_name)
     try:
         with zipfile.ZipFile(temporary_path, "w", allowZip64=True) as archive:
-            for path, relative in app_files:
-                _write_member(
-                    archive,
-                    relative,
-                    path.read_bytes(),
-                    records,
-                    kind="app",
-                    executable=bool(path.stat().st_mode & stat.S_IXUSR),
-                )
             for path, relative in output_files:
                 _write_member(
                     archive,
-                    relative,
+                    PurePosixPath(DATA_ROOT) / relative,
                     _portable_output_bytes(path, relative),
                     records,
                     kind="output",
                     stored=path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"},
                 )
             for name, data in state_files:
-                _write_member(archive, PurePosixPath(name), data, records, kind="state")
+                _write_member(archive, PurePosixPath(DATA_ROOT) / PurePosixPath(name), data, records, kind="state")
             _write_member(
                 archive,
-                PurePosixPath("DEPLOYMENT.md"),
+                PurePosixPath("DATA-MIGRATION.md"),
                 _deployment_guide(),
                 records,
                 kind="guide",
@@ -398,7 +370,9 @@ def export_deployment_bundle(
                 "version": DEPLOYMENT_VERSION,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "root": DEPLOYMENT_ROOT,
-                "app_file_count": len(app_files),
+                "app_file_count": 0,
+                "data_only": True,
+                "data_root": DATA_ROOT,
                 "output_file_count": len(output_files),
                 "state_file_count": len(state_files),
                 "source_size_bytes": sum(record["size"] for record in records),
@@ -426,7 +400,7 @@ def export_deployment_bundle(
         path=target,
         checksum_path=checksum_path,
         sha256=archive_sha256,
-        app_file_count=len(app_files),
+        app_file_count=0,
         output_file_count=len(output_files),
         state_file_count=len(state_files),
         file_count=len(records),
@@ -458,6 +432,10 @@ def validate_deployment_bundle(path: str | Path) -> dict[str, Any]:
         manifest = json.loads(archive.read(manifest_name))
         if manifest.get("format") != DEPLOYMENT_FORMAT or manifest.get("version") != DEPLOYMENT_VERSION:
             raise ValueError("不支持的部署包格式或版本")
+        if manifest.get("data_only") is not True:
+            raise ValueError("部署包不是数据迁移包")
+        if manifest.get("data_root") != DATA_ROOT:
+            raise ValueError("部署包缺少统一 data 数据根目录")
         expected_names = {manifest_name}
         total_size = 0
         for record in manifest.get("files", []):
@@ -466,6 +444,8 @@ def validate_deployment_bundle(path: str | Path) -> dict[str, Any]:
             if name in expected_names or name not in names:
                 raise ValueError(f"部署包清单不一致：{relative}")
             expected_names.add(name)
+            if record.get("kind") == "app":
+                raise ValueError("数据迁移包不应包含应用文件")
             data = archive.read(name)
             total_size += len(data)
             raw_size = record.get("size")

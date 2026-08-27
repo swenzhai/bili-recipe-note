@@ -80,7 +80,7 @@ python -m bili_recipe_notes "https://www.bilibili.com/video/BVxxxx"
 - `--list-batches` / `--show-batch ID`（查看批次列表或逐条状态）
 - `--normalize-output-folders preview|apply`（预览或执行旧输出目录规范化）
 - `--export-curation-review [PATH]`（生成同名/近似名菜谱审核表）
-- `--export-deployment-bundle [PATH]`（导出源码、菜谱、图片和整理进度的跨平台部署包）
+- `--export-deployment-bundle [PATH]`（只导出菜谱、图片、知识库和整理进度的数据迁移包；源码与运行环境由 Git 管理）
 - `--export-handoff ID`（把批次和已完成工作导出为跨平台交接包）
 - `--import-handoff PATH`（校验并导入 `.handoff.zip`）
 - `--handoff-destination PATH`（指定交接包导出文件或目录）
@@ -219,39 +219,35 @@ python -m bili_recipe_notes --export-curation-review --out outputs
 
 ### 迁移到另一台电脑
 
-需要把当前源码、全部输出和整理进度一起搬走时，生成跨平台部署包：
+需要把当前菜谱数据、知识库和整理进度搬到另一台已从 Git 获取源码的服务器时，生成数据迁移包：
 
 ```bash
 python -m bili_recipe_notes --export-deployment-bundle --out outputs
 ```
 
-默认写入 `deployments/bili-recipe-notes-<时间>.deployment.zip`。包内包含当前应用源码、依赖清单、启动脚本、菜谱 JSON/Markdown、字幕、步骤图片、批次状态、整理报告和人工决定；不会包含 Cookie、`.venv`、Git 历史、缓存、原始音视频、`.bak`、已有 ZIP 或移动端数据库。导出结束前会逐文件校验大小和 SHA-256。
+默认写入 `deployments/bili-recipe-notes-<时间>.deployment.zip`。包内只包含菜谱 JSON/Markdown、字幕、步骤图片、知识库、批次状态、整理报告和人工决定；不会包含源码、依赖清单、启动脚本、Cookie、`.venv`、Git 历史、缓存、原始音视频、`.bak`、已有 ZIP 或移动端数据库。导出结束前会逐文件校验大小和 SHA-256。
 
-Windows PowerShell 解压后，在包内的 `bili-recipe-notes` 目录运行：
+目标服务器先从 Git 获取应用源码和运行环境，再把数据包解压到临时目录；包内统一的 `data/` 目录包含全部迁移数据。将 `data/outputs/` 和 `data/.bili-recipe-notes/` 合并到 Git 项目根目录即可。
+
+Windows PowerShell 数据包解压示例（假定 Git 项目位于 `C:\\apps\\bili-recipe-notes`）：
 
 ```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\start-ui-windows.bat
+Expand-Archive .\bili-recipe-notes-*.deployment.zip -DestinationPath C:\temp\bili-recipe-data
+Copy-Item -Recurse -Force C:\temp\bili-recipe-data\bili-recipe-notes\data\outputs\* C:\apps\bili-recipe-notes\outputs\
+Copy-Item -Recurse -Force C:\temp\bili-recipe-data\bili-recipe-notes\data\.bili-recipe-notes\* C:\apps\bili-recipe-notes\.bili-recipe-notes\
 ```
 
-Linux 解压后如需让可信局域网内的其他机器访问，运行：
+Linux 数据包解压示例（假定 Git 项目位于 `/srv/apps/bili-recipe-notes`）：
 
 ```bash
-chmod +x start-ui-linux.sh
-./start-ui-linux.sh
+unzip bili-recipe-notes-*.deployment.zip -d /tmp/bili-recipe-data
+rsync -a /tmp/bili-recipe-data/bili-recipe-notes/data/outputs/ /srv/apps/bili-recipe-notes/outputs/
+rsync -a /tmp/bili-recipe-data/bili-recipe-notes/data/.bili-recipe-notes/ /srv/apps/bili-recipe-notes/.bili-recipe-notes/
 ```
 
-macOS 解压后运行：
+macOS 数据包解压方式与 Linux 相同：
 
-```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-ARROW_DEFAULT_MEMORY_POOL=system .venv/bin/python -m streamlit run bili_recipe_notes/ui.py \
-  --server.address=127.0.0.1 --server.port=8501 --server.headless=true
-```
-
-首次进入“最终菜谱整理”后点击“重新扫描输出”，让报告路径适配新电脑。已经保存的人工决定使用稳定目录 ID，不会被重新扫描覆盖。包内另附 `DEPLOYMENT.md`，可离线查看相同步骤。
+数据恢复后从 Git 项目现有的启动方式启动应用；首次进入“最终菜谱整理”后点击“重新扫描输出”，让报告路径适配新服务器。包内另附 `DATA-MIGRATION.md`，可离线查看数据恢复说明。
 
 ### 本地 UI
 
@@ -393,7 +389,7 @@ UI 默认配置会保存到：
 
 点餐台可设置总人数、儿童人数和日常家宴、朋友聚餐、带小孩、清淡家宴等类型。系统根据现有菜谱的分类、标题、标签和完整度推荐荤菜、素菜、汤羹、主食等组合；带儿童时会降低明显辛辣和含酒菜品的优先级，但过敏原和实际忌口仍需人工确认。
 
-本餐中的每道菜可以单独调整份量倍率和备注，页面会生成跨菜品采购汇总并支持下载。组合可保存到 `.bili-recipe-notes/meal-plans.json`，同一套餐可以记录多次实践日期、评分和调整经验；完整部署包会携带套餐库，方便迁移到另一台服务器。
+本餐中的每道菜可以单独调整份量倍率和备注，页面会生成跨菜品采购汇总并支持下载。组合可保存到 `.bili-recipe-notes/meal-plans.json`，同一套餐可以记录多次实践日期、评分和调整经验；数据迁移包会携带套餐库，方便迁移到另一台服务器。
 
 ### 移动烹饪模式
 
