@@ -257,6 +257,16 @@ def _state_files(project_root: Path) -> list[tuple[str, bytes]]:
     meal_plans_path = config_root / "meal-plans.json"
     if meal_plans_path.is_file():
         files.append((".bili-recipe-notes/meal-plans.json", meal_plans_path.read_bytes()))
+    knowledge_path = config_root / "knowledge_base.json"
+    if knowledge_path.is_file():
+        files.append((".bili-recipe-notes/knowledge_base.json", knowledge_path.read_bytes()))
+        backup_path = knowledge_path.with_suffix(knowledge_path.suffix + ".bak")
+        if backup_path.is_file():
+            files.append((".bili-recipe-notes/knowledge_base.json.bak", backup_path.read_bytes()))
+    import_dir = config_root / "knowledge-imports"
+    for path in sorted(import_dir.glob("*")):
+        if path.is_file() and path.suffix.lower() not in {".bak", ".tmp"}:
+            files.append((f".bili-recipe-notes/knowledge-imports/{path.name}", path.read_bytes()))
     for path in sorted((config_root / "batches").glob("*.json")):
         if path.name.endswith(".json.bak"):
             continue
@@ -270,7 +280,7 @@ def _state_files(project_root: Path) -> list[tuple[str, bytes]]:
 def _deployment_guide() -> bytes:
     return """# Bili Recipe Notes 部署包
 
-本包包含应用源码、全部菜谱/字幕/步骤图片、同名菜谱审核报告、已保存套餐以及人工决定。
+本包包含应用源码、全部菜谱/字幕/步骤图片、同名菜谱审核报告、已保存套餐、烹饪技巧知识库以及人工决定。
 不包含 Cookie、虚拟环境、Git 历史、缓存、原始音视频、备份文件或移动端数据库。
 
 ## Windows

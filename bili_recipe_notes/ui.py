@@ -53,18 +53,23 @@ try:
     from .history import HistoryItem, scan_history
     from .handoff import export_batch_handoff, import_handoff_bundle
     from .knowledge_base import (
+        KNOWLEDGE_CATEGORIES,
         KnowledgeExtractionOptions,
         add_practice_record,
         delete_knowledge_entry,
         due_review_entries,
         export_knowledge_base,
         extract_knowledge_from_folders,
+        extract_knowledge_from_document,
         extract_knowledge_from_video,
+        knowledge_quality_issues,
         knowledge_base_path,
         load_knowledge_entries,
+        list_knowledge_backups,
         merge_knowledge_entries,
         record_knowledge_review,
         related_knowledge_for_recipe,
+        restore_knowledge_backup,
         search_knowledge_entries,
         suggest_duplicate_groups,
         update_knowledge_entry,
@@ -158,18 +163,23 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
     from bili_recipe_notes.history import HistoryItem, scan_history
     from bili_recipe_notes.handoff import export_batch_handoff, import_handoff_bundle
     from bili_recipe_notes.knowledge_base import (
+        KNOWLEDGE_CATEGORIES,
         KnowledgeExtractionOptions,
         add_practice_record,
         delete_knowledge_entry,
         due_review_entries,
         export_knowledge_base,
         extract_knowledge_from_folders,
+        extract_knowledge_from_document,
         extract_knowledge_from_video,
+        knowledge_quality_issues,
         knowledge_base_path,
         load_knowledge_entries,
+        list_knowledge_backups,
         merge_knowledge_entries,
         record_knowledge_review,
         related_knowledge_for_recipe,
+        restore_knowledge_backup,
         search_knowledge_entries,
         suggest_duplicate_groups,
         update_knowledge_entry,
@@ -1581,8 +1591,14 @@ def _render_cooking_tips_column(st, config: UIConfig) -> None:
         ["最近更新", "标题", "分类"],
         key="tips_column_sort",
     )
+    only_approved = st.checkbox("仅显示已确认技巧", value=True, key="tips_column_approved_only")
 
-    entries = [entry for entry in all_entries if category == "全部" or entry.category == category]
+    entries = [
+        entry
+        for entry in all_entries
+        if (not only_approved or entry.review_status == "approved")
+        and (category == "全部" or entry.category == category)
+    ]
     if query:
         entries = [
             entry
@@ -1630,6 +1646,11 @@ def _render_cooking_tips_column(st, config: UIConfig) -> None:
             if source_text:
                 st.markdown("**来源与证据**")
                 st.code(source_text, language="text")
+            if entry.source_url:
+                st.markdown(f"[打开来源]({entry.source_url})")
+            issues = knowledge_quality_issues(entry)
+            if issues:
+                st.warning("质量提醒：" + "、".join(issues))
 
 
 def _render_library_overview(st, config: UIConfig) -> None:
@@ -1855,6 +1876,8 @@ def _render_recipe_detail(st, config: UIConfig) -> None:
                 + " · ".join(value for value in (recipe.uploader, recipe.video_title) if value)
             )
 
+        _render_related_cooking_tips(st, selected.output_folder)
+
         st.markdown("### 用料")
         ingredient_column, seasoning_column = st.columns(2, gap="large")
         with ingredient_column:
@@ -1914,6 +1937,22 @@ def _render_recipe_detail(st, config: UIConfig) -> None:
             st.markdown("### 烹饪前请确认")
             for point in recipe.uncertain_points:
                 st.warning(str(point))
+
+
+def _render_related_cooking_tips(st, output_folder: Path) -> None:
+    try:
+        related = related_knowledge_for_recipe(output_folder, limit=4)
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"相关技巧暂时不可用：{_clean_error(exc)}")
+        return
+    if not related:
+        return
+    with st.expander(f"相关烹饪技巧（{len(related)}）", expanded=False):
+        for entry in related:
+            st.markdown(f"**{entry.title}** · {entry.category}")
+            st.write(entry.content)
+            if entry.source_url:
+                st.markdown(f"[查看来源]({entry.source_url})")
 
 
 MEAL_OCCASIONS = ["日常家宴", "朋友聚餐", "带小孩", "清淡家宴", "节日聚餐", "自定义"]
@@ -2513,6 +2552,8 @@ def _render_cooking_mode(st, config: UIConfig) -> None:
         )
     unit_system = "metric" if unit_label == "换算为公制" else "original"
     st.caption(f"当前用量倍率：{factor:.2f}×")
+
+    _render_related_cooking_tips(st, selected.output_folder)
 
     shopping_items = build_shopping_list(recipe, factor=factor, unit_system=unit_system)
     shopping_markdown = shopping_list_markdown(recipe, shopping_items, factor)
@@ -5812,6 +5853,7 @@ def main() -> None:
         kb_path = knowledge_base_path()
         all_entries = load_knowledge_entries()
         categories = sorted({entry.category for entry in all_entries})
+        category_options = list(dict.fromkeys([*KNOWLEDGE_CATEGORIES, *categories]))
         col_query, col_category = st.columns([3, 1])
         with col_query:
             knowledge_query = st.text_input("搜索知识", placeholder="火候、去腥、乳化、焯水...", key="kb_query")
@@ -5850,14 +5892,21 @@ def main() -> None:
                 if selected_entry.applicable_to:
                     st.markdown("#### 适用场景")
                     st.markdown("\n".join(f"- {item}" for item in selected_entry.applicable_to))
+                quality_issues = knowledge_quality_issues(selected_entry)
+                if quality_issues:
+                    st.warning("质量提醒：" + "、".join(quality_issues))
                 if selected_entry.evidence:
                     st.markdown("#### 视频依据")
                     st.markdown(selected_entry.evidence)
+                if selected_entry.source_excerpt:
+                    st.markdown("#### 原文摘录")
+                    st.caption(selected_entry.source_excerpt)
                 st.code(
                     "\n".join(
                         item
                         for item in [
                             f"来源标题：{selected_entry.source_title}",
+                            f"来源类型：{selected_entry.source_kind}",
                             f"来源 URL：{selected_entry.source_url}",
                             f"输出目录：{selected_entry.source_output_folder}",
                             f"掌握状态：{selected_entry.mastery}",
@@ -5867,6 +5916,8 @@ def main() -> None:
                     ),
                     language="text",
                 )
+                if selected_entry.source_url:
+                    st.markdown(f"[打开来源]({selected_entry.source_url})")
             with col_review:
                 st.markdown("#### 收录状态")
                 if selected_entry.review_status == "approved":
@@ -5891,7 +5942,14 @@ def main() -> None:
 
             with st.expander("编辑当前知识"):
                 edit_title = st.text_input("标题", value=selected_entry.title, key=f"{entry_state_prefix}title")
-                edit_category = st.text_input("分类", value=selected_entry.category, key=f"{entry_state_prefix}category")
+                edit_category = st.selectbox(
+                    "分类",
+                    category_options,
+                    index=category_options.index(selected_entry.category)
+                    if selected_entry.category in category_options
+                    else 0,
+                    key=f"{entry_state_prefix}category",
+                )
                 edit_content = st.text_area(
                     "内容",
                     value=selected_entry.content,
@@ -5971,6 +6029,12 @@ def main() -> None:
             with st.expander("实践记录"):
                 if selected_entry.practice_records:
                     st.dataframe(selected_entry.practice_records, width="stretch")
+                practice_recipe_options = ["手动填写"] + [item.title for item in scan_history(config.out_dir) if item.title]
+                practice_recipe = st.selectbox(
+                    "关联菜谱",
+                    practice_recipe_options,
+                    key=f"kb_practice_recipe_{selected_entry.id}",
+                )
                 practice_dish = st.text_input("实践菜品", key=f"kb_practice_dish_{selected_entry.id}")
                 practice_outcome = st.selectbox(
                     "结果",
@@ -5978,12 +6042,17 @@ def main() -> None:
                     key=f"kb_practice_outcome_{selected_entry.id}",
                 )
                 practice_photo = st.text_input("成品照片路径", key=f"kb_practice_photo_{selected_entry.id}")
+                if practice_photo.strip() and Path(practice_photo).is_file():
+                    st.image(practice_photo, caption="实践成品", width=240)
                 practice_notes = st.text_area("实践记录", height=90, key=f"kb_practice_notes_{selected_entry.id}")
                 if st.button("添加实践记录", key=f"kb_add_practice_{selected_entry.id}"):
                     try:
+                        dish = practice_dish.strip() or ("" if practice_recipe == "手动填写" else practice_recipe)
+                        if not dish:
+                            raise ValueError("请填写实践菜品或选择关联菜谱")
                         add_practice_record(
                             selected_entry.id,
-                            dish=practice_dish,
+                            dish=dish,
                             outcome=practice_outcome,
                             notes=practice_notes,
                             photo_path=practice_photo,
@@ -6072,6 +6141,23 @@ def main() -> None:
             else:
                 st.success(f"已导出：{exported}")
 
+        st.markdown("#### 版本恢复")
+        knowledge_backups = list_knowledge_backups()
+        if knowledge_backups:
+            backup_options = {f"{item.name} · {datetime.fromtimestamp(item.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')}": item for item in knowledge_backups[:20]}
+            selected_backup_label = st.selectbox("选择知识库备份", list(backup_options), key="kb_backup_select")
+            confirm_restore = st.checkbox("确认用备份覆盖当前知识库", key="kb_confirm_restore")
+            if st.button("恢复选中备份", disabled=not confirm_restore, key="kb_restore"):
+                try:
+                    backups = _backup_files([kb_path], "knowledge-restore")
+                    restore_knowledge_backup(backup_options[selected_backup_label])
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"恢复失败：{_clean_error(exc)}")
+                else:
+                    _rerun_with_notice(st, f"已恢复知识库{_backup_summary(backups)}")
+        else:
+            st.caption("暂无知识库备份。编辑、删除或合并前会自动创建版本备份。")
+
         st.markdown("#### 同步干货到 Obsidian")
         approved_entries = [entry for entry in all_entries if entry.review_status == "approved"]
         draft_entries = [entry for entry in all_entries if entry.review_status != "approved"]
@@ -6149,6 +6235,37 @@ def main() -> None:
                         "output_folder"
                     )
                     st.rerun()
+
+        st.markdown("#### 从 PDF / OCR 文档提取")
+        st.caption("支持可复制文字的 PDF、菜谱截图/书页图片，以及外部 OCR 导出的 TXT/Markdown；导入前会保留来源和 OCR 原文摘录。")
+        uploaded_document = st.file_uploader(
+            "上传书籍或 OCR 文档",
+            type=["pdf", "txt", "md", "markdown", "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"],
+            key="kb_document_upload",
+        )
+        if uploaded_document is not None:
+            if st.button("提取文档中的通用技巧", type="primary", disabled=config.llm_provider == "none", key="kb_document_extract"):
+                document_path: Path | None = None
+                document_result = None
+                try:
+                    suffix = Path(str(uploaded_document.name)).suffix or ".txt"
+                    safe_name = re.sub(r"[^\w\u4e00-\u9fff.-]+", "-", Path(str(uploaded_document.name)).stem).strip("-") or "document"
+                    import_dir = knowledge_base_path().parent / "knowledge-imports"
+                    import_dir.mkdir(parents=True, exist_ok=True)
+                    document_path = import_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{safe_name}{suffix.lower()}"
+                    document_path.write_bytes(uploaded_document.getvalue())
+                    with st.spinner("正在提取文档知识..."):
+                        document_result = extract_knowledge_from_document(
+                            document_path,
+                            options=_knowledge_extraction_options(config),
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"文档知识提取失败：{_clean_error(exc)}")
+                if document_result is not None:
+                    _rerun_with_notice(
+                        st,
+                        f"已写入：{document_result.knowledge_path}，新增 {document_result.added_count} 条，更新 {document_result.updated_count} 条",
+                    )
 
         st.markdown("#### 从历史视频提取")
         analyzable = [item for item in items if item.note_path or item.transcript_path or item.recipe_path]

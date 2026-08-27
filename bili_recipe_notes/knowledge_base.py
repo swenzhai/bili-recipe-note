@@ -4,6 +4,7 @@ import hashlib
 import csv
 import json
 import re
+import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +17,15 @@ from .storage import CorruptDataError, atomic_write_json, atomic_write_text, fil
 
 
 KNOWLEDGE_BASE_FILE_NAME = "knowledge_base.json"
+DOCUMENT_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+KNOWLEDGE_CATEGORIES = ("技巧", "原理", "食材处理", "火候", "调味", "工具", "避坑", "其他")
+KNOWLEDGE_QUERY_ALIASES = {
+    "除腥": "去腥",
+    "醒面": "松弛",
+    "收汁": "勾芡",
+    "煎锅": "平底锅",
+    "二发": "最终发酵",
+}
 JSON_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n(?P<body>.*?)(?:\n)?```\s*$", re.DOTALL | re.IGNORECASE)
 
 
@@ -34,6 +44,8 @@ class CookingKnowledgeEntry:
     source_url: str = ""
     source_output_folder: str = ""
     source_refs: list[dict[str, str]] = field(default_factory=list)
+    source_kind: str = "video"
+    source_excerpt: str = ""
     review_status: str = "draft"
     mastery: str = "new"
     review_count: int = 0
@@ -109,6 +121,7 @@ def _clean_source_refs(value: Any) -> list[dict[str, str]]:
                 "url": str(item.get("url") or "").strip(),
                 "output_folder": str(item.get("output_folder") or "").strip(),
                 "evidence": str(item.get("evidence") or "").strip(),
+                "excerpt": str(item.get("excerpt") or "").strip(),
             }
             if any(ref.values()):
                 refs.append(ref)
@@ -121,6 +134,7 @@ def _source_ref(entry: CookingKnowledgeEntry) -> dict[str, str] | None:
         "url": entry.source_url.strip(),
         "output_folder": entry.source_output_folder.strip(),
         "evidence": entry.evidence.strip(),
+        "excerpt": entry.source_excerpt.strip(),
     }
     return ref if any(ref.values()) else None
 
@@ -178,6 +192,8 @@ def _entry_from_dict(data: dict[str, Any]) -> CookingKnowledgeEntry:
         source_url=source_url,
         source_output_folder=str(data.get("source_output_folder") or "").strip(),
         source_refs=_clean_source_refs(data.get("source_refs")),
+        source_kind=str(data.get("source_kind") or "video").strip() or "video",
+        source_excerpt=str(data.get("source_excerpt") or "").strip(),
         review_status=(
             str(data.get("review_status") or "draft").strip()
             if str(data.get("review_status") or "draft").strip() in {"draft", "approved"}
@@ -231,6 +247,147 @@ def load_knowledge_entries(project_root: Path | None = None) -> list[CookingKnow
     if not path.exists():
         return []
     return _load_knowledge_entries_from_path(path)
+
+
+def knowledge_quality_issues(entry: CookingKnowledgeEntry) -> list[str]:
+    """Return actionable quality warnings without rejecting a valid draft."""
+    issues: list[str] = []
+    if not entry.source_url and not entry.source_output_folder:
+        issues.append("缺少可回溯来源")
+    if not entry.evidence:
+        issues.append("缺少原文或视频依据")
+    if len(entry.content) < 20:
+        issues.append("可执行内容过短")
+    if not entry.applicable_to:
+        issues.append("未填写适用场景")
+    if entry.confidence is not None and not 0 <= entry.confidence <= 1:
+        issues.append("置信度应在 0 到 1 之间")
+    return issues
+
+
+def list_knowledge_backups(project_root: Path | None = None) -> list[Path]:
+    path = knowledge_base_path(project_root)
+    if not path.parent.exists():
+        return []
+    backups = list(path.parent.glob(f"{path.stem}.before-*{path.suffix}"))
+    fixed = path.with_suffix(path.suffix + ".bak")
+    if fixed.is_file():
+        backups.append(fixed)
+    return sorted((item for item in backups if item.is_file()), key=lambda item: item.stat().st_mtime, reverse=True)
+
+
+def restore_knowledge_backup(backup: str | Path, project_root: Path | None = None) -> Path:
+    backup_path = Path(backup).expanduser().resolve()
+    path = knowledge_base_path(project_root)
+    if not backup_path.is_file() or backup_path.parent != path.parent.resolve():
+        raise ValueError("知识库备份路径无效")
+    entries = _load_knowledge_entries_from_path(backup_path)
+    return save_knowledge_entries(entries, project_root=project_root)
+
+
+def ocr_image_text(image_path: str | Path) -> str:
+    path = Path(image_path).expanduser().resolve()
+    if not path.is_file() or path.suffix.lower() not in DOCUMENT_IMAGE_SUFFIXES:
+        raise ValueError("不是受支持的图片文件")
+    try:
+        import pytesseract
+        from PIL import Image
+
+        text = pytesseract.image_to_string(Image.open(path), lang="chi_sim+eng")
+        if text.strip():
+            return text
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    for language in ("chi_sim+eng", "eng"):
+        try:
+            result = subprocess.run(
+                ["tesseract", str(path), "stdout", "-l", language],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+        if result.stdout.strip():
+            return result.stdout
+    raise RuntimeError("无法识别图片文字，请安装 pytesseract 与 Tesseract，或先导出 OCR 文本")
+
+
+def read_document_text(document_path: str | Path) -> str:
+    """Read OCR/text content from a PDF or a plain text export."""
+    path = Path(document_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"文档不存在：{path}")
+    if path.suffix.lower() in {".txt", ".md", ".markdown"}:
+        return path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix.lower() in DOCUMENT_IMAGE_SUFFIXES:
+        return ocr_image_text(path)
+    if path.suffix.lower() != ".pdf":
+        raise ValueError("仅支持 PDF、TXT 或 Markdown 文档")
+    try:
+        from pypdf import PdfReader
+
+        pages = [page.extract_text() or "" for page in PdfReader(str(path)).pages]
+        text = "\n\n".join(f"[第 {index + 1} 页]\n{page}" for index, page in enumerate(pages))
+        if text.strip():
+            return text
+    except ImportError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"PDF 文本读取失败：{exc}") from exc
+    try:
+        result = subprocess.run(["pdftotext", "-layout", str(path), "-"], capture_output=True, text=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("无法读取 PDF 文本，请先安装 pypdf 或 pdftotext，或上传 OCR TXT") from exc
+    return result.stdout
+
+
+def build_document_knowledge_prompt(document_text: str, source_title: str = "") -> str:
+    return (
+        "请从以下书籍/PDF/OCR资料中提取可迁移的通用烹饪知识。"
+        "只提取技巧、原理、判断标准、避坑经验、食材处理、调味逻辑和工具方法；不要输出完整菜谱步骤。"
+        "每条保留页码或原文摘录作为 evidence，无法确认的内容不要杜撰。输出 JSON 数组。\n"
+        "字段：title、category（技巧/原理/食材处理/火候/调味/工具/避坑/其他）、content、rationale、"
+        "applicable_to（数组）、evidence、tags（数组）、confidence（0 到 1）。\n\n"
+        f"资料标题：{source_title or '未命名文档'}\n\n资料正文：\n{document_text}"
+    )
+
+
+def extract_knowledge_from_document(
+    document_path: str | Path,
+    options: KnowledgeExtractionOptions | None = None,
+    project_root: Path | None = None,
+) -> KnowledgeExtractionResult:
+    path = Path(document_path).expanduser().resolve()
+    text = read_document_text(path)
+    if not text.strip():
+        raise ValueError("文档没有可提取的文字，请先进行 OCR")
+    opts = options or KnowledgeExtractionOptions()
+    output = complete_markdown_prompt(
+        build_document_knowledge_prompt(text, path.stem),
+        provider=opts.llm_provider,
+        openai_model=opts.openai_model,
+        local_llm_command=opts.local_llm_command,
+        codex_model=opts.codex_model,
+        codex_profile=opts.codex_profile,
+        cli_extra_instructions=opts.llm_cli_extra_instructions,
+    )
+    if not output:
+        detail = get_last_llm_error()
+        raise RuntimeError(f"文档知识提取失败：{detail or opts.llm_provider}")
+    entries = parse_knowledge_entries(
+        output,
+        source={
+            "source_title": path.stem,
+            "source_url": path.as_uri(),
+            "source_kind": "image" if path.suffix.lower() in DOCUMENT_IMAGE_SUFFIXES else "document",
+            "source_excerpt": text[:500],
+        },
+    )
+    knowledge_path, added, updated = upsert_knowledge_entries(entries, project_root=project_root)
+    return KnowledgeExtractionResult(knowledge_path, entries, added, updated)
 
 
 def _write_knowledge_entries(path: Path, entries: list[CookingKnowledgeEntry]) -> Path:
@@ -509,6 +666,10 @@ def search_knowledge_entries(
 ) -> list[CookingKnowledgeEntry]:
     entries = load_knowledge_entries(project_root)
     cleaned_query = query.strip().lower()
+    expanded_queries = [cleaned_query]
+    for source, target in KNOWLEDGE_QUERY_ALIASES.items():
+        if source in cleaned_query:
+            expanded_queries.append(cleaned_query.replace(source, target))
     cleaned_category = category.strip()
     results = []
     for entry in entries:
@@ -526,10 +687,15 @@ def search_knowledge_entries(
                 entry.source_title,
             ]
         ).lower()
-        if cleaned_query and cleaned_query not in haystack:
+        if cleaned_query and not any(item in haystack for item in expanded_queries):
             continue
-        results.append(entry)
-    return results
+        score = 0
+        if cleaned_query:
+            score += 5 if cleaned_query in entry.title.lower() else 0
+            score += 3 if cleaned_query in " ".join(entry.tags).lower() else 0
+            score += 1 if cleaned_query in haystack else 0
+        results.append((score, entry.updated_at or entry.created_at or "", entry))
+    return [entry for _, _, entry in sorted(results, key=lambda item: (item[0], item[1]), reverse=True)]
 
 
 def _markdown_for_entries(entries: list[CookingKnowledgeEntry]) -> str:
@@ -545,6 +711,8 @@ def _markdown_for_entries(entries: list[CookingKnowledgeEntry]) -> str:
             lines.extend(["### 适用场景", "", *[f"- {item}" for item in entry.applicable_to], ""])
         if entry.evidence:
             lines.extend(["### 视频依据", "", entry.evidence, ""])
+        if entry.source_excerpt:
+            lines.extend(["### 原文摘录", "", entry.source_excerpt, ""])
         if entry.source_refs:
             lines.extend(["### 来源", ""])
             for ref in entry.source_refs:
@@ -598,6 +766,8 @@ def export_knowledge_base(kind: str = "markdown", category: str = "", project_ro
                     "tags",
                     "source_title",
                     "source_url",
+                    "source_kind",
+                    "source_excerpt",
                     "mastery",
                 ],
             )

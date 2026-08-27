@@ -86,6 +86,10 @@ def test_deployment_bundle_contains_portable_app_outputs_and_curation_state(tmp_
         ),
         encoding="utf-8",
     )
+    (config_root / "knowledge_base.json").write_text(
+        json.dumps({"version": 1, "entries": [{"id": "tip", "title": "热锅", "category": "火候", "content": "先热锅"}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
     (config_root / "batches" / "batch-demo.json").write_text(
         json.dumps(
             {
@@ -120,6 +124,7 @@ def test_deployment_bundle_contains_portable_app_outputs_and_curation_state(tmp_
         assert "bili-recipe-notes/outputs/curation-review/curation-decisions.json" in names
         assert "bili-recipe-notes/DEPLOYMENT.md" in names
         assert "bili-recipe-notes/.bili-recipe-notes/meal-plans.json" in names
+        assert "bili-recipe-notes/.bili-recipe-notes/knowledge_base.json" in names
         assert not any(name.endswith("media.mp4") for name in names)
         assert not any(name.endswith("job.json.bak") for name in names)
         assert not any(name.endswith("run.sh") for name in names)

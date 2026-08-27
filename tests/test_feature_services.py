@@ -20,10 +20,13 @@ from bili_recipe_notes.knowledge_base import (
     due_review_entries,
     export_knowledge_base,
     extract_knowledge_from_folders,
+    extract_knowledge_from_document,
     extract_knowledge_from_video,
+    knowledge_quality_issues,
     load_knowledge_entries,
     merge_knowledge_entries,
     record_knowledge_review,
+    read_document_text,
     related_knowledge_for_recipe,
     save_knowledge_entries,
     search_knowledge_entries,
@@ -471,6 +474,57 @@ def test_knowledge_base_upsert_and_search(tmp_path) -> None:
     assert updated == 0
     results = search_knowledge_entries("定型", "火候", project_root=tmp_path)
     assert [item.title for item in results] == ["热锅再下蛋"]
+
+
+def test_knowledge_search_supports_aliases_and_quality_checks(tmp_path) -> None:
+    entry = CookingKnowledgeEntry(
+        id="rest",
+        title="面团松弛",
+        category="技巧",
+        content="醒面后再整形，面团更容易延展并保持结构。",
+        tags=["松弛"],
+        applicable_to=["面团"],
+        evidence="原文摘录",
+        source_url="file:///book.pdf#page=3",
+    )
+    save_knowledge_entries([entry], project_root=tmp_path)
+    assert [item.id for item in search_knowledge_entries("醒面", project_root=tmp_path)] == ["rest"]
+    assert knowledge_quality_issues(entry) == []
+
+
+def test_extract_knowledge_from_document_preserves_document_source(monkeypatch, tmp_path) -> None:
+    document = tmp_path / "面包技巧.txt"
+    document.write_text("第 3 页：面团醒面后更容易整形。", encoding="utf-8")
+
+    def _complete(prompt, **kwargs):
+        assert "面包技巧" in prompt
+        return json.dumps(
+            [{
+                "title": "醒面后再整形",
+                "category": "技巧",
+                "content": "面团醒面后再整形，更容易延展。",
+                "evidence": "第 3 页：面团醒面后更容易整形。",
+                "applicable_to": ["面团"],
+                "tags": ["醒面"],
+                "confidence": 0.9,
+            }],
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr(knowledge_base, "complete_markdown_prompt", _complete)
+    result = extract_knowledge_from_document(document, project_root=tmp_path)
+    loaded = load_knowledge_entries(project_root=tmp_path)
+    assert result.added_count == 1
+    assert loaded[0].source_kind == "document"
+    assert loaded[0].source_url.startswith("file:")
+    assert loaded[0].source_excerpt.startswith("第 3 页")
+
+
+def test_image_document_uses_ocr_and_marks_image_source(monkeypatch, tmp_path) -> None:
+    image = tmp_path / "书页.png"
+    image.write_bytes(b"not-an-image")
+    monkeypatch.setattr(knowledge_base, "ocr_image_text", lambda path: "图片 OCR 内容")
+    assert read_document_text(image) == "图片 OCR 内容"
 
 
 def test_knowledge_base_auto_dedupes_similar_entries(tmp_path) -> None:

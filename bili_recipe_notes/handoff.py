@@ -253,6 +253,23 @@ def export_batch_handoff(
             urls = {item.url for item in state.items}
             for source, archive_name in _creator_documents(output_root, urls):
                 _write_archive_member(archive, archive_name, source.read_bytes(), records)
+            knowledge_path = root / ".bili-recipe-notes" / "knowledge_base.json"
+            if knowledge_path.is_file():
+                _write_archive_member(
+                    archive,
+                    ".bili-recipe-notes/knowledge_base.json",
+                    knowledge_path.read_bytes(),
+                    records,
+                )
+            import_dir = root / ".bili-recipe-notes" / "knowledge-imports"
+            for source in sorted(import_dir.glob("*")):
+                if source.is_file() and source.suffix.lower() not in {".bak", ".tmp"}:
+                    _write_archive_member(
+                        archive,
+                        f".bili-recipe-notes/knowledge-imports/{source.name}",
+                        source.read_bytes(),
+                        records,
+                    )
             manifest = {
                 "format": HANDOFF_FORMAT,
                 "version": HANDOFF_VERSION,
@@ -576,6 +593,21 @@ def import_handoff_bundle(
                 backup_count += 1
             _copy_member(archive, info, destination)
             creator_document_count += 1
+
+        knowledge_member = by_name.get(".bili-recipe-notes/knowledge_base.json")
+        if knowledge_member is not None:
+            knowledge_destination = root / ".bili-recipe-notes" / "knowledge_base.json"
+            if knowledge_destination.exists():
+                backup_count += 1
+            _copy_member(archive, knowledge_member, knowledge_destination)
+        for name, info in by_name.items():
+            prefix = ".bili-recipe-notes/knowledge-imports/"
+            if not name.startswith(prefix) or PurePosixPath(name).name in {"", ".", ".."}:
+                continue
+            destination = root / ".bili-recipe-notes" / "knowledge-imports" / PurePosixPath(name).name
+            if destination.exists():
+                backup_count += 1
+            _copy_member(archive, info, destination)
 
     state.options = _prepare_options({**state.options, **(snapshot.get("options") or {})}, output_root)
     batch_file = save_batch_state(state, project_root=root)
