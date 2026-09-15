@@ -1,5 +1,5 @@
 {
-  "out_dir": "outputs1",
+  "out_dir": "outputs0",
   "cookies": null,
   "language": "zh",
   "whisper_model": "small",
@@ -17,5 +17,8 @@
   "enable_recipe_review": false,
   "obsidian_vault_dir": "obsidian-vault",
   "auto_archive_after_generation": false,
-  "archive_knowledge_with_recipe": true
+  "archive_knowledge_with_recipe": true,
+  "restaurant_name": "Chef Zhai",
+  "restaurant_subtitle": "家庭厨房",
+  "restaurant_logo_path": null
 }
