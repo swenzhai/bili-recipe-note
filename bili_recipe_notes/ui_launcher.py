@@ -17,6 +17,11 @@ def resolve_ui_path() -> Path:
 
 
 def main() -> int:
+    if len(sys.argv) == 5 and sys.argv[1] == "--ai-review-worker":
+        from bili_recipe_notes.ai_review_worker import main as ai_review_worker_main
+
+        return ai_review_worker_main(sys.argv[2:])
+
     if len(sys.argv) == 3 and sys.argv[1] == "--batch-worker-request":
         from .batch_worker import main as batch_worker_main
 

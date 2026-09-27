@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -773,6 +774,119 @@ def test_background_dashboard_renders_running_batch(monkeypatch) -> None:
     assert at.button(key="dashboard_open_dashboard-running") is not None
     assert any("当前处理" in info.value and "current" in info.value for info in at.info)
     assert len(at.dataframe) == 1
+
+
+@pytest.mark.parametrize("page,prefix", [("批量处理", "batch"), ("任务仪表盘", "dashboard")])
+@pytest.mark.skipif(not (sys.platform.startswith("linux") or sys.platform == "darwin"), reason="Requires Linux/macOS")
+def test_batch_pause_and_resume_buttons_survive_page_reload(monkeypatch, tmp_path, page, prefix) -> None:
+    from dataclasses import replace
+
+    from bili_recipe_notes import batch_runner
+
+    monkeypatch.chdir(tmp_path)
+    state = create_batch_state(["https://example.com/current"], {}, batch_id="pause-ui")
+    state.items[0].status = "raw_running"
+    runtime = batch_runner.BackgroundBatchStatus("pause-ui", "running", "2026-09-26T07:00:00+00:00")
+    calls = []
+
+    def pause(batch_id):
+        nonlocal runtime
+        calls.append(("pause", batch_id))
+        runtime = replace(runtime, status="paused", paused_at="2026-09-26T07:10:00+00:00")
+        return runtime
+
+    def resume(batch_id):
+        nonlocal runtime
+        calls.append(("resume", batch_id))
+        runtime = replace(runtime, status="running", paused_at=None)
+        return runtime
+
+    monkeypatch.setattr("bili_recipe_notes.batch_queue.list_batch_states", lambda: [state])
+    monkeypatch.setattr(batch_runner, "get_background_batch_status", lambda _: runtime)
+    monkeypatch.setattr(batch_runner, "pause_background_batch", pause)
+    monkeypatch.setattr(batch_runner, "resume_background_batch", resume)
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at.selectbox(key="main_page").set_value(page).run()
+    at.button(key=f"{prefix}_pause_pause-ui").click().run()
+    assert not at.exception
+    assert calls == [("pause", "pause-ui")]
+    assert at.button(key=f"{prefix}_resume_pause-ui").label == "继续任务"
+    if page == "批量处理":
+        assert next(button for button in at.button if button.label == "继续未完成").disabled
+        assert next(button for button in at.button if button.label == "只重试失败").disabled
+
+    # A fresh browser session must get the control from persisted runtime state.
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at.selectbox(key="main_page").set_value(page).run()
+    assert at.button(key=f"{prefix}_resume_pause-ui").label == "继续任务"
+    at.button(key=f"{prefix}_resume_pause-ui").click().run()
+    assert not at.exception
+    assert calls == [("pause", "pause-ui"), ("resume", "pause-ui")]
+    assert at.button(key=f"{prefix}_pause_pause-ui").label == "暂停任务"
+
+
+def test_paused_batch_does_not_inflate_elapsed_time_or_show_eta() -> None:
+    from dataclasses import replace
+
+    from bili_recipe_notes.batch_runner import BackgroundBatchStatus
+
+    state = BatchQueueState("paused", "", "", {}, [
+        BatchQueueItem(url="https://example.com/done", status="done"),
+        BatchQueueItem(url="https://example.com/pending"),
+    ])
+    runtime = BackgroundBatchStatus(
+        "paused", "paused", "2026-09-26T07:00:00+00:00",
+        paused_at="2026-09-26T07:20:00+00:00", paused_seconds=600,
+    )
+    now = datetime(2026, 9, 26, 8, 0, tzinfo=timezone.utc)
+    summary = ui._batch_dashboard_summary(state, runtime, now=now)
+    assert summary["elapsed_seconds"] == 600
+    assert summary["speed_per_hour"] == 6
+    assert summary["eta_seconds"] is None
+    assert summary["estimated_finish"] is None
+    resumed = replace(runtime, status="running", paused_at=None, paused_seconds=3000)
+    assert ui._batch_dashboard_summary(state, resumed, now=now)["elapsed_seconds"] == 600
+
+
+@pytest.mark.skipif(not (sys.platform.startswith("linux") or sys.platform == "darwin"), reason="Requires Linux/macOS")
+def test_pause_button_reports_error_without_claiming_success(monkeypatch, tmp_path) -> None:
+    from bili_recipe_notes import batch_runner
+
+    monkeypatch.chdir(tmp_path)
+    state = create_batch_state(["https://example.com/a"], {}, batch_id="pause-error")
+    runtime = batch_runner.BackgroundBatchStatus("pause-error", "running", "2026-09-26T07:00:00+00:00")
+    monkeypatch.setattr("bili_recipe_notes.batch_queue.list_batch_states", lambda: [state])
+    monkeypatch.setattr(batch_runner, "get_background_batch_status", lambda _: runtime)
+
+    def fail(_):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(batch_runner, "pause_background_batch", fail)
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at.selectbox(key="main_page").set_value("批量处理").run()
+    at.button(key="batch_pause_pause-error").click().run()
+    assert not at.exception
+    assert any("暂停任务失败" in error.value for error in at.error)
+    assert at.button(key="batch_pause_pause-error") is not None
+
+
+def test_new_batch_cannot_duplicate_paused_batch(monkeypatch, tmp_path) -> None:
+    from bili_recipe_notes import batch_runner
+
+    monkeypatch.chdir(tmp_path)
+    state = create_batch_state(["https://example.com/a"], {}, batch_id="paused-overlap")
+    runtime = batch_runner.BackgroundBatchStatus("paused-overlap", "paused", "2026-09-26T07:00:00+00:00")
+    monkeypatch.setattr("bili_recipe_notes.batch_queue.list_batch_states", lambda: [state])
+    monkeypatch.setattr(batch_runner, "get_background_batch_status", lambda _: runtime)
+    calls = []
+    monkeypatch.setattr(batch_runner, "start_background_batch", lambda *args, **kwargs: calls.append(args))
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at.selectbox(key="main_page").set_value("批量处理").run()
+    next(widget for widget in at.text_area if widget.label == "视频 URL，每行一个").set_value("https://example.com/a")
+    next(button for button in at.button if button.label == "创建新批次并运行").click().run()
+    assert not at.exception
+    assert not calls
+    assert any("已阻止重复启动" in error.value for error in at.error)
 
 
 def test_large_batch_remains_paged_while_switching_pages(monkeypatch, tmp_path: Path) -> None:

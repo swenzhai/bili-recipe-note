@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from bili_recipe_notes.mobile_sync import MobileSyncStore
+from bili_recipe_notes.review_policy import AI_REVIEW_FILE_NAME, review_recipe_hash, set_ai_review_visibility
 from bili_recipe_notes.web_export import build_web_library_payload, export_web_library
 
 
@@ -81,6 +82,31 @@ def test_export_web_library_writes_importable_json(tmp_path: Path) -> None:
     assert result.asset_count == 1
     assert result.size_bytes == destination.stat().st_size
     assert payload["recipes"][0]["title"] == "离线测试菜"
+
+
+def test_web_export_omits_ai_hidden_content_and_allows_manual_restore(tmp_path: Path) -> None:
+    outputs = tmp_path / "outputs"
+    folder = outputs / "demo"
+    _write_recipe(folder)
+    (folder / AI_REVIEW_FILE_NAME).write_text(json.dumps({
+        "schema_version": 1,
+        "status": "completed",
+        "source_recipe_sha256": review_recipe_hash(folder),
+        "classification": "technique",
+        "visibility": "hidden",
+        "confidence": 0.99,
+        "tags": ["烹饪技巧"],
+    }), encoding="utf-8")
+    destination = tmp_path / "library.json"
+
+    result = export_web_library(tmp_path, outputs, destination)
+    assert result.recipe_count == 0
+    assert json.loads(destination.read_text(encoding="utf-8"))["assets"] == {}
+
+    set_ai_review_visibility(folder, "visible")
+    restored = export_web_library(tmp_path, outputs, destination)
+    assert restored.recipe_count == 1
+    assert json.loads(destination.read_text(encoding="utf-8"))["recipes"][0]["tags"] == ["烹饪技巧"]
 
 
 def test_web_library_can_keep_only_first_image_per_recipe(tmp_path: Path) -> None:

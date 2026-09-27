@@ -24,8 +24,13 @@ from PIL import Image, ImageOps
 from streamlit_cropper import st_cropper
 
 try:
-    from .batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state
-    from .batch_runner import get_background_batch_status, read_batch_log, start_background_batch
+    from .ai_review_ui import render_ai_review_page
+    from .review_policy import is_recipe_hidden
+    from .batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state, selectable_items
+    from .batch_runner import (
+        get_background_batch_status, pause_background_batch, read_batch_log,
+        resume_background_batch, start_background_batch,
+    )
     from .branding import default_logo_path, remove_logo, save_logo
     from .config import UIConfig, load_config, save_config
     from .content_analysis import ContentAnalysisOptions, analyze_video_content
@@ -134,8 +139,13 @@ try:
     from .storage import atomic_write_json, atomic_write_text
     from .web_export import build_web_library_payload, web_library_bytes
 except ImportError:  # pragma: no cover - supports direct streamlit script execution
-    from bili_recipe_notes.batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state
-    from bili_recipe_notes.batch_runner import get_background_batch_status, read_batch_log, start_background_batch
+    from bili_recipe_notes.ai_review_ui import render_ai_review_page
+    from bili_recipe_notes.review_policy import is_recipe_hidden
+    from bili_recipe_notes.batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state, selectable_items
+    from bili_recipe_notes.batch_runner import (
+        get_background_batch_status, pause_background_batch, read_batch_log,
+        resume_background_batch, start_background_batch,
+    )
     from bili_recipe_notes.branding import default_logo_path, remove_logo, save_logo
     from bili_recipe_notes.config import UIConfig, load_config, save_config
     from bili_recipe_notes.content_analysis import ContentAnalysisOptions, analyze_video_content
@@ -265,6 +275,7 @@ PAGES = [
     "烹饪模式",
     "草稿与归档",
     "快速审核",
+    "AI 审核归类",
     "审核确认",
     "最终菜谱整理",
     "批量处理",
@@ -278,7 +289,7 @@ PAGES = [
 ]
 PAGE_GROUPS = {
     "采集与生成": ["任务仪表盘", "单视频生成", "批量处理", "UP 主链接"],
-    "审阅与成稿": ["草稿与归档", "快速审核", "审核确认", "编辑修复", "最终菜谱整理"],
+    "审阅与成稿": ["草稿与归档", "AI 审核归类", "快速审核", "审核确认", "编辑修复", "最终菜谱整理"],
     "使用与知识": ["菜谱库全览", "烹饪技巧", "菜谱详情", "本餐点菜", "烹饪模式", "知识库", "二次分析", "手机客户端"],
     "系统与迁移": ["工作交接", "环境检查"],
 }
@@ -658,9 +669,11 @@ def _batch_dashboard_summary(
     current_time = now or datetime.now(timezone.utc)
     if current_time.tzinfo is None:
         current_time = current_time.replace(tzinfo=timezone.utc)
-    elapsed_end = finished_at or current_time
+    paused_at = _parse_timestamp(getattr(runtime, "paused_at", None)) if status == "paused" else None
+    paused_seconds = float(getattr(runtime, "paused_seconds", 0) or 0)
+    elapsed_end = finished_at or paused_at or current_time
     elapsed_seconds = (
-        max(0.0, (elapsed_end - started_at).total_seconds())
+        max(0.0, (elapsed_end - started_at).total_seconds() - paused_seconds)
         if started_at is not None
         else None
     )
@@ -703,7 +716,7 @@ def _preferred_batch_id(
             str(state.batch_id)
             for state in batch_states
             if runtime_statuses.get(str(state.batch_id))
-            and runtime_statuses[str(state.batch_id)].status == "running"
+            and runtime_statuses[str(state.batch_id)].status in {"running", "paused"}
         ),
         key=lambda batch_id: str(getattr(runtime_statuses[batch_id], "started_at", "")),
         reverse=True,
@@ -726,6 +739,18 @@ def _running_batch_overlaps(
         if overlap_count:
             overlaps.append((batch_id, overlap_count))
     return overlaps
+
+
+def _check_batch_overlaps(
+    urls: list[str], active_batch_ids: list[str], batch_by_id: dict[str, Any], *, exclude: str | None = None
+) -> None:
+    overlaps = _running_batch_overlaps(urls, [batch_id for batch_id in active_batch_ids if batch_id != exclude], batch_by_id)
+    if overlaps:
+        details = "；".join(f"{batch_id} 重复 {count} 条" for batch_id, count in overlaps)
+        raise ValueError(
+            "检测到相同链接已有运行中或暂停中的后台任务，已阻止重复启动："
+            f"{details}。请直接查看现有批次进度。"
+        )
 
 
 def _backup_files(paths: Iterable[Path | None], action: str) -> list[Path]:
@@ -1402,6 +1427,32 @@ def _render_recipe_ingredients(st, values: Iterable[Any], empty_message: str) ->
         st.markdown(f"- **{name}**：{amount}{suffix}")
 
 
+def _render_batch_pause_control(st, batch_id: str, runtime: Any, *, key_prefix: str) -> None:
+    if not runtime or runtime.status not in {"running", "paused"}:
+        return
+    paused = runtime.status == "paused"
+    label = "继续任务" if paused else "暂停任务"
+    supported = sys.platform.startswith("linux") or sys.platform == "darwin"
+    if st.button(
+        label,
+        key=f"{key_prefix}_{'resume' if paused else 'pause'}_{batch_id}",
+        disabled=not supported,
+        help="保留当前处理位置和配置；长时间暂停后，当前外部请求可能超时，失败项可重试。" if supported else "暂停和继续目前支持 Linux/macOS。",
+    ):
+        try:
+            updated = resume_background_batch(batch_id) if paused else pause_background_batch(batch_id)
+        except Exception as exc:  # noqa: BLE001 - keep process-control errors inside the UI
+            st.error(f"{label}失败：{_clean_error(exc)}")
+        else:
+            message = {
+                "paused": "任务已暂停，点击“继续任务”可接着处理。",
+                "running": "任务已继续。",
+            }.get(updated.status, "任务状态已更新，请查看最新进度。")
+            _rerun_with_notice(st, message)
+    if paused:
+        st.caption("任务已暂停，继续时沿用原配置。长时间暂停后，当前外部请求可能超时，失败项可在批次结束后重试。")
+
+
 def _render_background_dashboard(st) -> None:
     st.subheader("后台任务仪表盘")
     st.caption("集中查看所有批处理任务；预计时间会根据本次运行的实际平均速度持续调整。")
@@ -1438,26 +1489,30 @@ def _render_background_dashboard(st) -> None:
         }
         runtime_labels = {
             "running": "运行中",
+            "paused": "已暂停",
             "done": "已完成",
             "done_with_errors": "完成但有失败",
             "failed": "后台失败",
             "stopped": "已停止（可继续）",
             "history": "历史任务",
         }
-        running_states = [
+        active_states = [
             state
             for state in states
             if runtime_by_id.get(state.batch_id)
-            and runtime_by_id[state.batch_id].status == "running"
+            and runtime_by_id[state.batch_id].status in {"running", "paused"}
         ]
 
-        if running_states:
-            st.success(f"当前有 {len(running_states)} 个后台任务正在运行。")
-            for state in running_states:
+        if active_states:
+            paused_count = sum(runtime_by_id[state.batch_id].status == "paused" for state in active_states)
+            st.info(f"当前有 {len(active_states) - paused_count} 个后台任务正在运行，{paused_count} 个已暂停。")
+            for state in active_states:
                 runtime = runtime_by_id[state.batch_id]
                 summary = _batch_dashboard_summary(state, runtime)
                 with st.container(border=True):
                     st.markdown(f"### {state.batch_id}")
+                    st.caption(f"任务状态：{runtime_labels[runtime.status]}")
+                    _render_batch_pause_control(st, state.batch_id, runtime, key_prefix="dashboard")
                     output_roots = sorted(
                         {
                             str(Path(item.output_folder).parent)
@@ -1502,7 +1557,8 @@ def _render_background_dashboard(st) -> None:
                     for item in active_items:
                         raw_status = str(getattr(item, "status", "running"))
                         st.info(
-                            f"当前处理：{BATCH_STATUS_LABELS.get(raw_status, raw_status)} · {item.url}"
+                            f"{'暂停位置' if runtime.status == 'paused' else '当前处理'}："
+                            f"{BATCH_STATUS_LABELS.get(raw_status, raw_status)} · {item.url}"
                         )
                     if runtime.error:
                         st.warning(f"后台提示：{runtime.error}")
@@ -1657,6 +1713,8 @@ def _render_library_overview(st, config: UIConfig) -> None:
     st.subheader("菜谱库全览")
     st.caption("查看当前菜谱库的规模、分类、菜系和标签分布；统计只读取现有菜谱，不会修改文件。")
     items = [item for item in scan_history(config.out_dir) if item.recipe_path]
+    if not st.checkbox("包含 AI 审核后隐藏的内容", key="overview_include_hidden"):
+        items = [item for item in items if not is_recipe_hidden(item.output_folder)]
     if not items:
         st.info("菜谱库还是空的。生成或导入菜谱后，这里会自动形成统计图表。")
         return
@@ -1802,6 +1860,8 @@ def _render_recipe_detail(st, config: UIConfig) -> None:
     st.subheader("菜谱详情")
     st.caption("完整只读查看一条菜谱；用料、备菜、全部步骤和关键提示集中在同一页。")
     available = [item for item in scan_history(config.out_dir) if item.recipe_path]
+    if not st.checkbox("包含 AI 审核后隐藏的内容", key="detail_include_hidden"):
+        available = [item for item in available if not is_recipe_hidden(item.output_folder)]
     if not available:
         st.info("还没有可查看的菜谱。请先生成或导入一条菜谱。")
         return
@@ -2054,7 +2114,10 @@ def _render_restaurant_meal_ui(st, config: UIConfig) -> None:
     if st.button("← 返回管理界面", key="meal_return_main"):
         _close_meal_mode(st)
 
-    available = [item for item in scan_history(config.out_dir) if item.recipe_path]
+    available = [
+        item for item in scan_history(config.out_dir)
+        if item.recipe_path and not is_recipe_hidden(item.output_folder)
+    ]
     if not available:
         st.info("菜谱库还是空的。请先生成或导入菜谱。")
         return
@@ -2485,7 +2548,10 @@ def _render_cooking_mode(st, config: UIConfig) -> None:
         unsafe_allow_html=True,
     )
 
-    available = [item for item in scan_history(config.out_dir) if item.recipe_path]
+    available = [
+        item for item in scan_history(config.out_dir)
+        if item.recipe_path and not is_recipe_hidden(item.output_folder)
+    ]
     if not available:
         st.info("还没有可用于烹饪模式的菜谱。请先生成或导入一条菜谱。")
         return
@@ -4719,6 +4785,9 @@ def main() -> None:
     if active_page == "快速审核":
         _render_quick_recipe_review(st, config)
 
+    if active_page == "AI 审核归类":
+        render_ai_review_page(st, config)
+
     if active_page == "最终菜谱整理":
         _render_curation_review(st, config)
 
@@ -4788,8 +4857,16 @@ def main() -> None:
             for state in batch_states
             if runtime_by_id.get(state.batch_id) and runtime_by_id[state.batch_id].status == "running"
         ]
+        active_batch_ids = [
+            state.batch_id
+            for state in batch_states
+            if runtime_by_id.get(state.batch_id) and runtime_by_id[state.batch_id].status in {"running", "paused"}
+        ]
         if running_batch_ids:
             st.success("正在运行的批次：" + "、".join(running_batch_ids))
+        paused_batch_ids = [batch_id for batch_id in active_batch_ids if batch_id not in running_batch_ids]
+        if paused_batch_ids:
+            st.info("已暂停的批次：" + "、".join(paused_batch_ids))
         overlapping_running_pairs = []
         for index, batch_id in enumerate(running_batch_ids):
             left = batch_by_id[batch_id]
@@ -4824,6 +4901,7 @@ def main() -> None:
                 runtime = runtime_by_id.get(value)
                 runtime_label = {
                     "running": "运行中",
+                    "paused": "已暂停",
                     "done": "已完成",
                     "done_with_errors": "完成但有失败",
                     "failed": "后台失败",
@@ -4847,16 +4925,21 @@ def main() -> None:
             selected_batch_id = None
             st.info("还没有持久化批次。创建后即使刷新或重启网页，也会自动显示最新运行状态。")
 
+        selected_runtime = runtime_by_id.get(selected_batch_id)
+        selected_active = bool(selected_runtime and selected_runtime.status in {"running", "paused"})
+        if selected_batch_id:
+            _render_batch_pause_control(st, selected_batch_id, selected_runtime, key_prefix="batch")
+
         col_new, col_resume, col_retry = st.columns(3)
         run_mode = None
         with col_new:
             if st.button("创建新批次并运行", type="primary"):
                 run_mode = "new-queue"
         with col_resume:
-            if st.button("继续未完成", disabled=not selected_batch_id):
+            if st.button("继续未完成", disabled=not selected_batch_id or selected_active):
                 run_mode = "resume-unfinished"
         with col_retry:
-            if st.button("只重试失败", disabled=not selected_batch_id):
+            if st.button("只重试失败", disabled=not selected_batch_id or selected_active):
                 run_mode = "retry-failed"
 
         if st.button("开始批量生成", type="primary"):
@@ -4877,14 +4960,13 @@ def main() -> None:
                             )
                 if not urls and run_mode not in {"resume-unfinished", "retry-failed"}:
                     raise ValueError("没有可处理的视频；请添加链接，或检查它们是否已归类为非菜谱。")
-                if run_mode in {"new-queue", "new-direct"}:
-                    overlaps = _running_batch_overlaps(urls, running_batch_ids, batch_by_id)
-                    if overlaps:
-                        details = "；".join(f"{batch_id} 重复 {count} 条" for batch_id, count in overlaps)
-                        raise ValueError(
-                            "检测到相同链接正在后台处理，已阻止重复启动："
-                            f"{details}。请直接查看现有批次进度。"
-                        )
+                if run_mode in {"resume-unfinished", "retry-failed"} and selected_batch_id:
+                    selected_urls = [
+                        item.url for item in selectable_items(batch_by_id[selected_batch_id], run_mode, target_stage)
+                    ]
+                    _check_batch_overlaps(selected_urls, active_batch_ids, batch_by_id, exclude=selected_batch_id)
+                else:
+                    _check_batch_overlaps(urls, active_batch_ids, batch_by_id)
 
                 save_config(config)
                 batch_id: str | None = None
@@ -4951,6 +5033,7 @@ def main() -> None:
                 if background:
                     status_text = {
                         "running": "后台运行中",
+                        "paused": "后台已暂停（点击“继续任务”接着处理）",
                         "done": "后台运行完成",
                         "done_with_errors": "后台运行完成（有失败项）",
                         "failed": "后台运行失败",
@@ -4963,7 +5046,9 @@ def main() -> None:
                 progress_columns = st.columns(5)
                 progress_columns[0].metric("总数", summary["total"])
                 progress_columns[1].metric("已完成", summary["completed"])
-                progress_columns[2].metric("执行中", summary["running"])
+                progress_columns[2].metric(
+                    "暂停中" if background and background.status == "paused" else "执行中", summary["running"]
+                )
                 progress_columns[3].metric("待处理", summary["pending"])
                 progress_columns[4].metric("失败", summary["failed"])
                 st.progress(
@@ -5052,6 +5137,12 @@ def main() -> None:
                 if completed_batch_items:
                     st.markdown("#### 批量结果后处理")
                     st.caption("每条结果都是独立草稿，可以逐条编辑、审核或归档；批量生成不会锁死后续修改。")
+                    if st.button("AI 逐项审核本批次", key=f"batch_ai_review_{selected_state.batch_id}"):
+                        st.session_state["_ai_review_scope_folders"] = [
+                            str(Path(item.output_folder).resolve()) for item in completed_batch_items
+                        ]
+                        st.session_state["_next_page"] = "AI 审核归类"
+                        st.rerun()
                     batch_item_labels = {
                         f"{Path(item.output_folder).name} | {item.status}": item for item in completed_batch_items
                     }
@@ -6592,6 +6683,13 @@ def main() -> None:
                 batch_id = create_batch_id()
                 creator_batch_options.batch_id = batch_id
                 try:
+                    existing_batches = {state.batch_id: state for state in list_batch_states()}
+                    active_ids = [
+                        saved_id for saved_id in existing_batches
+                        if (runtime := get_background_batch_status(saved_id))
+                        and runtime.status in {"running", "paused"}
+                    ]
+                    _check_batch_overlaps(processable_urls, active_ids, existing_batches)
                     options_snapshot = {
                         key: value for key, value in creator_batch_options.__dict__.items() if key != "urls"
                     }

@@ -18,7 +18,7 @@
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 开发、运行测试或构建二进制时改用 `pip install -r requirements-dev.txt`。
@@ -33,6 +33,15 @@ pip install -r requirements.txt
 
 Python 3.10+。
 
+如果切换了 Conda 环境或升级了 Python，旧 `.venv` 可能仍指向已不存在的解释器，出现 `No such file or directory` 或 `bad interpreter`。在旧目录上重复执行 `python -m venv .venv` 不一定能修复。请先退出虚拟环境（若已激活，执行 `deactivate`），激活要使用的 Conda 环境（例如 `conda activate py314`），再备份并重建：
+
+```bash
+mv .venv ".venv.$(date +%Y%m%d-%H%M%S).bak"
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
 ### ffmpeg 安装提示
 
 需要系统可执行 `ffmpeg`，例如：
@@ -40,6 +49,19 @@ Python 3.10+。
 - macOS: `brew install ffmpeg`
 - Ubuntu/Debian: `sudo apt install ffmpeg`
 - Windows: `winget install ffmpeg`
+
+Conda 环境也可使用 `conda install -n py314 -c conda-forge ffmpeg`（将 `py314` 替换为实际环境名）。
+
+### Whisper 模型下载失败
+
+没有可用字幕的视频会使用 Whisper 转写。安装 `faster-whisper` 不会自动下载模型；首次使用默认 `small` 模型时需要访问 Hugging Face。如果批次集中报 `transcribe_audio`、`Connection reset by peer` 和找不到本地 snapshot，可在已激活的 `.venv` 中通过可访问的镜像预下载模型（Linux/macOS）：
+
+```bash
+HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 python -c "from faster_whisper.utils import download_model; print(download_model('small'))"
+HF_HUB_OFFLINE=1 python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8'); print('模型离线加载成功')"
+```
+
+模型缓存在当前用户的 `~/.cache/huggingface/hub`（设置了 `HF_HOME` 或 `HF_HUB_CACHE` 时以对应路径为准）。下载并验证后，继续原批次或重试失败项。若希望完全避免模型联网检查，可在启动 UI 或批次前设置 `export HF_HUB_OFFLINE=1`；此时所选模型必须已经缓存。
 
 ## 使用方式
 
@@ -217,6 +239,16 @@ python -m bili_recipe_notes --export-curation-review --out outputs
 
 默认生成 `outputs/curation-review/recipe-review.csv` 和 `recipe-review.json`。工具会聚合同名菜谱，谨慎提示仅相差一个字的近似名称，并根据步骤完整度、视频时长、质量分、字幕重合和推广信号推荐 `primary_candidate`、`variant_candidate`、`short_clip_candidate`、`exclude_candidate` 或 `name_review_candidate`。也可以在网页的“最终菜谱整理”页面对照全部来源的用料、步骤、字幕证据和原视频，保存主版本、不同做法、短剪合并或排除决定。人工结果独立保存在 `outputs/curation-review/curation-decisions.json`，重新扫描不会覆盖。
 
+### AI 审核归类
+
+批量生成完成后，可进入管理页的“AI 审核归类”，使用当前输出目录和 LLM 设置，对已有菜谱逐条审核。在“批量处理”点击“AI 逐项审核本批次”，还可直接带入该批次已生成的菜谱范围。点击“开始 AI 批量审核”后任务在后台顺序运行，进度每 5 秒自动更新；点击“刷新审核进度与结果”查看最新分类和待确认问题，或选择“AI 审核这一条”单独审核。点击“完成当前条后暂停”会保留已保存结果，之后可继续未完成项或重试失败项。默认跳过有效审核，源菜谱变化后会提示重审。
+
+AI 会把内容归为“菜谱”“烹饪技巧”“非菜谱”或“无法确认”，并对菜谱逐项核对食材、调料和步骤的字幕依据。其他分类可仅给出内容判断和证据。只有证据明确、置信度至少为 `0.9` 的烹饪技巧或非菜谱才会默认隐藏，不再主动进入菜谱展示和点餐。完整做菜视频不会仅因含推广口播被隐藏，同名菜谱的合理做法变体也会保留。证据不足的内容继续展示并标记待人工确认。
+
+在审核页查看隐藏项，可以阅读归类理由并人工恢复展示；人工展示决定会在后续复审中保留，手机菜单在下一次同步时更新。审核记录独立写入菜谱目录的 `recipe.ai-review.json`，批次状态位于输出根目录的 `.ai-review/`。原始报告、字幕、来源、任务与质量报告，以及既有 `recipe.json`、`note.md`、人工审核文件和媒体均不会被本流程改写、删除或移动。AI 的修改意见也只保存在审核记录中。
+
+项目内的 [AGENTS.md](AGENTS.md) 和 [菜谱审核 Agent 指南](docs/agents/recipe-audit.md) 规定了审核工作流、分类边界、证据要求及人工恢复规则，可用于指导 AI 后续整理。原有“审核确认”仍是人工修改并应用生成版的独立流程。
+
 ### 迁移到另一台电脑
 
 需要把当前菜谱数据、知识库和整理进度搬到另一台已从 Git 获取源码的服务器时，生成数据迁移包：
@@ -301,6 +333,8 @@ macOS 直接双击 `start-ui-mac.command` 即可。首次打开会自动在项�
 
 macOS 启动器会自动设置稳定的 Arrow 内存池，把 Whisper 批处理放在独立进程，并在 UI 意外退出时最多自动重启 3 次。UI 诊断日志保存在 `.venv/ui.log`，手机 API 日志保存在 `.venv/mobile-api.log`。后台批次拥有独立 PID 和持久状态，即使网页刷新或 UI 重启也会继续运行。
 
+Linux/macOS 可在“批量处理”选择运行中的批次，或在“任务仪表盘”的任务卡片上点击“暂停任务”。暂停会保留当前处理位置；点击“继续任务”会沿用原配置继续同一个任务。刷新页面或重启 UI 后仍可继续；电脑重启后则使用“继续未完成”恢复已保存的阶段。暂停中的批次会阻止重复启动相同链接，暂停时间不计入处理速度。长时间暂停可能导致当前外部请求在继续后超时，届时可在批次结束后选择“只重试失败”。Windows 暂不支持即时暂停，按钮会禁用。
+
 如果从压缩包或网络下载后 macOS 丢失了执行权限，运行一次：
 
 ```bash
@@ -324,6 +358,7 @@ UI 会在浏览器中打开，支持：
 - 设置 cookies 文件路径、输出目录、语言、Whisper 模型
 - 开关步骤截图、LLM 重写、临时媒体保留，并设置最终步骤/关键图片上限
 - 可选生成逐项审核版，在“审核确认”中采用、修改后采用或跳过每一项
+- 在“AI 审核归类”中逐条批量核查已有菜谱、标记内容类型，查看隐藏项并人工恢复展示
 - 在“最终菜谱整理”中横向比较同名和近似名来源，确认主版本、不同做法、短剪合并或排除
 - 生成结果先进入“草稿与归档”，可以不修改直接存档，也可以完整编辑或审核后再存档
 - 在编辑页修改分类、菜系、标签、配料、步骤、关键点，或直接手写最终 Markdown
@@ -567,6 +602,7 @@ outputs/规范菜名--BVID/
 ├── source.json          # 原视频元数据；原始阶段即生成
 ├── recipe.json
 ├── recipe.review.json   # 开启逐项审核时生成
+├── recipe.ai-review.json # AI 审核归类的独立记录；不覆盖生成版
 ├── note.md
 ├── extra_analysis.md
 ├── transcript.json

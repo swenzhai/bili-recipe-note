@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import uuid
 from pathlib import Path
@@ -15,6 +16,7 @@ from bili_recipe_notes.mobile_sync import (
     is_private_client,
     token_hash,
 )
+from bili_recipe_notes.review_policy import AI_REVIEW_FILE_NAME, review_recipe_hash, set_ai_review_visibility
 
 
 def _recipe(root: Path, name: str, *, bvid: str = "BV1demo", cid: str = "101") -> Path:
@@ -139,6 +141,91 @@ def test_technique_sources_are_retained_but_excluded_from_menu(tmp_path: Path) -
 
     store.set_video_classifications([source_url], "recipe")
     assert store.index_recipes()["indexed"] == 1
+
+
+def _ai_review(folder: Path, *, classification: str = "non_recipe", visibility: str = "hidden") -> None:
+    (folder / AI_REVIEW_FILE_NAME).write_text(json.dumps({
+        "schema_version": 1,
+        "status": "completed",
+        "source_recipe_sha256": review_recipe_hash(folder),
+        "classification": classification,
+        "visibility": visibility,
+        "confidence": 0.99,
+        "tags": ["审核标签"],
+        "reason": "测试审核结果",
+    }), encoding="utf-8")
+
+
+def test_ai_hidden_recipe_syncs_removal_and_manual_restore_without_touching_sources(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "审核广告")
+    originals = {path.name: path.read_bytes() for path in folder.iterdir() if path.is_file()}
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    recipe_id = store.list_recipes()[0]["id"]
+    device_id, _ = _paired(store)
+    cursor = store.current_revision()
+
+    _ai_review(folder)
+    result = store.index_recipes()
+    assert result["indexed"] == 0
+    assert result["deleted"] == 1
+    assert store.list_recipes() == []
+    removed = store.sync(device_id, cursor, [])["changes"]
+    assert [(item["entity_id"], item["action"]) for item in removed] == [(recipe_id, "delete")]
+    assert store.list_indexed_recipes(include_deleted=True)[0]["id"] == recipe_id
+    assert store.list_video_sources()[0]["classification"] == "recipe"
+
+    cursor = store.current_revision()
+    set_ai_review_visibility(folder, "visible")
+    assert store.index_recipes()["indexed"] == 1
+    restored = store.sync(device_id, cursor, [])["changes"]
+    assert [(item["entity_id"], item["action"]) for item in restored] == [(recipe_id, "upsert")]
+    assert restored[0]["payload"]["tags"] == ["审核标签"]
+    for name, content in originals.items():
+        assert (folder / name).read_bytes() == content
+
+
+def test_ai_review_tags_are_published_without_overwriting_original_recipe(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "审核菜谱")
+    path = folder / "recipe.json"
+    recipe = json.loads(path.read_text(encoding="utf-8"))
+    recipe["tags"] = ["家常菜", "审核标签"]
+    path.write_text(json.dumps(recipe), encoding="utf-8")
+    before = path.read_bytes()
+    _ai_review(folder, classification="recipe", visibility="visible")
+    store = MobileSyncStore(tmp_path)
+
+    store.index_recipes()
+    assert store.list_recipes()[0]["tags"] == ["家常菜", "审核标签"]
+    assert path.read_bytes() == before
+
+
+def test_stale_ai_review_does_not_keep_updated_recipe_hidden(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "待重新审核")
+    _ai_review(folder)
+    store = MobileSyncStore(tmp_path)
+    assert store.index_recipes()["indexed"] == 0
+
+    recipe_path = folder / "recipe.json"
+    recipe_path.write_bytes(recipe_path.read_bytes() + b"\n")
+    assert store.index_recipes()["indexed"] == 1
+    assert "审核标签" not in store.list_recipes()[0].get("tags", [])
+
+
+def test_hidden_latest_duplicate_does_not_republish_an_older_copy(tmp_path: Path) -> None:
+    old = _recipe(tmp_path, "旧副本")
+    latest = _recipe(tmp_path, "新副本")
+    os.utime(old / "recipe.json", (100, 100))
+    os.utime(latest / "recipe.json", (200, 200))
+    _ai_review(latest)
+    store = MobileSyncStore(tmp_path)
+
+    result = store.index_recipes()
+    assert result["indexed"] == 0
+    assert len(result["duplicates"]) == 1
+    set_ai_review_visibility(latest, "visible")
+    store.index_recipes()
+    assert store.list_recipes()[0]["title"] == "新副本"
 
 
 def test_recipe_cover_is_published_as_the_preferred_asset(tmp_path: Path) -> None:

@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .config import CONFIG_DIR_NAME, load_config
 from .cover_policy import has_manually_approved_cover
+from .review_policy import ai_review_is_hidden, load_ai_review
 from .storage import atomic_write_json
 
 
@@ -532,6 +533,7 @@ class MobileSyncStore:
 
     def index_recipes(self) -> dict[str, Any]:
         candidates: dict[str, list[tuple[float, Path, dict[str, Any], list[dict[str, Any]], str]]] = {}
+        hidden_folders: set[Path] = set()
         with self._connect() as connection:
             excluded_source_keys = {
                 str(row["source_key"])
@@ -551,6 +553,15 @@ class MobileSyncStore:
                     continue
                 recipe_id = self._recipe_id(folder, recipe, _read_object(folder / "job.json"))
                 payload = {**recipe, "id": recipe_id, "schema_version": SCHEMA_VERSION}
+                review = load_ai_review(folder)
+                if ai_review_is_hidden(review):
+                    hidden_folders.add(folder)
+                if review:
+                    original_tags = recipe.get("tags") if isinstance(recipe.get("tags"), list) else []
+                    payload["tags"] = list(dict.fromkeys(
+                        tag.strip() for tag in [*original_tags, *review["tags"]]
+                        if isinstance(tag, str) and tag.strip()
+                    ))
                 assets = self._assets_for_recipe(folder, payload, recipe_id)
                 public_assets = [{key: value for key, value in item.items() if key != "_path"} for item in assets]
                 payload["assets"] = public_assets
@@ -558,7 +569,10 @@ class MobileSyncStore:
                 candidates.setdefault(recipe_id, []).append(
                     (recipe_path.stat().st_mtime, folder, payload, assets, content_hash)
                 )
-        chosen = {key: max(items, key=lambda item: item[0]) for key, items in candidates.items()}
+        latest = {key: max(items, key=lambda item: item[0]) for key, items in candidates.items()}
+        # Apply the review after duplicate resolution so an older copy cannot
+        # reappear when the current generated recipe is hidden.
+        chosen = {key: item for key, item in latest.items() if item[1] not in hidden_folders}
         duplicates = [
             {"recipe_id": key, "folders": [str(item[1]) for item in items]}
             for key, items in candidates.items() if len(items) > 1

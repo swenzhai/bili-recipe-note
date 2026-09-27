@@ -8,6 +8,7 @@ from typing import Any
 from .quality import analyze_recipe_quality, load_quality_report, write_quality_report
 from .obsidian_archive import recipe_archive_status
 from .recipe_extractor import Recipe, normalize_recipe_taxonomy
+from .review_policy import load_ai_review
 
 
 @dataclass
@@ -109,6 +110,15 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
         transcript_path = folder / "transcript.json"
         job_path = folder / "job.json"
         recipe = _read_json(recipe_path) if recipe_path.exists() else {}
+        ai_review = load_ai_review(folder) if recipe else None
+        tags = list(dict.fromkeys(
+            tag.strip()
+            for tag in [
+                *(recipe.get("tags") if isinstance(recipe.get("tags"), list) else []),
+                *((ai_review or {}).get("tags") or []),
+            ]
+            if isinstance(tag, str) and tag.strip()
+        ))
         normalized_recipe: Recipe | None = None
         if recipe:
             try:
@@ -157,9 +167,7 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
                 archived_at=str(archive.get("archived_at")) if archive.get("archived_at") else None,
                 category=str(recipe.get("category") or "未分类"),
                 cuisine=str(recipe.get("cuisine") or "未分类"),
-                tags=[str(tag) for tag in recipe.get("tags", []) if str(tag).strip()]
-                if isinstance(recipe.get("tags"), list)
-                else [],
+                tags=tags,
                 taste_rating=normalized_recipe.taste_rating if normalized_recipe else None,
                 difficulty_rating=normalized_recipe.difficulty_rating if normalized_recipe else None,
                 time_rating=normalized_recipe.time_rating if normalized_recipe else None,

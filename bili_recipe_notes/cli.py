@@ -521,6 +521,11 @@ def _validate_required_recipe_outputs(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
+    if len(sys.argv) == 5 and sys.argv[1] == "--ai-review-worker":
+        from .ai_review_worker import main as ai_review_worker_main
+
+        return ai_review_worker_main(sys.argv[2:])
+
     parser = build_parser()
     args = parser.parse_args()
     try:

@@ -18,6 +18,8 @@ def test_exports_keep_full_text_and_bundle_images(tmp_path: Path) -> None:
     (images / "step_01.jpg").write_bytes(b"not-a-real-image")
     (media / "video.mp4").write_bytes(b"private-media")
     (folder / "recipe.json").write_text("{}", encoding="utf-8")
+    review_bytes = b'{"classification":"non_recipe","visibility":"hidden"}'
+    (folder / "recipe.ai-review.json").write_bytes(review_bytes)
     (folder / "transcript.json").write_text("[]", encoding="utf-8")
     lines = ["# Demo: Recipe", "", *[f"- 第 {index} 行内容" for index in range(100)], "", "最后一行"]
     note = folder / "note.md"
@@ -36,6 +38,7 @@ def test_exports_keep_full_text_and_bundle_images(tmp_path: Path) -> None:
     with zipfile.ZipFile(bundle) as archive:
         names = set(archive.namelist())
         assert {"note.md", "recipe.json", "transcript.json", "images/step_01.jpg"} <= names
+        assert archive.read("recipe.ai-review.json") == review_bytes
         assert "media/video.mp4" not in names
 
 

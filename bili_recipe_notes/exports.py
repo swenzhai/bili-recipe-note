@@ -189,6 +189,7 @@ def export_recipe_bundle(note_path: Path, output_path: Path | None = None) -> Pa
     allowed_names = {
         "note.md",
         "recipe.json",
+        "recipe.ai-review.json",
         "transcript.json",
         "quality.json",
         "job.json",
