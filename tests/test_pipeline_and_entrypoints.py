@@ -455,7 +455,7 @@ def test_empty_transcription_fails_and_cleans_media_according_to_option(monkeypa
             )
         )
 
-    output_folder = next((tmp_path / str(keep_media)).iterdir())
+    output_folder = next((tmp_path / str(keep_media)).rglob("job.json")).parent
     assert (output_folder / "media").exists() is keep_media
     assert json.loads((output_folder / "job.json").read_text(encoding="utf-8"))["status"] == "failed"
 
@@ -582,13 +582,16 @@ def test_strict_batch_requeues_degraded_completed_recipe(monkeypatch, tmp_path) 
 
 
 def test_extract_creator_links_writes_file(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(pipeline, "creators_dir", lambda: tmp_path / "data" / "creators")
     monkeypatch.setattr(
         pipeline,
-        "extract_creator_video_links",
-        lambda url, cookies=None: [
-            "https://www.bilibili.com/video/BV1xx411c7mD",
-            "https://www.bilibili.com/video/BV1ab411c7mE",
-        ],
+        "crawl_creator_videos",
+        lambda url, cookies=None: CreatorCrawlResult(
+            uid="123456", uploader="厨师", videos=[
+                CreatorVideo("BV1xx411c7mD", "第一道", "https://www.bilibili.com/video/BV1xx411c7mD"),
+                CreatorVideo("BV1ab411c7mE", "第二道", "https://www.bilibili.com/video/BV1ab411c7mE"),
+            ],
+        ),
     )
 
     links_path = pipeline.extract_creator_links(
@@ -602,6 +605,9 @@ def test_extract_creator_links_writes_file(monkeypatch, tmp_path) -> None:
         "https://www.bilibili.com/video/BV1xx411c7mD",
         "https://www.bilibili.com/video/BV1ab411c7mE",
     ]
+    assert links_path == tmp_path / "data" / "creators" / "123456-厨师" / "all_links.txt"
+    assert (links_path.parent / "video_links.txt").read_bytes() == links_path.read_bytes()
+    assert json.loads((links_path.parent / "creator.json").read_text())["uid"] == "123456"
 
 
 def test_cli_run_passes_options_to_pipeline(monkeypatch, tmp_path) -> None:
@@ -812,6 +818,7 @@ def test_generate_recipe_from_raw_does_not_refetch_source(monkeypatch, tmp_path)
 
 
 def test_creator_archive_uses_stable_folder_and_keeps_previous_list(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(pipeline, "creators_dir", lambda: tmp_path / "data" / "creators")
     crawls = iter(
         [
             CreatorCrawlResult(
@@ -832,5 +839,6 @@ def test_creator_archive_uses_stable_folder_and_keeps_previous_list(monkeypatch,
     second = pipeline.crawl_and_archive_creator("https://space.bilibili.com/123/video", None, str(tmp_path / "out"))
 
     assert first.creator_dir == second.creator_dir
+    assert first.creator_dir == tmp_path / "data" / "creators" / "123-厨师"
     assert "BV1ab411c7mE" in second.links_path.read_text(encoding="utf-8")
     assert "BV1xx411c7mD" in second.links_path.with_name("video_links.txt.bak").read_text(encoding="utf-8")

@@ -153,6 +153,8 @@ def test_batch_handoff_round_trip_keeps_work_and_remaps_paths(tmp_path: Path) ->
     assert imported_pending.status == "pending"
     assert imported_pending.output_folder is None
     assert str(destination_out.resolve()) in (imported_raw.output_folder or "")
+    assert Path(imported_raw.output_folder or "").parent == destination_out / "厨房老师"
+    assert (destination_root / "data" / "creators" / "42-demo" / "video_links.txt").is_file()
     imported_job = json.loads((Path(imported_recipe.output_folder or "") / "job.json").read_text(encoding="utf-8"))
     assert imported_job["output_folder"] == imported_recipe.output_folder
     assert imported_state.options["out"] == str(destination_out.resolve())

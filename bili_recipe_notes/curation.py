@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from .output_layout import iter_output_folders
+from .data_paths import relocate_value
+
 import csv
 import json
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import StringIO
@@ -61,7 +64,7 @@ def load_curation_review(value: str | Path) -> dict[str, Any]:
     payload = _read_object(directory / CURATION_REVIEW_FILE)
     if not payload or payload.get("schema_version") != 1 or not isinstance(payload.get("groups"), list):
         raise ValueError(f"审核报告不存在或格式无效：{directory / CURATION_REVIEW_FILE}")
-    return payload
+    return relocate_value(payload)
 
 
 def load_curation_decisions(value: str | Path) -> dict[str, Any]:
@@ -433,7 +436,7 @@ def build_curation_review(out_dir: str | Path, destination: str | Path) -> Curat
     if root.is_dir():
         items = [
             item
-            for folder in sorted(path for path in root.iterdir() if path.is_dir())
+            for folder in sorted(iter_output_folders(root))
             if (item := _load_recipe_item(folder)) is not None
         ]
     by_title: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -447,6 +450,7 @@ def build_curation_review(out_dir: str | Path, destination: str | Path) -> Curat
         similar_by_title[pair["candidate_title"]].add(pair["title"])
 
     duplicate_groups = {title: values for title, values in by_title.items() if len(values) > 1}
+    folder_names = Counter(Path(item["output_folder"]).name for item in items)
     review_titles = set(duplicate_groups) | set(similar_by_title)
     rows: list[dict[str, Any]] = []
     groups: list[dict[str, Any]] = []
@@ -477,7 +481,9 @@ def build_curation_review(out_dir: str | Path, destination: str | Path) -> Curat
             if role == "primary_candidate":
                 primary_candidate_count += 1
             row = {
-                "item_id": Path(item["output_folder"]).name,
+                "item_id": (Path(item["output_folder"]).name
+                            if folder_names[Path(item["output_folder"]).name] == 1
+                            else Path(item["output_folder"]).relative_to(root).as_posix()),
                 "group_title": title,
                 "group_size": len(title_items),
                 "similar_titles": " | ".join(sorted(title_similar_names)),

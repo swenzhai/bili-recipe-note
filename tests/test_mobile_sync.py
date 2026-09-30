@@ -13,14 +13,19 @@ from bili_recipe_notes.mobile_sync import (
     AuthenticationError,
     MobileSyncStore,
     ValidationError,
+    VisibilityStateError,
     is_private_client,
+    recipe_visibility_states,
     token_hash,
 )
-from bili_recipe_notes.review_policy import AI_REVIEW_FILE_NAME, review_recipe_hash, set_ai_review_visibility
+from bili_recipe_notes.review_policy import (
+    AI_REVIEW_FILE_NAME, AI_REVIEW_RULES_VERSION, AI_REVIEW_PROMPT_VERSION,
+    review_recipe_hash, review_input_fingerprint, set_ai_review_visibility,
+)
 
 
 def _recipe(root: Path, name: str, *, bvid: str = "BV1demo", cid: str = "101") -> Path:
-    folder = root / "outputs" / name
+    folder = root / "data" / "recipes" / name
     images = folder / "images"
     images.mkdir(parents=True)
     (images / "step.jpg").write_bytes(b"fake-jpeg")
@@ -144,15 +149,21 @@ def test_technique_sources_are_retained_but_excluded_from_menu(tmp_path: Path) -
 
 
 def _ai_review(folder: Path, *, classification: str = "non_recipe", visibility: str = "hidden") -> None:
+    (folder / "transcript.json").write_text(json.dumps([{"text": "测试引用，仅用于合成测试"}]), encoding="utf-8")
     (folder / AI_REVIEW_FILE_NAME).write_text(json.dumps({
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "completed",
         "source_recipe_sha256": review_recipe_hash(folder),
+        "input_fingerprint": review_input_fingerprint(folder),
+        "rules_version": AI_REVIEW_RULES_VERSION,
+        "prompt_version": AI_REVIEW_PROMPT_VERSION,
         "classification": classification,
         "visibility": visibility,
         "confidence": 0.99,
         "tags": ["审核标签"],
         "reason": "测试审核结果",
+        "evidence": [{"text": "测试引用，仅用于合成测试"}],
+        "item_checks": [],
     }), encoding="utf-8")
 
 
@@ -207,7 +218,9 @@ def test_stale_ai_review_does_not_keep_updated_recipe_hidden(tmp_path: Path) -> 
     assert store.index_recipes()["indexed"] == 0
 
     recipe_path = folder / "recipe.json"
-    recipe_path.write_bytes(recipe_path.read_bytes() + b"\n")
+    changed = json.loads(recipe_path.read_text(encoding="utf-8"))
+    changed["steps"][0]["action"] = "补充了新的制作步骤"
+    recipe_path.write_text(json.dumps(changed, ensure_ascii=False), encoding="utf-8")
     assert store.index_recipes()["indexed"] == 1
     assert "审核标签" not in store.list_recipes()[0].get("tags", [])
 
@@ -226,6 +239,209 @@ def test_hidden_latest_duplicate_does_not_republish_an_older_copy(tmp_path: Path
     set_ai_review_visibility(latest, "visible")
     store.index_recipes()
     assert store.list_recipes()[0]["title"] == "新副本"
+
+
+def test_manual_restore_overrides_legacy_exclusion_but_keeps_menu_unpublished(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "旧来源排除")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    recipe_id = store.list_recipes()[0]["id"]
+    source_url = store.list_recipes()[0]["source_url"]
+    store.set_recipe_publications({recipe_id: False})
+    store.set_video_classifications([source_url], "technique")
+    assert store.index_recipes()["indexed"] == 0
+
+    set_ai_review_visibility(folder, "visible")
+    assert store.index_recipes()["indexed"] == 1
+    state = store.recipe_visibility_states()[str(folder)]
+    assert state["content_visible"] is True
+    assert state["visible"] is False
+    assert state["reason_code"] == "unpublished"
+    assert state["source_classification"] == "technique"
+    assert store.list_video_sources()[0]["classification"] == "technique"
+    assert store.list_recipes()[0]["published"] is False
+
+    store.set_recipe_publications({recipe_id: True})
+    assert store.recipe_visibility_states()[str(folder)]["visible"] is True
+    set_ai_review_visibility(folder, None)
+    assert store.index_recipes()["indexed"] == 0
+
+
+def test_manual_hide_survives_stale_ai_review_and_recipe_read_failure(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "人工隐藏")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    _ai_review(folder, classification="recipe", visibility="visible")
+    set_ai_review_visibility(folder, "hidden")
+    path = folder / "recipe.json"
+    updated = json.loads(path.read_text(encoding="utf-8"))
+    updated["title"] = "内容已更新"
+    path.write_text(json.dumps(updated, ensure_ascii=False), encoding="utf-8")
+    assert store.index_recipes()["indexed"] == 0
+
+    set_ai_review_visibility(folder, "visible")
+    assert store.index_recipes()["indexed"] == 1
+    set_ai_review_visibility(folder, "hidden")
+    path.write_text("{", encoding="utf-8")
+    result = store.index_recipes()
+    assert result["errors"]
+    assert store.list_recipes() == []
+
+
+def test_visibility_reader_does_not_initialize_database_or_modify_reports(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "只读状态")
+    before = {str(path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    state = recipe_visibility_states(tmp_path / "data" / "recipes", project_root=tmp_path)[str(folder)]
+    assert state["visible"] is True
+    assert state["published"] is True
+    assert state["recipe_id"] is None
+    assert {str(path): path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
+    assert not (tmp_path / "data" / "state").exists()
+
+
+def test_visibility_reader_reports_corrupt_database_without_assuming_visible(tmp_path: Path) -> None:
+    _recipe(tmp_path, "数据库不可读")
+    database = tmp_path / "data" / "state" / "mobile-sync.sqlite3"
+    database.parent.mkdir(parents=True)
+    database.write_bytes(b"not-a-sqlite-database")
+    with pytest.raises(VisibilityStateError, match="无法读取来源分类"):
+        recipe_visibility_states(tmp_path / "data" / "recipes", project_root=tmp_path)
+    assert database.read_bytes() == b"not-a-sqlite-database"
+
+
+def test_incremental_index_reuses_unchanged_candidates_and_detects_changed_image(tmp_path: Path, monkeypatch) -> None:
+    first = _recipe(tmp_path, "缓存一", cid="1")
+    _recipe(tmp_path, "缓存二", cid="2")
+    store = MobileSyncStore(tmp_path)
+    assert store.index_recipes()["rebuilt"] == 2
+    monkeypatch.setattr("bili_recipe_notes.mobile_sync.fingerprint_is_stable", lambda _: True)
+    calls = []
+    build_assets = store._assets_for_recipe
+
+    def assets(folder, payload, recipe_id):
+        calls.append(folder)
+        return build_assets(folder, payload, recipe_id)
+
+    monkeypatch.setattr(store, "_assets_for_recipe", assets)
+    stable = store.index_recipes()
+    assert stable["cache_hits"] == 2
+    assert stable["rebuilt"] == stable["changed"] == 0
+    assert calls == []
+
+    replacement = first / "images" / "new.jpg"
+    replacement.write_bytes(b"new-jpeg!")
+    replacement.replace(first / "images" / "step.jpg")
+    updated = store.index_recipes()
+    assert updated["cache_hits"] == 1
+    assert updated["rebuilt"] == updated["changed"] == 1
+    assert calls == [first]
+    recipe = next(item for item in store.list_recipes() if item["title"] == "缓存一")
+    assert recipe["steps"][0]["image_sha256"] == hashlib.sha256(b"new-jpeg!").hexdigest()
+
+
+def test_incremental_index_detects_image_deletion_and_recreation(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "图片变动")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    image_path = folder / "images" / "step.jpg"
+    image_path.unlink()
+    assert store.index_recipes()["changed"] == 1
+    assert store.list_recipes()[0]["assets"] == []
+    assert "image_sha256" not in store.list_recipes()[0]["steps"][0]
+    image_path.write_bytes(b"restored-image")
+    assert store.index_recipes()["changed"] == 1
+    assert store.list_recipes()[0]["assets"][0]["sha256"] == hashlib.sha256(b"restored-image").hexdigest()
+
+
+@pytest.mark.parametrize("file_name", ["job.json", "source.json", "transcript.json", "note.md"])
+def test_incremental_index_checks_all_review_and_identity_inputs(tmp_path: Path, file_name: str, monkeypatch) -> None:
+    folder = _recipe(tmp_path, "审核输入缓存")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    path = folder / file_name
+    if file_name == "job.json":
+        value = json.loads(path.read_text(encoding="utf-8"))
+        value["title"] = "更新来源标题"
+        path.write_text(json.dumps(value), encoding="utf-8")
+    else:
+        path.write_text("[]" if file_name == "transcript.json" else "{}", encoding="utf-8")
+    assert store.index_recipes()["rebuilt"] == 1
+    monkeypatch.setattr("bili_recipe_notes.mobile_sync.fingerprint_is_stable", lambda _: True)
+    assert store.index_recipes()["cache_hits"] == 1
+
+
+def test_unreadable_recipe_retains_last_good_payload_and_recovers(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "短暂损坏")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    before = store.list_recipes()
+    path = folder / "recipe.json"
+    original = path.read_bytes()
+    path.write_text("{", encoding="utf-8")
+    result = store.index_recipes()
+    assert len(result["errors"]) == 1
+    assert result["deleted"] == 0
+    assert store.list_recipes() == before
+    path.write_bytes(original)
+    assert store.index_recipes()["errors"] == []
+
+
+def test_unreadable_latest_duplicate_does_not_fall_back_to_older_content(tmp_path: Path) -> None:
+    old = _recipe(tmp_path, "旧副本")
+    latest = _recipe(tmp_path, "最新可用副本")
+    os.utime(old / "recipe.json", (100, 100))
+    os.utime(latest / "recipe.json", (200, 200))
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    path = latest / "recipe.json"
+    original = path.read_bytes()
+    path.write_text("{", encoding="utf-8")
+    result = store.index_recipes()
+    assert result["indexed"] == 1
+    assert result["changed"] == result["deleted"] == 0
+    assert result["errors"]
+    assert store.list_recipes()[0]["title"] == "最新可用副本"
+    path.write_bytes(original)
+    assert store.index_recipes()["errors"] == []
+
+
+def test_legacy_classification_changes_apply_even_when_candidate_is_cached(tmp_path: Path, monkeypatch) -> None:
+    _recipe(tmp_path, "分类变更")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    source = store.list_recipes()[0]["source_url"]
+    monkeypatch.setattr("bili_recipe_notes.mobile_sync.fingerprint_is_stable", lambda _: True)
+    store.set_video_classifications([source], "technique")
+    hidden = store.index_recipes()
+    assert hidden["cache_hits"] == 1
+    assert hidden["indexed"] == 0
+    store.set_video_classifications([source], "recipe")
+    restored = store.index_recipes()
+    assert restored["cache_hits"] == 1
+    assert restored["indexed"] == 1
+
+
+def test_missing_library_root_does_not_delete_existing_library(tmp_path: Path) -> None:
+    _recipe(tmp_path, "离线目录")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    before = store.list_recipes()
+    (tmp_path / "data" / "recipes").rename(tmp_path / "temporarily-offline")
+    with pytest.raises(OSError, match="暂不可用"):
+        store.index_recipes()
+    assert store.list_recipes() == before
+
+
+def test_folder_rename_updates_index_paths_even_when_payload_is_unchanged(tmp_path: Path) -> None:
+    folder = _recipe(tmp_path, "原目录")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    renamed = folder.with_name("新目录")
+    folder.rename(renamed)
+    store.index_recipes()
+    assert store.list_recipe_cover_reviews()[0]["output_folder"] == str(renamed)
+    digest = store.list_recipes()[0]["assets"][0]["sha256"]
+    assert store.asset_path(digest)[0] == renamed / "images" / "step.jpg"
 
 
 def test_recipe_cover_is_published_as_the_preferred_asset(tmp_path: Path) -> None:
@@ -295,7 +511,7 @@ def test_recipe_identity_uses_part_number_and_persists_random_fallback(tmp_path:
     metadata = json.loads((part / "sync-meta.json").read_text(encoding="utf-8"))
     assert metadata["source_identity"] == "bilibili:bv1demo:p:2"
 
-    anonymous = tmp_path / "outputs" / "anonymous"
+    anonymous = tmp_path / "data" / "recipes" / "anonymous"
     anonymous.mkdir()
     (anonymous / "recipe.json").write_text(
         json.dumps({"title": "无来源", "steps": []}, ensure_ascii=False),
@@ -513,7 +729,7 @@ def test_recipe_publication_persists_and_syncs_without_losing_details(tmp_path: 
 
 
 def test_database_v2_migration_defaults_existing_recipes_to_published(tmp_path: Path) -> None:
-    database = tmp_path / ".bili-recipe-notes" / "mobile-sync.sqlite3"
+    database = tmp_path / "data" / "state" / "mobile-sync.sqlite3"
     database.parent.mkdir(parents=True)
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -792,7 +1008,7 @@ def test_device_starting_prep_becomes_only_meal_chef(tmp_path: Path) -> None:
 
 
 def test_database_v3_migration_adds_meal_stages(tmp_path: Path) -> None:
-    database = tmp_path / ".bili-recipe-notes" / "mobile-sync.sqlite3"
+    database = tmp_path / "data" / "state" / "mobile-sync.sqlite3"
     database.parent.mkdir(parents=True)
     order_id = str(uuid.uuid4())
     recipe_id = str(uuid.uuid4())
@@ -837,8 +1053,8 @@ def test_legacy_capabilities_hide_shared_meal_changes(tmp_path: Path) -> None:
 
 
 def test_legacy_meal_plans_migrate_once_with_backup(tmp_path: Path) -> None:
-    config = tmp_path / ".bili-recipe-notes"
-    config.mkdir()
+    config = tmp_path / "data" / "state"
+    config.mkdir(parents=True)
     source = config / "meal-plans.json"
     source.write_text(json.dumps({
         "schema_version": 1,

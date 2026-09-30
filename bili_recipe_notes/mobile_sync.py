@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .output_layout import iter_output_folders
+
 import hashlib
 import hmac
 import ipaddress
@@ -8,6 +10,7 @@ import mimetypes
 import secrets
 import shutil
 import sqlite3
+import stat
 import threading
 import uuid
 from contextlib import contextmanager
@@ -15,11 +18,18 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
-from .config import CONFIG_DIR_NAME, load_config
+from .config import load_config
+from .data_paths import state_dir, resolve_stored_path, relocate_value, ensure_data_layout
 from .cover_policy import has_manually_approved_cover
-from .review_policy import ai_review_is_hidden, load_ai_review
+from .file_cache import file_fingerprint, file_sha256, fingerprint_is_stable, read_json_cached
+from .review_policy import (
+    AI_REVIEW_FILE_NAME,
+    get_review_state,
+    resolve_recipe_visibility,
+    resolve_record_visibility,
+)
 from .storage import atomic_write_json
 
 
@@ -51,6 +61,10 @@ class AuthenticationError(MobileSyncError):
 
 class ValidationError(MobileSyncError):
     pass
+
+
+class VisibilityStateError(MobileSyncError):
+    """Display decisions could not be read safely; do not assume visibility."""
 
 
 @dataclass(frozen=True)
@@ -96,18 +110,27 @@ def _canonical_json(value: Any) -> str:
 
 def _read_object(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = read_json_cached(path)
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, dict) else {}
 
 
 def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return file_sha256(path)
+
+
+@dataclass(frozen=True)
+class _RecipeCandidate:
+    folder: Path
+    recipe_id: str
+    payload: dict[str, Any]
+    assets: list[dict[str, Any]]
+    content_hash: str
+    dependencies: tuple[Path, ...]
+    fingerprint: tuple[Any, ...]
+    review_state: dict[str, Any]
+    modified_ns: int
 
 
 def normalize_source_url(value: str) -> str:
@@ -125,6 +148,79 @@ def normalize_source_url(value: str) -> str:
     return f"{normalized}?p={page}" if page else normalized
 
 
+def _visibility_states(
+    out_dir: Path,
+    database_path: Path,
+    folders: Iterable[str | Path] | None,
+    project_root: str | Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Read menu decisions without initializing, migrating, or writing a DB."""
+
+    try:
+        return _read_visibility_states(out_dir, database_path, folders, project_root)
+    except (sqlite3.Error, OSError) as exc:
+        raise VisibilityStateError(f"无法读取来源分类与菜单状态，已停止展示以避免误公开隐藏内容：{exc}") from exc
+
+
+def _read_visibility_states(
+    out_dir: Path,
+    database_path: Path,
+    folders: Iterable[str | Path] | None,
+    project_root: str | Path | None = None,
+) -> dict[str, dict[str, Any]]:
+
+    selected = [Path(folder).expanduser().resolve() for folder in folders] if folders is not None else [
+        folder for folder in sorted(iter_output_folders(out_dir))
+        if (folder / "recipe.json").is_file() and not (folder / "recipe.json").is_symlink()
+    ]
+    by_folder: dict[str, dict[str, Any]] = {}
+    by_id: dict[str, dict[str, Any]] = {}
+    source_classes: dict[str, str] = {}
+    if file_fingerprint(database_path) is not None:
+        uri = "file:" + quote(str(database_path.resolve()), safe="/") + "?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=5) as connection:
+            connection.row_factory = sqlite3.Row
+            tables = {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if "recipes" in tables:
+                columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(recipes)")}
+                publication = "published" if "published" in columns else "1 AS published"
+                for row in connection.execute(f"SELECT id,output_folder,{publication} FROM recipes"):
+                    state = dict(row)
+                    by_folder[str(resolve_stored_path(state["output_folder"], project_root))] = state
+                    by_id[str(state["id"])] = state
+            if "video_sources" in tables:
+                source_classes = {
+                    str(row["source_key"]): str(row["classification"])
+                    for row in connection.execute("SELECT source_key,classification FROM video_sources")
+                }
+    results = {}
+    for folder in selected:
+        recipe = _read_object(folder / "recipe.json")
+        metadata = _read_object(folder / SYNC_META_FILE_NAME)
+        stored = by_folder.get(str(folder)) or by_id.get(str(metadata.get("recipe_id") or ""))
+        published = bool(stored["published"]) if stored else True
+        classification = source_classes.get(normalize_source_url(str(recipe.get("source_url") or "")))
+        state = resolve_recipe_visibility(folder, source_classification=classification, published=published)
+        results[str(folder)] = {
+            **state,
+            "published": published,
+            "source_classification": classification,
+            "recipe_id": str(stored["id"]) if stored else metadata.get("recipe_id"),
+        }
+    return results
+
+
+def recipe_visibility_states(
+    out_dir: str | Path,
+    folders: Iterable[str | Path] | None = None,
+    project_root: str | Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    root = Path(project_root or Path.cwd()).expanduser().resolve()
+    outputs = Path(out_dir).expanduser()
+    outputs = outputs.resolve() if outputs.is_absolute() else (root / outputs).resolve()
+    return _visibility_states(outputs, state_dir(root) / DATABASE_FILE_NAME, folders, root)
+
+
 class MobileSyncStore:
     """Server-side source of truth for mobile pairing and offline synchronization."""
 
@@ -139,13 +235,28 @@ class MobileSyncStore:
         configured_out = out_dir if out_dir is not None else load_config(self.project_root).out_dir
         output_path = Path(configured_out).expanduser()
         self.out_dir = output_path.resolve() if output_path.is_absolute() else (self.project_root / output_path).resolve()
-        config_dir = self.project_root / CONFIG_DIR_NAME
+        config_dir = state_dir(self.project_root)
         config_dir.mkdir(parents=True, exist_ok=True)
         self.database_path = Path(database_path).resolve() if database_path else config_dir / DATABASE_FILE_NAME
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.media_dir = config_dir / MEDIA_DIR_NAME
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._index_lock = threading.Lock()
+        self._recipe_candidates: dict[Path, _RecipeCandidate] = {}
+        ensure_data_layout(self.project_root)
         self._initialize()
+        self._relocate_database_paths()
+
+    def _relocate_database_paths(self) -> None:
+        """Keep practice photos and unpublished items usable after moving data."""
+        with self._write_connection() as connection:
+            for table, column in (("recipes", "output_folder"), ("assets", "path")):
+                rows = connection.execute(f"SELECT rowid,{column} FROM {table}").fetchall()
+                values = relocate_value([value for _, value in rows], self.project_root)
+                for (rowid, value), updated in zip(rows, values):
+                    if value != updated:
+                        connection.execute(f"UPDATE {table} SET {column}=? WHERE rowid=?", (updated, rowid))
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=15.0)
@@ -280,7 +391,7 @@ class MobileSyncStore:
         self._migrate_legacy_meal_plans()
 
     def _migrate_legacy_meal_plans(self) -> None:
-        path = self.project_root / CONFIG_DIR_NAME / "meal-plans.json"
+        path = state_dir(self.project_root) / "meal-plans.json"
         if not path.is_file():
             return
         with self._write_connection() as connection:
@@ -506,6 +617,7 @@ class MobileSyncStore:
         for index, step in enumerate(payload.get("steps") or []):
             if not isinstance(step, dict):
                 continue
+            step.pop("image_sha256", None)
             raw = str(step.get("screenshot_path") or "").strip()
             if not raw or "://" in raw:
                 continue
@@ -531,71 +643,169 @@ class MobileSyncStore:
             )
         return found
 
+    def _candidate_for_folder(self, folder: Path) -> tuple[_RecipeCandidate, bool]:
+        cached = self._recipe_candidates.get(folder)
+        if cached and all(fingerprint_is_stable(item) for item in cached.fingerprint) and tuple(file_fingerprint(path) for path in cached.dependencies) == cached.fingerprint:
+            return cached, True
+        recipe_path = folder / "recipe.json"
+        recipe_fingerprint = file_fingerprint(recipe_path)
+        recipe = read_json_cached(recipe_path)
+        if not isinstance(recipe, dict) or not isinstance(recipe.get("steps"), list):
+            raise ValueError("recipe.json 必须是包含 steps 数组的对象")
+        try:
+            job = read_json_cached(folder / "job.json")
+        except FileNotFoundError:
+            job = {}
+        if not isinstance(job, dict):
+            raise ValueError("job.json 必须是 JSON 对象")
+        recipe_id = self._recipe_id(folder, recipe, job)
+        dependencies = [folder / name for name in (
+            "recipe.json", "source.json", "job.json", AI_REVIEW_FILE_NAME,
+            "transcript.json", "note.md", SYNC_META_FILE_NAME,
+        )]
+        images = [step.get("screenshot_path") for step in recipe["steps"] if isinstance(step, dict)]
+        if has_manually_approved_cover(recipe):
+            images.append(recipe.get("cover_image_path"))
+        for image in images:
+            raw = str(image or "").strip()
+            if not raw or "://" in raw:
+                continue
+            path = (folder / raw).resolve()
+            if path.is_relative_to(folder.resolve()):
+                dependencies.append(path)
+        dependencies = list(dict.fromkeys(dependencies))
+        fingerprint = tuple(file_fingerprint(path) for path in dependencies)
+        if fingerprint[0] != recipe_fingerprint:
+            raise OSError("菜谱在索引期间发生变化，保留上次可用版本")
+        review_state = get_review_state(folder)
+        review = review_state["ai_review"]
+        payload = {**recipe, "id": recipe_id, "schema_version": SCHEMA_VERSION}
+        if review:
+            original_tags = recipe.get("tags") if isinstance(recipe.get("tags"), list) else []
+            payload["tags"] = list(dict.fromkeys(
+                tag.strip() for tag in [*original_tags, *review["tags"]]
+                if isinstance(tag, str) and tag.strip()
+            ))
+        assets = self._assets_for_recipe(folder, payload, recipe_id)
+        payload["assets"] = [{key: value for key, value in item.items() if key != "_path"} for item in assets]
+        if tuple(file_fingerprint(path) for path in dependencies) != fingerprint:
+            raise OSError("菜谱或配图在索引期间发生变化，保留上次可用版本")
+        candidate = _RecipeCandidate(
+            folder=folder, recipe_id=recipe_id, payload=payload, assets=assets,
+            content_hash=hashlib.sha256(_canonical_json(payload).encode()).hexdigest(),
+            dependencies=tuple(dependencies), fingerprint=fingerprint, review_state=review_state,
+            modified_ns=recipe_fingerprint[3],
+        )
+        self._recipe_candidates[folder] = candidate
+        return candidate, False
+
+    def recipe_visibility_states(self, folders: Iterable[str | Path] | None = None) -> dict[str, dict[str, Any]]:
+        return _visibility_states(self.out_dir, self.database_path, folders, self.project_root)
+
     def index_recipes(self) -> dict[str, Any]:
-        candidates: dict[str, list[tuple[float, Path, dict[str, Any], list[dict[str, Any]], str]]] = {}
-        hidden_folders: set[Path] = set()
+        with self._index_lock:
+            return self._index_recipes()
+
+    def _index_recipes(self) -> dict[str, Any]:
+        candidates: dict[str, list[_RecipeCandidate]] = {}
+        failed_folders: set[Path] = set()
+        protected_ids: set[str] = set()
+        errors: list[dict[str, str]] = []
+        cache_hits = rebuilt = 0
         with self._connect() as connection:
-            excluded_source_keys = {
-                str(row["source_key"])
+            source_classifications = {
+                str(row["source_key"]): str(row["classification"])
                 for row in connection.execute(
-                    "SELECT source_key FROM video_sources WHERE classification IN ('non_recipe','technique')"
+                    "SELECT source_key,classification FROM video_sources"
                 )
             }
-        if self.out_dir.exists():
-            for folder in self.out_dir.iterdir():
+            previously_indexed = connection.execute("SELECT COUNT(*) FROM recipes WHERE deleted_at IS NULL").fetchone()[0]
+        try:
+            if not self.out_dir.is_dir():
+                raise FileNotFoundError(self.out_dir)
+            folders = list(iter_output_folders(self.out_dir))
+        except FileNotFoundError:
+            if previously_indexed:
+                raise OSError("菜谱输出目录暂不可用，保留现有菜单")
+            folders = []
+        observed: set[Path] = set()
+        for folder in folders:
+            if folder.name.startswith("."):
+                continue
+            try:
+                if not stat.S_ISDIR(folder.stat().st_mode):
+                    continue
+                observed.add(folder)
                 recipe_path = folder / "recipe.json"
-                if not folder.is_dir() or not recipe_path.is_file():
+                if file_fingerprint(recipe_path) is None:
                     continue
-                recipe = _read_object(recipe_path)
-                if not recipe or not isinstance(recipe.get("steps"), list):
-                    continue
-                if normalize_source_url(str(recipe.get("source_url") or "")) in excluded_source_keys:
-                    continue
-                recipe_id = self._recipe_id(folder, recipe, _read_object(folder / "job.json"))
-                payload = {**recipe, "id": recipe_id, "schema_version": SCHEMA_VERSION}
-                review = load_ai_review(folder)
-                if ai_review_is_hidden(review):
-                    hidden_folders.add(folder)
-                if review:
-                    original_tags = recipe.get("tags") if isinstance(recipe.get("tags"), list) else []
-                    payload["tags"] = list(dict.fromkeys(
-                        tag.strip() for tag in [*original_tags, *review["tags"]]
-                        if isinstance(tag, str) and tag.strip()
-                    ))
-                assets = self._assets_for_recipe(folder, payload, recipe_id)
-                public_assets = [{key: value for key, value in item.items() if key != "_path"} for item in assets]
-                payload["assets"] = public_assets
-                content_hash = hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
-                candidates.setdefault(recipe_id, []).append(
-                    (recipe_path.stat().st_mtime, folder, payload, assets, content_hash)
-                )
-        latest = {key: max(items, key=lambda item: item[0]) for key, items in candidates.items()}
+                candidate, hit = self._candidate_for_folder(folder)
+                cache_hits += int(hit)
+                rebuilt += int(not hit)
+                candidates.setdefault(candidate.recipe_id, []).append(candidate)
+            except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                failed_folders.add(folder)
+                if folder in self._recipe_candidates:
+                    protected_ids.add(self._recipe_candidates[folder].recipe_id)
+                errors.append({"folder": str(folder), "error": f"{type(exc).__name__}: {exc}"})
+        self._recipe_candidates = {folder: candidate for folder, candidate in self._recipe_candidates.items() if folder in observed}
+        latest = {key: max(items, key=lambda item: item.modified_ns) for key, items in candidates.items()}
         # Apply the review after duplicate resolution so an older copy cannot
         # reappear when the current generated recipe is hidden.
-        chosen = {key: item for key, item in latest.items() if item[1] not in hidden_folders}
+        chosen = {}
+        for recipe_id, candidate in latest.items():
+            classification = source_classifications.get(normalize_source_url(str(candidate.payload.get("source_url") or "")))
+            state = resolve_record_visibility(
+                candidate.review_state["record"], candidate.review_state["ai_review"],
+                source_classification=classification,
+            )
+            if state["content_visible"]:
+                chosen[recipe_id] = candidate
         duplicates = [
-            {"recipe_id": key, "folders": [str(item[1]) for item in items]}
+            {"recipe_id": key, "folders": [str(item.folder) for item in items]}
             for key, items in candidates.items() if len(items) > 1
         ]
         changed = deleted = 0
         with self._write_connection() as connection:
             existing = {str(row["id"]): row for row in connection.execute("SELECT * FROM recipes")}
+            protected_ids.update(
+                recipe_id for recipe_id, row in existing.items() if Path(row["output_folder"]) in failed_folders
+            )
+            # A broken recipe must not erase its last good payload, but an
+            # explicit human hide still applies to that retained payload.
+            for recipe_id in tuple(protected_ids):
+                previous = existing.get(recipe_id)
+                if previous is not None:
+                    folder = Path(previous["output_folder"])
+                    previous_payload = json.loads(str(previous["payload_json"]))
+                    previous_source = normalize_source_url(str(previous_payload.get("source_url") or ""))
+                    if not resolve_recipe_visibility(
+                        folder, source_classification=source_classifications.get(previous_source),
+                    )["content_visible"]:
+                        protected_ids.discard(recipe_id)
+                        chosen.pop(recipe_id, None)
             now = utc_now()
-            for recipe_id, (_, folder, payload, assets, content_hash) in chosen.items():
+            for recipe_id, candidate in chosen.items():
+                if recipe_id in protected_ids:
+                    continue
+                folder, payload, assets, content_hash = candidate.folder, candidate.payload, candidate.assets, candidate.content_hash
                 old = existing.get(recipe_id)
                 source_url = str(payload.get("source_url") or "").strip()
                 source_key = normalize_source_url(source_url)
+                if (
+                    old and old["content_hash"] == content_hash and old["deleted_at"] is None
+                    and old["output_folder"] == str(folder) and (not source_key or source_key in source_classifications)
+                ):
+                    continue
                 if source_key:
                     creator_name = str(payload.get("creator_name") or payload.get("uploader") or "").strip() or None
                     connection.execute(
                         "INSERT INTO video_sources(source_key,source_url,creator_name,title,classification,recipe_id,batch_id,created_at,updated_at) "
                         "VALUES (?,?,?,?, 'recipe', ?, NULL, ?, ?) ON CONFLICT(source_key) DO UPDATE SET "
                         "source_url=excluded.source_url,creator_name=COALESCE(excluded.creator_name,video_sources.creator_name),"
-                        "title=excluded.title,classification='recipe',recipe_id=excluded.recipe_id,updated_at=excluded.updated_at",
+                        "title=excluded.title,recipe_id=excluded.recipe_id,updated_at=excluded.updated_at",
                         (source_key, source_url, creator_name, str(payload.get("video_title") or payload.get("title") or ""), recipe_id, now, now),
                     )
-                if old and old["content_hash"] == content_hash and old["deleted_at"] is None:
-                    continue
                 published = bool(old["published"]) if old is not None else True
                 recommended = bool(old["recommended"]) if old is not None else False
                 public_payload = {**payload, "published": published, "recommended": recommended}
@@ -626,7 +836,7 @@ class MobileSyncStore:
                     )
                 changed += 1
             for recipe_id, old in existing.items():
-                if recipe_id in chosen or old["deleted_at"] is not None:
+                if recipe_id in chosen or recipe_id in protected_ids or old["deleted_at"] is not None:
                     continue
                 revision = int(old["revision"])
                 if bool(old["published"]):
@@ -637,7 +847,11 @@ class MobileSyncStore:
                     (now, now, revision, recipe_id),
                 )
                 deleted += 1
-        return {"indexed": len(chosen), "changed": changed, "deleted": deleted, "duplicates": duplicates}
+        retained = sum(row["deleted_at"] is None for recipe_id, row in existing.items() if recipe_id in protected_ids)
+        return {
+            "indexed": len(chosen.keys() - protected_ids) + retained, "changed": changed, "deleted": deleted, "duplicates": duplicates,
+            "errors": errors, "cache_hits": cache_hits, "rebuilt": rebuilt,
+        }
 
     def known_non_recipe_urls(self, urls: Iterable[str]) -> set[str]:
         return self.known_video_urls(urls, classifications={"non_recipe", "technique"})
@@ -762,7 +976,7 @@ class MobileSyncStore:
             row = connection.execute("SELECT path,mime_type FROM assets WHERE sha256=?", (digest.lower(),)).fetchone()
         if not row:
             return None
-        path = Path(str(row["path"]))
+        path = resolve_stored_path(str(row["path"]), self.project_root)
         return (path, str(row["mime_type"])) if path.is_file() else None
 
     # Practice logs and synchronization

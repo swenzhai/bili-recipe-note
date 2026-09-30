@@ -6,7 +6,8 @@ from typing import Any
 
 from PIL import Image, UnidentifiedImageError
 
-from .config import CONFIG_DIR_NAME, UIConfig
+from .config import UIConfig
+from .data_paths import state_dir
 from .storage import atomic_write_bytes
 
 BRANDING_DIR_NAME = "branding"
@@ -17,8 +18,7 @@ SUPPORTED_LOGO_TYPES = {"image/png", "image/jpeg", "image/webp"}
 
 
 def branding_dir(project_root: str | Path | None = None) -> Path:
-    root = Path(project_root or Path.cwd()).resolve()
-    return root / CONFIG_DIR_NAME / BRANDING_DIR_NAME
+    return state_dir(project_root) / BRANDING_DIR_NAME
 
 
 def default_logo_path(project_root: str | Path | None = None) -> Path:
@@ -32,7 +32,7 @@ def _safe_configured_logo(config: UIConfig, project_root: str | Path | None = No
     if not configured:
         candidate = default_logo_path(root)
     elif configured.replace("\\", "/").startswith(f"{BRANDING_DIR_NAME}/"):
-        candidate = (root / CONFIG_DIR_NAME / configured).resolve()
+        candidate = (state_dir(root) / configured).resolve()
     else:
         candidate = (directory / configured).resolve()
     try:

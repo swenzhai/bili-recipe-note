@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections import Counter
 from dataclasses import asdict
@@ -15,6 +16,7 @@ from .batch_queue import (
     list_batch_states,
     load_batch_state,
 )
+from .data_paths import DATA_DIR_ENV, recipes_dir
 from .curation import DEFAULT_CURATION_REVIEW_DIR, build_curation_review
 from .deployment import export_deployment_bundle
 from .handoff import HandoffError, export_batch_handoff, import_handoff_bundle
@@ -32,7 +34,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("url", nargs="?", help="Single video URL, creator homepage, or one URL for --batch")
     parser.add_argument("--cookies", default=None)
-    parser.add_argument("--out", default="outputs")
+    parser.add_argument("--data-dir", help="Root for recipes, creator lists, databases and exports")
+    parser.add_argument("--out", default=None, help="Recipe library override (default: DATA/recipes)")
     parser.add_argument("--no-screenshot", action="store_true")
     parser.add_argument("--max-steps", type=int, default=10, choices=range(4, 13), metavar="4-12")
     parser.add_argument("--max-images", type=int, default=3, choices=range(1, 5), metavar="1-4")
@@ -68,8 +71,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="UTF-8 file containing advanced CLI prompt instructions",
     )
     parser.add_argument("--creator-home", action="store_true", help="Treat URL as creator homepage and extract all video links")
-    parser.add_argument("--creator-links-file", default="creator_video_links.txt")
+    parser.add_argument("--creator-links-file", default="video_links.txt")
     action_mode = parser.add_mutually_exclusive_group()
+    action_mode.add_argument("--migrate-data", choices=["preview", "apply"], help="Plan or migrate legacy data into the unified data root")
     action_mode.add_argument("--batch", action="store_true", help="Create and synchronously run a persistent batch")
     action_mode.add_argument("--resume-batch", metavar="BATCH_ID", help="Continue missing stages in an existing batch")
     action_mode.add_argument("--retry-batch", metavar="BATCH_ID", help="Retry only failed stages in an existing batch")
@@ -175,7 +179,7 @@ def _single_options(args: argparse.Namespace, url: str, extra_instructions: str 
     return RecipeJobOptions(
         url=url,
         cookies=getattr(args, "cookies", None),
-        out=getattr(args, "out", "outputs"),
+        out=(getattr(args, "out", None) or str(recipes_dir())),
         no_screenshot=getattr(args, "no_screenshot", False),
         whisper_model=getattr(args, "whisper_model", "small"),
         language=getattr(args, "language", "zh"),
@@ -205,7 +209,7 @@ def _batch_options(
     return BatchJobOptions(
         urls=urls,
         cookies=getattr(args, "cookies", None),
-        out=getattr(args, "out", "outputs"),
+        out=(getattr(args, "out", None) or str(recipes_dir())),
         no_screenshot=getattr(args, "no_screenshot", False),
         whisper_model=getattr(args, "whisper_model", "small"),
         language=getattr(args, "language", "zh"),
@@ -349,7 +353,7 @@ def _run_handoff_mode(args: argparse.Namespace) -> int:
     if import_path:
         if destination:
             raise ValueError("--handoff-destination can only be used with --export-handoff")
-        result = import_handoff_bundle(import_path, getattr(args, "out", "outputs"))
+        result = import_handoff_bundle(import_path, (getattr(args, "out", None) or str(recipes_dir())))
         console.print(
             f"[green]Handoff imported:[/green] {result.batch_id} | items={result.item_count} "
             f"| recipe={result.recipe_count} | raw={result.raw_count} | pending={result.pending_count}"
@@ -362,7 +366,7 @@ def _run_handoff_mode(args: argparse.Namespace) -> int:
     if export_batch_id:
         result = export_batch_handoff(
             export_batch_id,
-            getattr(args, "out", "outputs"),
+            (getattr(args, "out", None) or str(recipes_dir())),
             destination=destination,
         )
         console.print(
@@ -376,11 +380,31 @@ def _run_handoff_mode(args: argparse.Namespace) -> int:
 
 
 def run(args: argparse.Namespace) -> int:
+    if getattr(args, "data_dir", None):
+        os.environ[DATA_DIR_ENV] = str(Path(args.data_dir).expanduser().resolve())
+    args.out = getattr(args, "out", None) or str(recipes_dir())
+    if getattr(args, "migrate_data", None):
+        if any((getattr(args, "url", None), getattr(args, "batch_url", None), getattr(args, "batch_file", None),
+                getattr(args, "creator_home", False), getattr(args, "create_only", False))):
+            raise ValueError("--migrate-data does not accept video URLs or batch generation options")
+        from .data_migration import apply_data_migration, plan_data_migration
+        plan = plan_data_migration(Path.cwd())
+        console.print(f"Data root: {plan['data_root']} | moves={len(plan['moves'])}")
+        for move in plan['moves'][:20]:
+            console.print(f"{move['source']} -> {move['target']}")
+        if plan['conflicts']:
+            raise ValueError("Migration conflicts: " + "; ".join(plan['conflicts']))
+        if args.migrate_data == "apply":
+            result = apply_data_migration(plan)
+            console.print(f"Migration completed: {result['file_count']} files verified")
+            if result.get("manifest_path") and result.get("file_count"):
+                print(f"MIGRATION_MANIFEST={result['manifest_path']}")
+        return 0
     normalize_output_folders = getattr(args, "normalize_output_folders", None)
     if normalize_output_folders:
         if any((getattr(args, "url", None), getattr(args, "batch_url", None), getattr(args, "batch_file", None))):
             raise ValueError("--normalize-output-folders does not accept video URLs or --batch-file")
-        plans = plan_output_folder_migration(getattr(args, "out", "outputs"))
+        plans = plan_output_folder_migration((getattr(args, "out", None) or str(recipes_dir())))
         console.print(f"Output folder renames: {len(plans)}")
         for plan in plans[:20]:
             console.print(f"{plan.source.name} -> {plan.target.name}")
@@ -403,7 +427,7 @@ def run(args: argparse.Namespace) -> int:
             raise ValueError("--export-deployment-bundle does not accept video URLs or --batch-file")
         destination = Path(deployment_destination).expanduser() if deployment_destination else None
         result = export_deployment_bundle(
-            getattr(args, "out", "outputs"),
+            (getattr(args, "out", None) or str(recipes_dir())),
             destination,
             project_root=Path.cwd(),
         )
@@ -420,7 +444,7 @@ def run(args: argparse.Namespace) -> int:
     if curation_destination is not None:
         if any((getattr(args, "url", None), getattr(args, "batch_url", None), getattr(args, "batch_file", None))):
             raise ValueError("--export-curation-review does not accept video URLs or --batch-file")
-        out_dir = Path(getattr(args, "out", "outputs")).expanduser()
+        out_dir = Path((getattr(args, "out", None) or str(recipes_dir()))).expanduser()
         destination = (
             Path(curation_destination).expanduser()
             if curation_destination
@@ -440,7 +464,7 @@ def run(args: argparse.Namespace) -> int:
     if web_destination is not None:
         if any((getattr(args, "url", None), getattr(args, "batch_url", None), getattr(args, "batch_file", None))):
             raise ValueError("--export-web-library does not accept video URLs or --batch-file")
-        out_dir = Path(getattr(args, "out", "outputs")).expanduser()
+        out_dir = Path((getattr(args, "out", None) or str(recipes_dir()))).expanduser()
         destination = Path(web_destination).expanduser() if web_destination else out_dir / DEFAULT_WEB_LIBRARY_NAME
         result = export_web_library(
             Path.cwd(),
@@ -498,7 +522,7 @@ def run(args: argparse.Namespace) -> int:
         extract_creator_links(
             url=url,
             cookies=getattr(args, "cookies", None),
-            out=getattr(args, "out", "outputs"),
+            out=(getattr(args, "out", None) or str(recipes_dir())),
             filename=getattr(args, "creator_links_file", "creator_video_links.txt"),
             log=_log,
         )

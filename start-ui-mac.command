@@ -87,8 +87,13 @@ echo "Mobile client: http://$LAN_IP:8765"
 echo "Press Ctrl+C in this window to stop the server."
 echo
 
-API_LOG=".venv/mobile-api.log"
-UI_LOG=".venv/ui.log"
+BILI_RECIPE_DATA_DIR="$("$PYTHON_EXE" -c 'from bili_recipe_notes.data_paths import data_root; print(data_root())')" || exit 1
+export BILI_RECIPE_DATA_DIR
+RECIPE_LOG_DIR="$BILI_RECIPE_DATA_DIR/logs"
+mkdir -p "$RECIPE_LOG_DIR" || exit 1
+API_LOG="$RECIPE_LOG_DIR/mobile-api.log"
+UI_LOG="$RECIPE_LOG_DIR/ui.log"
+echo "Data directory: $BILI_RECIPE_DATA_DIR"
 API_PID=""
 cleanup_api() {
     if [ -n "$API_PID" ] && kill -0 "$API_PID" >/dev/null 2>&1; then
@@ -144,7 +149,7 @@ while true; do
     fi
     echo
     echo "UI process exited unexpectedly (status $UI_STATUS). Restarting in 2 seconds..."
-    echo "Diagnostic log: $(pwd)/$UI_LOG"
+    echo "Diagnostic log: $UI_LOG"
     sleep 2
 done
 

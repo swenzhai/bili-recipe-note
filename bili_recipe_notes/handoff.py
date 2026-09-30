@@ -25,6 +25,9 @@ from .batch_queue import (
     save_batch_state,
 )
 from .history import is_complete_output, is_raw_output
+from .creator_paths import creator_directory
+from .data_paths import creators_dir, exports_dir, state_dir
+from .output_layout import iter_output_folders
 from .storage import CorruptDataError, atomic_write_json, backup_path, read_json
 from .utils import sanitize_filename
 
@@ -154,20 +157,23 @@ def _portable_files(folder: Path) -> list[Path]:
     return files
 
 
-def _creator_documents(out_dir: Path, urls: set[str]) -> list[tuple[Path, str]]:
+def _creator_documents(out_dir: Path, urls: set[str], project_root: Path) -> list[tuple[Path, str]]:
     matches: list[tuple[Path, str]] = []
-    for links_path in sorted((out_dir / "creators").glob("*/video_links.txt")):
-        try:
-            document_urls = {line.strip() for line in links_path.read_text(encoding="utf-8").splitlines()}
-        except OSError:
-            continue
-        if not urls.intersection(document_urls):
-            continue
-        creator_name = sanitize_filename(links_path.parent.name)
-        matches.append((links_path, f"creators/{creator_name}/video_links.txt"))
-        manifest_path = links_path.parent / "creator.json"
-        if manifest_path.is_file():
-            matches.append((manifest_path, f"creators/{creator_name}/creator.json"))
+    archived: set[str] = set()
+    for creator_root in dict.fromkeys((creators_dir(project_root), out_dir / "creators", project_root / "creators")):
+        for links_path in sorted(creator_root.glob("*/*.txt")):
+            try:
+                document_urls = {line.strip() for line in links_path.read_text(encoding="utf-8").splitlines()}
+            except (OSError, UnicodeError):
+                continue
+            if not urls.intersection(document_urls):
+                continue
+            creator_name = sanitize_filename(links_path.parent.name)
+            for source in (links_path, links_path.parent / "creator.json"):
+                archive_name = f"creators/{creator_name}/{source.name}"
+                if source.is_file() and archive_name not in archived:
+                    matches.append((source, archive_name))
+                    archived.add(archive_name)
     return matches
 
 
@@ -197,7 +203,7 @@ def export_batch_handoff(
     destination_path = (
         Path(destination).expanduser()
         if destination
-        else output_root / "handoffs" / f"{sanitize_filename(batch_id)}-{stamp}.handoff.zip"
+        else exports_dir(root) / "handoffs" / f"{sanitize_filename(batch_id)}-{stamp}.handoff.zip"
     )
     if (destination_path.exists() and destination_path.is_dir()) or destination_path.suffix.lower() != ".zip":
         destination_path = destination_path / f"{sanitize_filename(batch_id)}-{stamp}.handoff.zip"
@@ -251,9 +257,9 @@ def export_batch_handoff(
                     data = _portable_job_bytes(source) if source.name == "job.json" else source.read_bytes()
                     _write_archive_member(archive, f"{archive_folder}/{relative}", data, records)
             urls = {item.url for item in state.items}
-            for source, archive_name in _creator_documents(output_root, urls):
+            for source, archive_name in _creator_documents(output_root, urls, root):
                 _write_archive_member(archive, archive_name, source.read_bytes(), records)
-            knowledge_path = root / ".bili-recipe-notes" / "knowledge_base.json"
+            knowledge_path = state_dir(root) / "knowledge_base.json"
             if knowledge_path.is_file():
                 _write_archive_member(
                     archive,
@@ -261,7 +267,7 @@ def export_batch_handoff(
                     knowledge_path.read_bytes(),
                     records,
                 )
-            import_dir = root / ".bili-recipe-notes" / "knowledge-imports"
+            import_dir = state_dir(root) / "knowledge-imports"
             for source in sorted(import_dir.glob("*")):
                 if source.is_file() and source.suffix.lower() not in {".bak", ".tmp"}:
                     _write_archive_member(
@@ -407,12 +413,28 @@ def _existing_source_url(folder: Path) -> str:
     return ""
 
 
-def _destination_folder(out_dir: Path, folder_name: str, url: str) -> Path:
-    candidate = out_dir / sanitize_filename(folder_name)
+def _destination_folder(out_dir: Path, folder_name: str, url: str, metadata: dict[str, Any]) -> Path:
+    existing = next((folder for folder in iter_output_folders(out_dir) if _existing_source_url(folder) == url), None)
+    if existing is not None:
+        return existing
+    parent = creator_directory(out_dir, metadata)
+    candidate = parent / sanitize_filename(folder_name)
     if not candidate.exists() or _existing_source_url(candidate) in {"", url}:
         return candidate
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:8]
-    return out_dir / sanitize_filename(f"{folder_name}-imported-{digest}")
+    return parent / sanitize_filename(f"{folder_name}-imported-{digest}")
+
+
+def _archive_creator_metadata(archive: zipfile.ZipFile, archive_folder: str) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for filename in ("job.json", "recipe.json", "source.json"):
+        try:
+            value = json.loads(archive.read(f"{archive_folder.rstrip('/')}/{filename}"))
+        except (KeyError, UnicodeError, json.JSONDecodeError):
+            continue
+        if isinstance(value, dict):
+            metadata.update({key: item for key, item in value.items() if item is not None})
+    return metadata
 
 
 def _restore_job_paths(folder: Path) -> None:
@@ -540,7 +562,9 @@ def import_handoff_bundle(
                 folder = (
                     existing_folder
                     if existing_folder and _existing_source_url(existing_folder) in {"", url}
-                    else _destination_folder(output_root, folder_name, url)
+                    else _destination_folder(
+                        output_root, folder_name, url, _archive_creator_metadata(archive, archive_folder)
+                    )
                 )
                 prefix = archive_folder.rstrip("/") + "/"
                 members = [
@@ -583,12 +607,10 @@ def import_handoff_bundle(
         creator_document_count = 0
         for name, info in by_name.items():
             path = PurePosixPath(name)
-            if len(path.parts) != 3 or path.parts[0] != "creators" or path.name not in {
-                "creator.json",
-                "video_links.txt",
-            }:
+            if (len(path.parts) != 3 or path.parts[0] != "creators"
+                    or (path.name != "creator.json" and path.suffix != ".txt")):
                 continue
-            destination = output_root / "creators" / sanitize_filename(path.parts[1]) / path.name
+            destination = creators_dir(root) / sanitize_filename(path.parts[1]) / path.name
             if destination.exists():
                 backup_count += 1
             _copy_member(archive, info, destination)
@@ -596,7 +618,7 @@ def import_handoff_bundle(
 
         knowledge_member = by_name.get(".bili-recipe-notes/knowledge_base.json")
         if knowledge_member is not None:
-            knowledge_destination = root / ".bili-recipe-notes" / "knowledge_base.json"
+            knowledge_destination = state_dir(root) / "knowledge_base.json"
             if knowledge_destination.exists():
                 backup_count += 1
             _copy_member(archive, knowledge_member, knowledge_destination)
@@ -604,7 +626,7 @@ def import_handoff_bundle(
             prefix = ".bili-recipe-notes/knowledge-imports/"
             if not name.startswith(prefix) or PurePosixPath(name).name in {"", ".", ".."}:
                 continue
-            destination = root / ".bili-recipe-notes" / "knowledge-imports" / PurePosixPath(name).name
+            destination = state_dir(root) / "knowledge-imports" / PurePosixPath(name).name
             if destination.exists():
                 backup_count += 1
             _copy_member(archive, info, destination)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import re
@@ -11,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from .llm import complete_markdown_prompt, get_last_llm_error
-from .review_policy import AI_REVIEW_FILE_NAME, load_ai_review, review_recipe_hash
+from .review_policy import (
+    AI_REVIEW_FILE_NAME, AI_REVIEW_RULES_VERSION, AI_REVIEW_PROMPT_VERSION, archive_review,
+    fingerprint_review_inputs, read_review_inputs, review_input_fingerprint,
+    load_ai_review, review_recipe_hash, load_review_record,
+)
 from .storage import atomic_write_json, file_lock
 
 _SECTIONS = ("ingredients", "seasonings", "steps")
@@ -52,7 +55,7 @@ def _evidence_matches(evidence: dict, transcript: list[dict]) -> bool:
     return False
 
 
-def build_ai_review_prompt(recipe: dict, transcript: list[dict], source: dict, note: str) -> str:
+def build_ai_review_prompt(recipe: dict, transcript: list[dict], source: dict, note: str = "") -> str:
     """Keep the executable contract separate from untrusted video material."""
 
     ids = [f"{section}:{index}" for section in _SECTIONS for index, _ in enumerate(recipe.get(section, []))]
@@ -88,7 +91,7 @@ def build_ai_review_prompt(recipe: dict, transcript: list[dict], source: dict, n
         "严格输出以下 8 个字段，不要代码围栏、解释文字或额外字段：\n"
         f"{json.dumps(contract, ensure_ascii=False)}\n"
         "<untrusted_material>\n"
-        + json.dumps({"recipe": recipe, "transcript": transcript, "source": source, "note": note}, ensure_ascii=False)
+        + json.dumps({"recipe": recipe, "transcript": transcript, "source": source}, ensure_ascii=False)
         + "\n</untrusted_material>"
     )
 
@@ -167,15 +170,6 @@ def validate_ai_review(value: Any, recipe: dict, transcript: list[dict]) -> dict
     return value
 
 
-def _read_optional_json(path: Path, expected: type, default: Any) -> Any:
-    if not path.exists():
-        return default
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, expected):
-        raise ValueError(f"{path.name} 的 JSON 结构无效")
-    return value
-
-
 def review_recipe(
     output_folder: str | Path,
     *,
@@ -192,21 +186,11 @@ def review_recipe(
     previous = load_ai_review(folder)
     if only_pending and previous is not None:
         return previous
-    raw_recipe = (folder / "recipe.json").read_bytes()
-    source_hash = hashlib.sha256(raw_recipe).hexdigest()
-    recipe = json.loads(raw_recipe)
-    if not isinstance(recipe, dict):
-        raise ValueError("recipe.json 必须是对象")
-    for section in _SECTIONS:
-        if not isinstance(recipe.get(section, []), list):
-            raise ValueError(f"recipe.json 的 {section} 必须是数组")
-    transcript = _read_optional_json(folder / "transcript.json", list, [])
-    if not all(isinstance(segment, dict) and isinstance(segment.get("text"), str) for segment in transcript):
-        raise ValueError("字幕必须由包含 text 字符串的对象组成")
-    source = _read_optional_json(folder / "source.json", dict, {})
-    note_path = folder / "note.md"
-    note = note_path.read_text(encoding="utf-8") if note_path.exists() else ""
-    response = complete_markdown_prompt(build_ai_review_prompt(recipe, transcript, source, note), provider=provider, **llm_options)
+    inputs = read_review_inputs(folder)
+    fingerprint = fingerprint_review_inputs(inputs)
+    source_hash = review_recipe_hash(folder)
+    recipe, transcript, source = inputs["recipe"], inputs["transcript"], inputs["source"]
+    response = complete_markdown_prompt(build_ai_review_prompt(recipe, transcript, source), provider=provider, **llm_options)
     if not response:
         raise RuntimeError(get_last_llm_error() or "AI 未返回审核结果")
     cleaned = response.strip()
@@ -214,21 +198,27 @@ def review_recipe(
     if fenced:
         cleaned = fenced.group(1)
     payload = validate_ai_review(json.loads(cleaned), recipe, transcript)
-    payload.update(schema_version=1, source_recipe_sha256=source_hash, reviewed_at=_now(), provider=provider)
+    payload.update(schema_version=2, source_recipe_sha256=source_hash, reviewed_at=_now(), provider=provider,
+                   input_fingerprint=fingerprint, rules_version=AI_REVIEW_RULES_VERSION,
+                   prompt_version=AI_REVIEW_PROMPT_VERSION, model_config={"provider": provider, **llm_options})
     target = folder / AI_REVIEW_FILE_NAME
     with file_lock(target):
-        if review_recipe_hash(folder) != source_hash:
-            raise RuntimeError("审核期间 recipe.json 已变更，本次结果未保存，请重新审核")
+        if review_input_fingerprint(folder) != fingerprint:
+            raise RuntimeError("审核期间菜谱内容或来源资料已变更，本次结果未保存，请重新审核")
         # A user may change visibility during a slow model call. Preserve the
         # latest manual decision even when an old source hash became stale.
-        try:
-            current = json.loads(target.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            current = {}
+        current = load_review_record(folder) or {}
         override = current.get("visibility_override") if isinstance(current, dict) else None
         if isinstance(current, dict) and (override is None or (isinstance(override, str) and override in {"visible", "hidden"})):
             for key in ("visibility_override", "override_at"):
                 if key in current:
                     payload[key] = current[key]
+        if current.get("classification_override") in ("recipe", "non_recipe", "technique", "uncertain", None):
+            for key in ("classification_override", "classification_override_at", "classification_override_comment"):
+                if key in current:
+                    payload[key] = current[key]
+        if isinstance(current.get("manual_review"), dict):
+            payload["manual_review"] = current["manual_review"]
+        archive_review(folder, current or None, event="ai_rereview")
         atomic_write_json(target, payload, backup=False)
     return payload

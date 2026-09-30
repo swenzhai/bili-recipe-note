@@ -54,7 +54,7 @@ def test_bundle_does_not_include_unrelated_files(tmp_path: Path) -> None:
 
 
 def test_bundle_includes_mobile_practice_logs(tmp_path: Path) -> None:
-    folder = tmp_path / "outputs" / "recipe"
+    folder = tmp_path / "data" / "recipes" / "recipe"
     folder.mkdir(parents=True)
     note = folder / "note.md"
     note.write_text("# 番茄炒蛋\n", encoding="utf-8")

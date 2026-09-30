@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from .batch_queue import batches_dir
+from .data_paths import DATA_DIR_ENV, data_root, resolve_stored_path
 from .pipeline import BatchJobItemResult, BatchJobOptions, BatchJobResult, run_batch
 from .storage import atomic_write_json, read_json
 
@@ -101,7 +102,7 @@ def _read_status(batch_id: str, project_root: str | Path | None = None) -> Backg
             started_at=str(value["started_at"]),
             finished_at=str(value["finished_at"]) if value.get("finished_at") else None,
             error=str(value["error"]) if value.get("error") else None,
-            log_path=Path(str(value["log_path"])) if value.get("log_path") else None,
+            log_path=resolve_stored_path(str(value["log_path"]), project_root) if value.get("log_path") else None,
             pid=int(value["pid"]) if value.get("pid") else None,
             paused_at=str(value["paused_at"]) if value.get("paused_at") else None,
             paused_seconds=float(value.get("paused_seconds") or 0.0),
@@ -239,8 +240,8 @@ def _load_result(batch_id: str, project_root: str | Path | None = None) -> Batch
             BatchJobItemResult(
                 url=str(raw.get("url") or ""),
                 status=str(raw.get("status") or "failed"),
-                output_folder=Path(str(raw["output_folder"])) if raw.get("output_folder") else None,
-                note_path=Path(str(raw["note_path"])) if raw.get("note_path") else None,
+                output_folder=resolve_stored_path(str(raw["output_folder"]), project_root) if raw.get("output_folder") else None,
+                note_path=resolve_stored_path(str(raw["note_path"]), project_root) if raw.get("note_path") else None,
                 error=str(raw["error"]) if raw.get("error") else None,
             )
         )
@@ -355,6 +356,7 @@ def start_background_batch(
             "stderr": subprocess.DEVNULL,
         }
         environment = os.environ.copy()
+        environment[DATA_DIR_ENV] = str(data_root(root))
         package_root = str(Path(__file__).resolve().parents[1])
         existing_python_path = environment.get("PYTHONPATH")
         environment["PYTHONPATH"] = (

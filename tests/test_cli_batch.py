@@ -127,7 +127,7 @@ def test_cli_exports_curation_review_to_default_output_path(monkeypatch, tmp_pat
         captured.update(out_dir=out_dir, destination=destination)
         from bili_recipe_notes.curation import CurationReviewResult
 
-        review_dir = tmp_path / "outputs" / "curation-review"
+        review_dir = tmp_path / "data" / "recipes" / "curation-review"
         return CurationReviewResult(
             review_dir / "recipe-review.json",
             review_dir / "recipe-review.csv",
@@ -142,8 +142,8 @@ def test_cli_exports_curation_review_to_default_output_path(monkeypatch, tmp_pat
 
     assert cli.run(args) == 0
     assert captured == {
-        "out_dir": Path("outputs"),
-        "destination": Path("outputs") / "curation-review",
+        "out_dir": tmp_path / "data" / "recipes",
+        "destination": tmp_path / "data" / "recipes" / "curation-review",
     }
     assert "CURATION_REVIEW_CSV=" in capsys.readouterr().out
 
@@ -173,7 +173,7 @@ def test_cli_exports_deployment_bundle(monkeypatch, tmp_path: Path, capsys) -> N
 
     assert cli.run(args) == 0
     assert captured == {
-        "out_dir": "outputs",
+        "out_dir": str(tmp_path / "data" / "recipes"),
         "destination": tmp_path / "transfer",
         "project_root": tmp_path,
     }
@@ -316,7 +316,7 @@ def test_cli_exports_web_library_to_default_output_path(monkeypatch, tmp_path: P
         from bili_recipe_notes.web_export import WebLibraryExportResult
 
         return WebLibraryExportResult(
-            path=(tmp_path / "outputs" / "bili-recipe-web-library.json").resolve(),
+            path=(tmp_path / "data" / "recipes" / "bili-recipe-web-library.json").resolve(),
             recipe_count=3,
             asset_count=2,
             practice_log_count=1,
@@ -328,9 +328,58 @@ def test_cli_exports_web_library_to_default_output_path(monkeypatch, tmp_path: P
 
     assert cli.run(args) == 0
     assert captured["project_root"] == tmp_path
-    assert captured["out_dir"] == Path("outputs")
-    assert captured["destination"] == Path("outputs/bili-recipe-web-library.json")
+    assert captured["out_dir"] == tmp_path / "data" / "recipes"
+    assert captured["destination"] == tmp_path / "data" / "recipes" / "bili-recipe-web-library.json"
     assert captured["image_mode"] == "first"
     assert capsys.readouterr().out.rstrip().endswith(
-        f"WEB_LIBRARY_PATH={(tmp_path / 'outputs' / 'bili-recipe-web-library.json').resolve()}"
+        f"WEB_LIBRARY_PATH={(tmp_path / 'data' / 'recipes' / 'bili-recipe-web-library.json').resolve()}"
     )
+
+
+@pytest.mark.parametrize("custom_output", [False, True])
+def test_cli_data_dir_controls_state_and_default_recipes(monkeypatch, tmp_path: Path, custom_output: bool) -> None:
+    project = tmp_path / "checkout"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("BILI_RECIPE_DATA_DIR", "")
+    data = tmp_path / "private-data"
+    arguments = ["--data-dir", str(data), "--batch", "--create-only", "--batch-id", "portable", "--batch-url", "https://example.com/BV1"]
+    if custom_output:
+        arguments += ["--out", str(tmp_path / "custom-recipes")]
+    assert cli.run(cli.build_parser().parse_args(arguments)) == 0
+    state = load_batch_state("portable", project_root=project)
+    assert (data / "state" / "batches" / "portable.json").is_file()
+    expected_output = tmp_path / "custom-recipes" if custom_output else data / "recipes"
+    assert state.options["out"] == str(expected_output)
+    assert not (project / "data").exists()
+    assert not (project / ".bili-recipe-notes").exists()
+
+
+@pytest.mark.parametrize("mode", ["preview", "apply"])
+def test_cli_data_migration_preview_and_apply(monkeypatch, tmp_path: Path, capsys, mode: str) -> None:
+    from bili_recipe_notes import data_migration
+
+    monkeypatch.chdir(tmp_path)
+    plan = {"data_root": str(tmp_path / "data"), "moves": [{"source": "outputs/demo", "target": "data/recipes/厨师/demo"}], "conflicts": []}
+    calls = []
+    monkeypatch.setattr(data_migration, "plan_data_migration", lambda project_root: plan)
+    def apply(value):
+        calls.append(value)
+        return {"file_count": 4, "manifest_path": tmp_path / "data" / "state" / "migrations" / "demo.json"}
+    monkeypatch.setattr(data_migration, "apply_data_migration", apply)
+    assert cli.run(cli.build_parser().parse_args(["--migrate-data", mode])) == 0
+    assert calls == ([plan] if mode == "apply" else [])
+    output = capsys.readouterr().out
+    assert "outputs/demo" in output
+    assert ("MIGRATION_MANIFEST=" in output) is (mode == "apply")
+    assert not (tmp_path / "data").exists()
+
+
+def test_cli_data_migration_conflicts_prevent_apply(monkeypatch, tmp_path: Path) -> None:
+    from bili_recipe_notes import data_migration
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(data_migration, "plan_data_migration", lambda project_root: {"data_root": str(tmp_path / "data"), "moves": [], "conflicts": ["target already exists"]})
+    monkeypatch.setattr(data_migration, "apply_data_migration", lambda plan: pytest.fail("conflicting migration must not run"))
+    with pytest.raises(ValueError, match="Migration conflicts"):
+        cli.run(cli.build_parser().parse_args(["--migrate-data", "apply"]))

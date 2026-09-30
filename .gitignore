@@ -24,3 +24,6 @@ obsidian-vault/
 /.bili-recipe-notes/mobile-sync.sqlite3*
 /.bili-recipe-notes/mobile-media/
 /.bili-recipe-notes/cookies/
+
+# Personal data is portable and kept outside source control.
+/data/

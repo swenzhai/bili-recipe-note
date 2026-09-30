@@ -98,3 +98,17 @@ def test_raw_output_uses_pending_title_and_completed_output_uses_recipe_title(
     renamed = rename_completed_output_folder(raw_folder)
     assert renamed.name == "宫保鸡丁--BV1raw"
     assert json.loads((renamed / "job.json").read_text())["output_folder"] == str(renamed)
+
+
+def test_normalize_preserves_creator_groups_and_ignores_non_outputs(tmp_path: Path) -> None:
+    root = tmp_path / "recipes"
+    folder = root / "123-厨师" / "旧标题"
+    _write_output(folder)
+    (root / "empty").mkdir()
+    (root / "creators" / "123-厨师").mkdir(parents=True)
+
+    plans = plan_output_folder_migration(root)
+
+    assert len(plans) == 1
+    assert plans[0].source == folder
+    assert plans[0].target == folder.parent / "红烧肉--BV1demo"

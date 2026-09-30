@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from .recipe_extractor import Recipe, normalize_recipe_taxonomy
 from .storage import atomic_write_json
+from .file_cache import read_json_cached, read_text_cached
 
 QUALITY_FILE_NAME = "quality.json"
 
@@ -28,7 +28,7 @@ class QualityReport:
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = read_json_cached(path)
     except Exception:
         return {}
     return raw if isinstance(raw, dict) else {}
@@ -64,7 +64,7 @@ def _add_issue(issues: list[QualityIssue], severity: str, code: str, message: st
 def analyze_recipe_quality(output_folder: str | Path) -> QualityReport:
     folder = Path(output_folder)
     recipe = _model_validate_recipe(_read_json(folder / "recipe.json"))
-    note = (folder / "note.md").read_text(encoding="utf-8") if (folder / "note.md").exists() else ""
+    note = read_text_cached(folder / "note.md") if (folder / "note.md").exists() else ""
     issues: list[QualityIssue] = []
     score = 100
 

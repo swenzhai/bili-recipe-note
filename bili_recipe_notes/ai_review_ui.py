@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .output_layout import iter_output_folders
+
 import json
 from pathlib import Path
 from typing import Any
@@ -12,10 +14,13 @@ from .ai_review_runner import (
     start_ai_review_batch,
 )
 from .config import UIConfig
+from .ai_review_workbench import render_review_workbench
+from .file_cache import read_json_cached
+from .mobile_sync import recipe_visibility_states
 from .review_policy import (
     AI_REVIEW_FILE_NAME,
-    ai_review_is_hidden,
-    load_ai_review,
+    get_review_state,
+    list_review_history,
     set_ai_review_visibility,
 )
 
@@ -54,26 +59,32 @@ def _review_records(out_dir: str | Path) -> list[dict[str, Any]]:
     """Read generated recipes without creating or refreshing source reports."""
     root = Path(out_dir).expanduser().resolve()
     records = []
-    for path in sorted(root.glob("*/recipe.json")):
-        if path.is_symlink() or path.parent.is_symlink():
+    for folder in sorted(iter_output_folders(root)):
+        path = folder / "recipe.json"
+        if not path.is_file() or path.is_symlink() or path.parent.is_symlink():
             continue
         try:
-            recipe = json.loads(path.read_text(encoding="utf-8"))
+            recipe = read_json_cached(path)
             if not isinstance(recipe, dict):
                 raise ValueError("recipe.json 必须是 JSON 对象")
             error = ""
         except (OSError, UnicodeError, ValueError) as exc:
             recipe, error = {}, str(exc)
-        review = load_ai_review(path.parent)
+        state = get_review_state(path.parent) if not error else {}
+        review = state.get("ai_review")
         records.append({
             "folder": path.parent,
             "title": str(recipe.get("title") or path.parent.name),
             "recipe": recipe,
             "review": review,
+            "review_state": state,
             "error": error,
             "stale": review is None and (path.parent / AI_REVIEW_FILE_NAME).exists(),
-            "hidden": ai_review_is_hidden(review),
         })
+    visibility = recipe_visibility_states(root, folders=[item["folder"] for item in records])
+    for item in records:
+        item["visibility"] = visibility.get(str(item["folder"]), {})
+        item["hidden"] = bool(item["visibility"].get("hidden"))
     return records
 
 
@@ -107,6 +118,36 @@ def _render_batch_status(st, batch: dict[str, Any]) -> None:
             ], hide_index=True, width="stretch")
 
 
+def _render_review_history(st, folder: Path) -> None:
+    with st.expander("审核历史"):
+        try:
+            snapshots = list_review_history(folder)
+        except (OSError, ValueError) as exc:
+            st.warning(f"审核历史暂不可用：{exc}")
+            return
+        if not snapshots:
+            st.caption("还没有历史版本。再次审核或修改人工决定时，会保留此前记录。")
+            return
+        events = {
+            "ai_rereview": "AI 复审", "manual_visibility": "人工展示决定",
+            "manual_classification": "人工分类", "manual_item": "逐项人工核对",
+            "manual_complete": "完成人工确认",
+        }
+        st.caption("这里保存的是每次变更前的记录，仅供核对和下载。")
+        by_id = {item["history_id"]: item for item in snapshots}
+        selection = st.selectbox(
+            "历史版本", list(by_id), key=f"ai_review_history_{folder.name}",
+            format_func=lambda key: f"{by_id[key].get('archived_at', '')} · {events.get(by_id[key].get('event'), '审核变更')}前",
+        )
+        snapshot = by_id[selection]
+        st.json(snapshot["review"])
+        st.download_button(
+            "下载所选历史记录", json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name=f"recipe.ai-review.{selection}.json", mime="application/json",
+            key=f"ai_review_history_download_{folder.name}",
+        )
+
+
 def render_ai_review_page(st, config: UIConfig) -> None:
     st.subheader("AI 审核归类")
     st.caption(
@@ -132,7 +173,7 @@ def render_ai_review_page(st, config: UIConfig) -> None:
     metrics = st.columns(4)
     metrics[0].metric("生成版菜谱", len(records))
     metrics[1].metric("已有有效审核", len(reviewed))
-    metrics[2].metric("待人工确认", sum(item["review"].get("status") == "needs_review" for item in reviewed))
+    metrics[2].metric("待人工确认", sum(bool(item["review_state"].get("needs_confirmation")) for item in records))
     metrics[3].metric("已隐藏", sum(item["hidden"] for item in records))
     st.caption("后台逐项保存进度，关闭浏览器后继续运行。可刷新查看最新结果，暂停后可继续未完成项。")
 
@@ -141,8 +182,12 @@ def render_ai_review_page(st, config: UIConfig) -> None:
     scope_folders = [str(Path(folder).resolve()) for folder in scope_folders if str(Path(folder).resolve()) in allowed]
     scope_options = ["全部生成菜谱"] + (["当前批次结果"] if scope_folders else [])
     scope = st.selectbox("审核范围", scope_options, index=len(scope_options) - 1, key="ai_review_scope")
-    only_pending = st.checkbox("跳过已有有效审核的菜谱", value=True, key="ai_review_only_pending")
+    only_pending = st.checkbox("跳过已有有效 AI 审核的菜谱", value=True, key="ai_review_only_pending")
     limit = int(st.number_input("本轮最多审核条数（0 表示全部）", min_value=0, value=0, step=10, key="ai_review_limit"))
+    with st.expander("失败恢复设置"):
+        max_attempts = int(st.number_input("短暂错误最多尝试次数", min_value=1, max_value=5, value=3, key="ai_review_max_attempts"))
+        failure_limit = int(st.number_input("连续失败多少条后自动暂停", min_value=1, max_value=100, value=5, key="ai_review_failure_limit"))
+        st.caption("超时等短暂错误会退避重试；配置错误会保留原因，避免重复调用。")
     if config.llm_provider == "none":
         st.info("请先在侧栏选择 LLM 服务，再启动 AI 审核。")
     start_col, refresh_col = st.columns(2)
@@ -154,6 +199,7 @@ def render_ai_review_page(st, config: UIConfig) -> None:
             batch = start_ai_review_batch(
                 config.out_dir, folders=scope_folders if scope == "当前批次结果" else None,
                 limit=limit or None, only_pending=only_pending, **_llm_options(config),
+                max_attempts=max_attempts, consecutive_failure_limit=failure_limit,
             )
         except Exception as exc:
             st.error(f"启动审核失败：{exc}")
@@ -180,6 +226,12 @@ def render_ai_review_page(st, config: UIConfig) -> None:
                 _render_batch_status(st, current)
 
             live_progress()
+            retry_config = st.radio(
+                "继续或重试时使用的配置", ["当前侧栏配置", "原任务配置"],
+                horizontal=True, key="ai_review_retry_config",
+            )
+            retry_options = _llm_options(config) if retry_config == "当前侧栏配置" else {}
+            invalid_retry_config = retry_config == "当前侧栏配置" and config.llm_provider == "none"
             controls = st.columns(3)
             if controls[0].button("完成当前条后暂停", key="ai_review_stop", disabled=not batch.get("active")):
                 try:
@@ -189,37 +241,44 @@ def render_ai_review_page(st, config: UIConfig) -> None:
                 else:
                     _notice(st, "已请求暂停，当前条审核完成后停止。")
             resumable = batch.get("status") in {"paused", "interrupted", "failed"}
-            if controls[1].button("继续未完成审核", key="ai_review_resume", disabled=active or not resumable):
+            if controls[1].button("继续未完成审核", key="ai_review_resume", disabled=active or not resumable or invalid_retry_config):
                 try:
-                    resume_ai_review_batch(config.out_dir, batch_id)
+                    resume_ai_review_batch(config.out_dir, batch_id, **retry_options)
                 except Exception as exc:
                     st.error(f"继续失败：{exc}")
                 else:
                     _notice(st, "已继续审核未完成的条目。")
-            if controls[2].button("重试失败项", key="ai_review_retry", disabled=active or not batch.get("failed")):
+            if controls[2].button("重试失败项", key="ai_review_retry", disabled=active or not batch.get("failed") or invalid_retry_config):
                 try:
-                    resume_ai_review_batch(config.out_dir, batch_id, retry_failed=True)
+                    resume_ai_review_batch(config.out_dir, batch_id, retry_failed=True, **retry_options)
                 except Exception as exc:
                     st.error(f"重试失败：{exc}")
                 else:
                     _notice(st, "已启动失败项重试。")
 
     st.divider()
+    next_filter = st.session_state.pop("_ai_review_next_filter", None)
+    if next_filter:
+        st.session_state["ai_review_result_filter"] = next_filter
     status_filter = st.radio(
-        "结果范围", ["全部", "待审核", "待人工确认", "已隐藏", "菜谱", "烹饪技巧", "非菜谱"],
+        "结果范围", ["全部", "待审核", "待人工确认", "已人工确认", "已隐藏", "菜谱", "烹饪技巧", "非菜谱"],
         horizontal=True, key="ai_review_result_filter",
     )
+    if st.session_state.pop("_ai_review_clear_search", False):
+        st.session_state["ai_review_search"] = ""
     query = st.text_input("搜索审核结果", placeholder="菜名、视频标题、标签或目录", key="ai_review_search").strip().casefold()
     visible = []
     for item in records:
         review = item["review"] or {}
         if status_filter == "待审核" and review:
             continue
-        if status_filter == "待人工确认" and review.get("status") != "needs_review":
+        if status_filter == "待人工确认" and not item["review_state"].get("needs_confirmation"):
+            continue
+        if status_filter == "已人工确认" and not item["review_state"].get("manual_completed"):
             continue
         if status_filter == "已隐藏" and not item["hidden"]:
             continue
-        if status_filter in {"菜谱", "烹饪技巧", "非菜谱"} and CLASSIFICATION_LABELS.get(review.get("classification")) != status_filter:
+        if status_filter in {"菜谱", "烹饪技巧", "非菜谱"} and CLASSIFICATION_LABELS.get(item["visibility"].get("classification")) != status_filter:
             continue
         search_text = " ".join([
             item["title"], item["folder"].name,
@@ -243,10 +302,17 @@ def render_ai_review_page(st, config: UIConfig) -> None:
     )
     selected = by_folder[selected_folder]
     review = selected["review"]
+    state = selected["review_state"]
+    stored = state.get("record") or {}
+    visibility = selected["visibility"]
     if selected["error"]:
         st.error(f"菜谱读取失败：{selected['error']}")
     if selected["stale"]:
-        st.warning("已有审核文件已失效或损坏，请重新审核当前版本。")
+        st.warning(
+            "旧版审核缺少字幕与规则版本记录，需要重新审核升级；已有人工决定仍然保留。"
+            if state.get("requires_upgrade") else
+            "当前没有有效的 AI 审核结果，可重新审核；已有人工分类和展示决定仍然保留。"
+        )
     if st.button(
         "AI 审核这一条", key="ai_review_single",
         disabled=active or bool(selected["error"]) or config.llm_provider == "none",
@@ -254,18 +320,22 @@ def render_ai_review_page(st, config: UIConfig) -> None:
         try:
             batch = start_ai_review_batch(
                 config.out_dir, folders=[selected_folder], only_pending=False, **_llm_options(config),
+                max_attempts=max_attempts, consecutive_failure_limit=failure_limit,
             )
         except Exception as exc:
             st.error(f"启动审核失败：{exc}")
         else:
             st.session_state["ai_review_batch_select"] = batch["batch_id"]
             _notice(st, "已开始审核所选菜谱。")
+    st.write(
+        f"内容分类：{CLASSIFICATION_LABELS.get(visibility.get('classification'), '无法确认')} · "
+        f"{'内容已隐藏' if selected['hidden'] else '内容可展示'}"
+    )
+    st.caption("展示依据：" + str(visibility.get("content_reason") or visibility.get("reason") or "暂无审核决定"))
+    if visibility.get("published") is False:
+        st.info("手机菜单仍处于手动下架状态；恢复内容展示后，可到“手机客户端”页面重新上架。")
     if review:
-        st.write(
-            f"分类：{CLASSIFICATION_LABELS.get(review['classification'], review['classification'])} · "
-            f"置信度：{review['confidence']:.0%} · "
-            f"{'已隐藏' if selected['hidden'] else '正常展示'}"
-        )
+        st.caption(f"AI 判断：{CLASSIFICATION_LABELS.get(review['classification'], review['classification'])} · 置信度：{review['confidence']:.0%}")
         st.write(review.get("reason", ""))
         st.caption("标签：" + "、".join(review.get("tags") or []))
         for evidence in review.get("evidence", []):
@@ -277,8 +347,11 @@ def render_ai_review_page(st, config: UIConfig) -> None:
                 {"审核项": check.get("id"), "结论": "有依据" if check.get("verdict") == "supported" else "待确认", "说明": check.get("reason")}
                 for check in checks
             ], hide_index=True, width="stretch")
-        if review.get("visibility_override"):
-            st.caption("已使用人工展示决定；再次 AI 审核会保留该决定。")
+    else:
+        st.info("尚无当前版本的有效 AI 审核结果。")
+    if not selected["error"]:
+        if stored.get("visibility_override"):
+            st.caption("已使用人工展示决定；内容变化和再次 AI 审核均保留该决定。")
         visibility_controls = st.columns(2)
         desired_visibility = "visible" if selected["hidden"] else "hidden"
         if visibility_controls[0].button(
@@ -291,19 +364,22 @@ def render_ai_review_page(st, config: UIConfig) -> None:
             else:
                 _notice(st, "展示决定已保存，手机菜单会在下一次同步时更新。")
         if visibility_controls[1].button(
-            "恢复 AI 展示建议", key="ai_review_clear_override", disabled=not review.get("visibility_override"),
+            "清除人工展示覆盖", key="ai_review_clear_override", disabled=not stored.get("visibility_override"),
         ):
             try:
                 set_ai_review_visibility(selected_folder, None)
             except Exception as exc:
                 st.error(f"恢复建议失败：{exc}")
             else:
-                _notice(st, "已恢复 AI 的展示建议。")
+                _notice(st, "已清除人工展示覆盖，按人工分类、来源分类与有效 AI 判断决定展示。")
+    if stored:
         st.download_button(
-            "下载当前审核记录", json.dumps(review, ensure_ascii=False, indent=2).encode("utf-8"),
+            "下载当前审核记录", json.dumps(stored, ensure_ascii=False, indent=2).encode("utf-8"),
             file_name=AI_REVIEW_FILE_NAME, mime="application/json", key="ai_review_download",
         )
-    else:
-        st.info("尚无当前版本的有效 AI 审核结果。")
+    if not selected["error"]:
+        next_folder = next((str(item["folder"]) for item in records if item["folder"] != selected["folder"] and item["review_state"].get("needs_confirmation")), None)
+        render_review_workbench(st, selected, next_folder=next_folder)
     with st.expander("只读查看生成版菜谱"):
         st.json(selected["recipe"])
+    _render_review_history(st, selected["folder"])

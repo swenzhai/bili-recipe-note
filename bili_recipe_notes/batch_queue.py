@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .config import CONFIG_DIR_NAME
+from .data_paths import ensure_data_layout, relocate_value, state_dir
 from .storage import CorruptDataError, atomic_write_json, file_lock, read_json
 
 BATCHES_DIR_NAME = "batches"
@@ -52,8 +52,7 @@ def now_utc() -> str:
 
 
 def batches_dir(project_root: str | Path | None = None) -> Path:
-    root = Path(project_root) if project_root else Path.cwd()
-    return root / CONFIG_DIR_NAME / BATCHES_DIR_NAME
+    return state_dir(project_root) / BATCHES_DIR_NAME
 
 
 def batch_path(batch_id: str, project_root: str | Path | None = None) -> Path:
@@ -93,16 +92,17 @@ def create_batch_state(
 
 
 def save_batch_state(state: BatchQueueState, project_root: str | Path | None = None) -> Path:
+    ensure_data_layout(project_root)
     state.updated_at = now_utc()
     path = batch_path(state.batch_id, project_root)
     with file_lock(path):
         if path.exists():
-            _load_batch_state_from_path(path)
+            _load_batch_state_from_path(path, project_root)
         atomic_write_json(path, asdict(state))
     return path
 
 
-def _load_batch_state_from_path(path: Path) -> BatchQueueState:
+def _load_batch_state_from_path(path: Path, project_root: str | Path | None = None) -> BatchQueueState:
     raw = read_json(path, expected_type=dict)
     try:
         raw_items = raw.get("items") or []
@@ -111,9 +111,16 @@ def _load_batch_state_from_path(path: Path) -> BatchQueueState:
         options = raw.get("options") or {}
         if not isinstance(options, dict):
             raise TypeError("options must be an object")
+        options = dict(options)
+        for key in ("out", "cookies", "source_database_path"):
+            if key in options:
+                options[key] = relocate_value(options[key], project_root)
         parsed_items: list[BatchQueueItem] = []
         for item in raw_items:
             item_data = dict(item)
+            for key in ("output_folder", "note_path"):
+                if key in item_data:
+                    item_data[key] = relocate_value(item_data[key], project_root)
             raw_stages = item_data.pop("stages", None)
             stages = _default_stages()
             if isinstance(raw_stages, dict):
@@ -171,7 +178,7 @@ def _infer_legacy_stages(item: dict[str, Any], stages: dict[str, BatchStageState
 
 
 def load_batch_state(batch_id: str, project_root: str | Path | None = None) -> BatchQueueState:
-    return _load_batch_state_from_path(batch_path(batch_id, project_root))
+    return _load_batch_state_from_path(batch_path(batch_id, project_root), project_root)
 
 
 def list_batch_states(project_root: str | Path | None = None) -> list[BatchQueueState]:
@@ -179,7 +186,7 @@ def list_batch_states(project_root: str | Path | None = None) -> list[BatchQueue
     if not root.exists():
         return []
     paths = sorted(root.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return [_load_batch_state_from_path(path) for path in paths]
+    return [_load_batch_state_from_path(path, project_root) for path in paths]
 
 
 def selectable_items(

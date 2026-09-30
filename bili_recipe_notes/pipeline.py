@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Literal
 from urllib.parse import parse_qs, urlparse
 
 from .batch_queue import create_batch_state, load_batch_state, save_batch_state, selectable_items
+from .creator_paths import creator_directory, creator_uid
+from .data_paths import creators_dir, data_root, ensure_data_layout, recipes_dir
 from .history import find_history_by_url, find_history_record_by_url, is_raw_output
 from .downloader import (
     CreatorCrawlResult,
@@ -18,7 +20,6 @@ from .downloader import (
     download_cover_video,
     download_lowres_video,
     download_subtitles,
-    extract_creator_video_links,
     fetch_video_info,
 )
 from .llm import (
@@ -29,6 +30,7 @@ from .llm import (
 )
 from .markdown_writer import render_markdown
 from .output_folders import rename_completed_output_folder
+from .output_layout import iter_output_folders
 from .quality import write_quality_report
 from .recipe_extractor import Recipe, TranscriptSegment, extract_recipe_rule_based, extract_recipe_with_llm
 from .recipe_review import create_recipe_review
@@ -51,7 +53,7 @@ from .screenshot import (
 from .storage import atomic_write_bytes, atomic_write_json, atomic_write_text
 from .subtitle import parse_subtitle_file
 from .transcriber import transcribe_audio
-from .utils import build_output_folder_name, ensure_dir, sanitize_filename
+from .utils import build_output_folder_name, ensure_dir
 
 LogCallback = Callable[[str], None]
 
@@ -60,7 +62,7 @@ LogCallback = Callable[[str], None]
 class RecipeJobOptions:
     url: str
     cookies: str | None = None
-    out: str = "outputs"
+    out: str = field(default_factory=lambda: str(recipes_dir()))
     no_screenshot: bool = False
     whisper_model: str = "small"
     language: str = "zh"
@@ -107,7 +109,7 @@ PipelineTarget = Literal["raw", "recipe"]
 class BatchJobOptions:
     urls: list[str]
     cookies: str | None = None
-    out: str = "outputs"
+    out: str = field(default_factory=lambda: str(recipes_dir()))
     no_screenshot: bool = False
     whisper_model: str = "small"
     language: str = "zh"
@@ -372,7 +374,24 @@ def capture_raw_material(
             part_label=part_label,
             source_url=options.url,
         )
-        folder = ensure_dir(Path(options.out) / folder_name)
+        if Path(options.out).resolve().is_relative_to(data_root()):
+            ensure_data_layout()
+        creator_metadata = {**info, "creator_name": options.creator_name or info.get("uploader")}
+        # Existing raw/failed/legacy outputs retain their location when retried.
+        # Only a new video chooses a creator group; moving existing work is a
+        # separate migration and must not happen as a side effect of capture.
+        existing_folder = next(
+            (
+                candidate for candidate in iter_output_folders(options.out)
+                if any(
+                    str(_read_json_object(candidate / filename).get("source_url") or "").strip()
+                    == options.url.strip()
+                    for filename in ("source.json", "job.json", "recipe.json")
+                )
+            ),
+            None,
+        )
+        folder = ensure_dir(existing_folder or (creator_directory(options.out, creator_metadata) / folder_name))
         media_dir = ensure_dir(folder / "media")
         existing_job = _read_json_object(folder / "job.json")
         if existing_job:
@@ -389,6 +408,7 @@ def capture_raw_material(
             "video_title": title,
             "uploader": info.get("uploader"),
             "creator_name": options.creator_name or info.get("uploader"),
+            "creator_uid": creator_uid(info),
             "bvid": bvid,
             "cid": cid,
             "part_id": part_id,
@@ -477,7 +497,7 @@ def _load_source_metadata(folder: Path, fallback_url: str = "") -> dict:
         metadata = {
             key: job.get(key)
             for key in (
-                "source_url", "video_title", "uploader", "creator_name", "bvid", "cid", "part_id", "part_label", "duration"
+                "source_url", "video_title", "uploader", "creator_name", "creator_uid", "bvid", "cid", "part_id", "part_label", "duration"
             )
         }
     if not metadata.get("source_url"):
@@ -639,10 +659,9 @@ def crawl_and_archive_creator(
     """Crawl a creator and atomically archive a stable text list plus manifest."""
     _emit(log, "Extracting creator videos and nested collections...")
     crawl = crawl_creator_videos(url, cookies=cookies)
-    creator_name = sanitize_filename(crawl.uploader, max_length=70)
-    creators_root = ensure_dir(Path(out) / "creators")
-    existing_dirs = sorted(path for path in creators_root.glob(f"{crawl.uid}-*") if path.is_dir())
-    creator_dir = existing_dirs[0] if existing_dirs else ensure_dir(creators_root / f"{crawl.uid}-{creator_name}")
+    if creators_dir().resolve().is_relative_to(data_root()):
+        ensure_data_layout()
+    creator_dir = ensure_dir(creator_directory(creators_dir(), {"uid": crawl.uid, "uploader": crawl.uploader}))
     links_path = creator_dir / "video_links.txt"
     manifest_path = creator_dir / "creator.json"
     atomic_write_text(links_path, "".join(f"{video.url}\n" for video in crawl.videos))
@@ -670,19 +689,21 @@ def extract_creator_links(
     filename: str,
     log: LogCallback | None = None,
 ) -> Path:
-    _emit(log, "Extracting creator video links...")
-    links = extract_creator_video_links(url, cookies=cookies)
-    out_dir = ensure_dir(Path(out))
-    requested_name = Path(filename.strip() or "creator_video_links.txt")
+    requested_name = Path(filename.strip() or "video_links.txt")
     if requested_name.is_absolute() or requested_name.name != str(requested_name):
         raise ValueError("creator links filename must be a plain filename inside the output directory")
+    if requested_name.name == "creator.json":
+        raise ValueError("creator links filename must not replace creator.json")
+    result = crawl_and_archive_creator(url, cookies, out, log)
+    out_dir = result.creator_dir
     links_path = (out_dir / requested_name.name).resolve()
     try:
         links_path.relative_to(out_dir.resolve())
     except ValueError:
         raise ValueError("creator links filename escapes the output directory") from None
-    atomic_write_text(links_path, "\n".join(links) + ("\n" if links else ""))
-    _emit(log, f"Extracted {len(links)} video links to {links_path}")
+    if links_path != result.links_path.resolve():
+        atomic_write_text(links_path, result.links_path.read_text(encoding="utf-8"))
+    _emit(log, f"Extracted {len(result.crawl.videos)} video links to {links_path}")
     return links_path
 
 

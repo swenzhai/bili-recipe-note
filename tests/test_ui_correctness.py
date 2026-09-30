@@ -13,6 +13,14 @@ from bili_recipe_notes.batch_queue import BatchQueueItem, BatchQueueState, creat
 from bili_recipe_notes.curation import build_curation_review, load_curation_decisions
 
 
+@pytest.fixture(autouse=True)
+def isolate_ui_data(tmp_path: Path, monkeypatch):
+    # AppTest executes the complete application, including database and batch
+    # controls that resolve their paths from cwd rather than the selected out.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("BILI_RECIPE_DATA_DIR", raising=False)
+
+
 def _recipe(title: str, *, ingredients: list[dict] | None = None, seasonings: list[dict] | None = None) -> dict:
     return {
         "title": title,
@@ -417,6 +425,52 @@ def test_restaurant_meal_ui_mounts_custom_component_and_builds_shopping_list(tmp
     assert any(button.label == "下载本餐采购清单" for button in at.get("download_button"))
     assert any(button.label == "保存新套餐" for button in at.button)
     assert len(at.dataframe) == 1
+
+
+def test_browsing_and_menu_share_visibility_but_only_menu_requires_publication(monkeypatch, tmp_path: Path) -> None:
+    from bili_recipe_notes.config import UIConfig
+    from bili_recipe_notes.history import scan_history
+    from bili_recipe_notes.mobile_sync import MobileSyncStore
+    from bili_recipe_notes.review_policy import set_ai_review_visibility
+
+    monkeypatch.chdir(tmp_path)
+    out = tmp_path / "outputs"
+    folders = {name: _write_record(out, name, _recipe(name)) for name in ("visible", "unpublished", "manual-hidden", "technique")}
+    store = MobileSyncStore(tmp_path, out_dir=out)
+    store.index_recipes()
+    unpublished = next(item for item in store.list_recipes() if item["title"] == "unpublished")
+    store.set_recipe_publications({unpublished["id"]: False})
+    store.set_video_classifications([_recipe("technique")["source_url"]], "technique")
+    set_ai_review_visibility(folders["manual-hidden"], "hidden")
+    before = {path: path.read_bytes() for path in out.rglob("*") if path.is_file()}
+
+    records = scan_history(out)
+    config = UIConfig(out_dir=out)
+    assert {item.title for item in ui._visible_history_items(records, config)} == {"visible", "unpublished"}
+    assert {item.title for item in ui._visible_history_items(records, config, menu=True)} == {"visible"}
+    assert all(path.read_bytes() == content for path, content in before.items())
+
+
+def test_library_shows_actionable_error_if_visibility_database_is_unreadable(monkeypatch, tmp_path: Path) -> None:
+    from bili_recipe_notes.mobile_sync import VisibilityStateError
+
+    _write_record(tmp_path, "hidden", _recipe("hidden"))
+
+    def unavailable(*args, **kwargs):
+        raise VisibilityStateError("同步数据库暂不可读")
+
+    monkeypatch.setattr(ui, "recipe_visibility_states", unavailable)
+    at = AppTest.from_string(
+        "import streamlit as st\n"
+        "from bili_recipe_notes.ui import _render_library_overview\n"
+        "from bili_recipe_notes.config import UIConfig\n"
+        "_render_library_overview(st, UIConfig(out_dir=st.session_state['out']))\n",
+    )
+    at.session_state["out"] = str(tmp_path)
+    at.run()
+    assert not at.exception
+    assert any("恢复同步数据库后刷新" in error.value for error in at.error)
+    assert not at.dataframe
 
 
 def test_library_count_rows_orders_counts_and_uses_recipe_share() -> None:

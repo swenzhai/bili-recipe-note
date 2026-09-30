@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from .output_layout import iter_output_folders
+from .data_paths import resolve_stored_path
+
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .quality import analyze_recipe_quality, load_quality_report, write_quality_report
+from .quality import analyze_recipe_quality, load_quality_report
 from .obsidian_archive import recipe_archive_status
 from .recipe_extractor import Recipe, normalize_recipe_taxonomy
 from .review_policy import load_ai_review
+from .file_cache import read_json_cached, read_text_cached
 
 
 @dataclass
@@ -41,7 +45,7 @@ class HistoryItem:
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = read_json_cached(path)
     except Exception:
         return {}
     return raw if isinstance(raw, dict) else {}
@@ -49,14 +53,14 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _has_nonempty_text(path: Path) -> bool:
     try:
-        return path.is_file() and path.stat().st_size > 0 and bool(path.read_text(encoding="utf-8").strip())
+        return path.is_file() and path.stat().st_size > 0 and bool(read_text_cached(path).strip())
     except OSError:
         return False
 
 
 def _has_usable_transcript(path: Path) -> bool:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = read_json_cached(path)
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
     return isinstance(raw, list) and any(
@@ -99,12 +103,13 @@ def is_raw_output(folder: str | Path) -> bool:
 
 
 def scan_history(out_dir: str | Path) -> list[HistoryItem]:
+    """Read library metadata without repairing or rewriting any source report."""
     root = Path(out_dir)
     if not root.exists():
         return []
 
     items: list[HistoryItem] = []
-    for folder in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True):
+    for folder in sorted(iter_output_folders(root), key=lambda p: p.stat().st_mtime, reverse=True):
         recipe_path = folder / "recipe.json"
         note_path = folder / "note.md"
         transcript_path = folder / "transcript.json"
@@ -132,10 +137,6 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
         quality = load_quality_report(folder)
         if not quality and (recipe_path.exists() or note_path.exists()):
             quality = analyze_recipe_quality(folder)
-            try:
-                write_quality_report(folder, quality)
-            except Exception:
-                pass
 
         if not recipe and not note_path.exists() and not transcript_path.exists() and not job:
             continue
@@ -163,7 +164,7 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
                 quality_score=quality.score if quality else None,
                 quality_summary=quality.summary if quality else None,
                 workflow_status=workflow_status,
-                archive_note_path=Path(str(archive["note_path"])) if archive.get("note_path") else None,
+                archive_note_path=resolve_stored_path(str(archive["note_path"])) if archive.get("note_path") else None,
                 archived_at=str(archive.get("archived_at")) if archive.get("archived_at") else None,
                 category=str(recipe.get("category") or "未分类"),
                 cuisine=str(recipe.get("cuisine") or "未分类"),

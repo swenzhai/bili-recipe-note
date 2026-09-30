@@ -1,45 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-
-type Recipe = {
-  id: string;
-  title: string;
-  category?: string;
-  total_time?: string;
-  tags?: string[];
-  published?: boolean;
-  recommended?: boolean;
-  creator_name?: string;
-  cover_image_sha256?: string;
-  cover_image_status?: string;
-  ingredients?: { name?: string; amount?: string }[];
-  prep_items?: string[];
-  steps?: { title?: string; action?: string; heat?: string; duration?: string; tips?: string; image_sha256?: string }[];
-  assets?: { sha256: string; kind?: string; step_index?: number }[];
-};
-type Selection = { order_id: string; device_id: string; device_name: string; recipe_id: string; quantity: number; note: string };
-type MealPhase = "ordering" | "prep" | "cooking" | "serving";
-type DishState = { recipe_id: string; prep_completed: boolean; cook_completed: boolean; served: boolean; completed: boolean };
-type Meal = { order: { id: string; status: string; epoch: number; phase: MealPhase; chef_device_id?: string | null; created_at?: string; completed_at?: string | null }; selections: Selection[]; dish_states: DishState[] };
-type Practice = { id: string; recipe_id: string; cooked_on: string; rating?: number; notes: string; photo_sha256?: string; version: number };
-type Plan = { id: string; name: string; items: { recipe_id: string; title: string; servings_multiplier: number; note: string }[]; version: number };
-type Pair = { base_url: string; pairing_token: string };
-type Device = { id: string; name: string; token: string };
-type Branding = { name: string; subtitle: string; has_logo: boolean; logo_url?: string | null };
-type Operation = { op_id: string; entity_type: string; entity_id?: string; action: string; base_version?: number; order_id?: string; epoch?: number; phase?: MealPhase; stage?: Exclude<MealPhase, "ordering">; recipe_id?: string; device_id?: string; quantity?: number; note?: string; completed?: boolean; plan_id?: string; payload?: Record<string, unknown> };
-type QueuedOperation = Operation & { sequence?: number; queued_at?: number };
-type Change = { entity_type: string; action: string; payload: Record<string, unknown> };
-type SyncPayload = {
-  operation_results: { op_id: string; status: string; reason?: string; message?: string; loaded?: number; skipped?: number; conflict_id?: string; server?: Practice }[];
-  changes: Change[];
-  next_cursor: number;
-  has_more: boolean;
-  bootstrap?: boolean;
-  meal?: Meal | null;
-};
+import {
+  menuRecipes, mergeChanges, optimisticallyAddQuantity, optimisticallySetDishStage,
+  pendingActionKey, synchronizeBatch,
+} from "./sync";
+import type { Recipe, Selection, MealPhase, Meal, Practice, Plan, Pair, Device, Branding, Operation, QueuedOperation, SyncPayload } from "./sync";
 
 const DB_NAME = "bili-recipe-lan";
 const OUTBOX_STORE = "outbox_v3";
-const CLIENT_SYNC_BATCH = 100;
 const CAPABILITIES = ["recipe", "practice_log", "meal_plan", "meal_order", "meal_selection", "meal_dish_state"];
 const CAPABILITY_KEY = CAPABILITIES.slice().sort().join(",");
 const ORDER_CATEGORIES = ["全部", "主厨推荐", "主菜", "肉类", "海鲜", "主食", "面条", "糕点", "汤羹", "小吃", "饮品", "素菜", "其他"] as const;
@@ -163,21 +130,6 @@ function mealOp(action: string, meal: Meal | null, extra: Partial<Operation> = {
   return { op_id: newUuid(), entity_type: "meal_selection", action, order_id: meal?.order.id, epoch: meal?.order.epoch, phase: meal?.order.phase, ...extra };
 }
 
-function wireOperation(operation: QueuedOperation): Operation {
-  const { sequence: _sequence, queued_at: _queuedAt, ...payload } = operation;
-  return payload;
-}
-
-function pendingActionKey(operation: Partial<Operation>): string | undefined {
-  if (operation.action === "set_dish_stage_completed") {
-    return [operation.order_id, operation.epoch, operation.action, operation.stage, operation.recipe_id].join(":");
-  }
-  if (["advance_meal_phase", "complete_order", "clear_order", "load_plan"].includes(operation.action || "")) {
-    return [operation.order_id, operation.epoch, operation.action].join(":");
-  }
-  return undefined;
-}
-
 function recipeThumbnail(recipe?: Recipe): string | undefined {
   if (!recipe || !["manual_video", "manual_step", "manual_timestamp", "manual_crop", "uploaded"].includes(recipe.cover_image_status || "")) return undefined;
   return recipe?.cover_image_sha256
@@ -208,69 +160,6 @@ function recipeOrderCategories(recipe: Recipe): OrderCategory[] {
   if (category === "中餐" && vegetable.test(text) && !meat.test(text) && !seafood.test(text)) result.add("素菜");
   if (![...result].some(item => item !== "主厨推荐") || category === "其他") result.add("其他");
   return ORDER_CATEGORIES.filter(item => item !== "全部" && result.has(item));
-}
-
-function mergeChanges<T extends { id: string }>(current: T[], changes: Change[], entityType: string, reset: boolean): T[] {
-  const merged = new Map((reset ? [] : current).map(item => [item.id, item]));
-  for (const change of changes) {
-    if (change.entity_type !== entityType) continue;
-    const id = String(change.payload.id || "");
-    if (!id) continue;
-    if (change.action === "delete") merged.delete(id);
-    else merged.set(id, change.payload as unknown as T);
-  }
-  return [...merged.values()];
-}
-
-function optimisticallyAddQuantity(current: Meal | null, operation: Operation, device: Device): Meal | null {
-  if (
-    !current
-    || operation.action !== "add_quantity"
-    || operation.order_id !== current.order.id
-    || operation.epoch !== current.order.epoch
-    || !operation.recipe_id
-  ) return current;
-  const targetDevice = operation.device_id || device.id;
-  const existing = current.selections.find(item => item.recipe_id === operation.recipe_id && item.device_id === targetDevice);
-  const quantity = (existing?.quantity || 0) + (operation.quantity || 0);
-  const selections = current.selections.filter(item => item.recipe_id !== operation.recipe_id || item.device_id !== targetDevice);
-  if (quantity > 0) selections.push({
-    order_id: current.order.id,
-    device_id: targetDevice,
-    device_name: existing?.device_name || (targetDevice === device.id ? device.name : targetDevice),
-    recipe_id: operation.recipe_id,
-    quantity,
-    note: existing?.note || "",
-  });
-  const dishStates = current.dish_states.some(item => item.recipe_id === operation.recipe_id)
-    ? current.dish_states
-    : [...current.dish_states, { recipe_id: operation.recipe_id, prep_completed: false, cook_completed: false, served: false, completed: false }];
-  return { ...current, selections, dish_states: dishStates };
-}
-
-function optimisticallySetDishStage(current: Meal | null, operation: Operation): Meal | null {
-  if (
-    !current
-    || operation.action !== "set_dish_stage_completed"
-    || operation.order_id !== current.order.id
-    || operation.epoch !== current.order.epoch
-    || operation.phase !== current.order.phase
-    || operation.stage !== current.order.phase
-    || !operation.recipe_id
-  ) return current;
-  const state = current.dish_states.find(item => item.recipe_id === operation.recipe_id) || {
-    recipe_id: operation.recipe_id, prep_completed: false, cook_completed: false, served: false, completed: false,
-  };
-  const completed = Boolean(operation.completed);
-  const updated = operation.stage === "prep"
-    ? { ...state, prep_completed: completed }
-    : operation.stage === "cooking"
-      ? { ...state, cook_completed: completed, completed }
-      : { ...state, served: completed };
-  return {
-    ...current,
-    dish_states: [...current.dish_states.filter(item => item.recipe_id !== operation.recipe_id), updated],
-  };
 }
 
 export default function App() {
@@ -356,61 +245,28 @@ export default function App() {
     syncRequested.current = false;
     let resync = false;
     try {
-      const pendingPage = await queued(CLIENT_SYNC_BATCH + 1);
-      const pending = pendingPage.slice(0, CLIENT_SYNC_BATCH).map(wireOperation);
-      resync = pendingPage.length > CLIENT_SYNC_BATCH;
-      for (const operation of pending) {
-        const digest = String(operation.payload?.photo_sha256 || "");
-        if (!digest) continue;
-        const photo = await cachedAsset(digest);
-        if (photo) {
-          const uploaded = await fetch(`${server}/api/v1/assets/${digest}`, { method: "PUT", headers: { Authorization: `Bearer ${device.token}`, "Content-Type": photo.type }, body: photo });
-          if (!uploaded.ok) throw new Error("实践照片上传失败");
-        }
-      }
-      const changes: Change[] = [];
-      let nextCursor = cursorRef.current;
-      let bootstrap = false;
-      let mealSnapshot: Meal | null | undefined;
-      let firstPage = true;
-      while (true) {
-        const response = await fetch(`${server}/api/v1/sync`, { method: "POST", headers: { Authorization: `Bearer ${device.token}`, "Content-Type": "application/json" }, body: JSON.stringify({ cursor: nextCursor, operations: firstPage ? pending : [], capabilities: CAPABILITIES }) });
-        if (response.status === 401) { await deleteState("device"); setDevice(null); throw new Error("设备已被撤销，请重新加入"); }
-        if (!response.ok) throw new Error("同步失败");
-        const payload = await response.json() as SyncPayload;
-        if (firstPage) {
-          for (const result of payload.operation_results) {
-            const original = pending.find(item => item.op_id === result.op_id);
-            if (result.status === "accepted") {
-              await dequeue(result.op_id);
-              if (original) markPending(original, false);
-              if (original?.action === "load_plan" && result.skipped) flash(result.message || `已跳过 ${result.skipped} 道不可用菜品`);
-              if (original?.action === "complete_order") resync = true;
-            }
-            else if (result.status === "conflict" && result.conflict_id && result.server) {
-              const choice = prompt("心得冲突：输入 server 使用服务器版本，mine 使用我的版本，merge 手动合并", "server");
-              if (original && choice === "server") await queue({ op_id: newUuid(), entity_type: "practice_log", entity_id: result.server.id, action: "resolve_conflict", payload: { id: result.server.id, conflict_id: result.conflict_id, resolution: "server" } });
-              if (original && ["mine", "merge"].includes(choice || "")) {
-                const notes = choice === "merge" ? prompt("输入合并后的心得", String(original.payload?.notes || "")) : original.payload?.notes;
-                if (notes !== null) await queue({ ...original, op_id: newUuid(), base_version: result.server.version, payload: { ...original.payload, notes, _resolved_conflict_id: result.conflict_id, _conflict_resolution: choice === "merge" ? "merged" : "incoming" } });
-              }
-              await dequeue(result.op_id); flash("心得冲突已记录解决选择");
-              if (original) markPending(original, false);
-              resync = true;
-            }
-            else if (["stale_order", "order_completed"].includes(result.reason || "")) { await dequeue(result.op_id); if (original) markPending(original, false); flash("本餐已变化，旧离线操作没有提交"); }
-            else if (["recipe_unpublished", "recipe_unavailable"].includes(result.reason || "")) { await dequeue(result.op_id); if (original) markPending(original, false); flash(result.message || "这道菜已不可用，没有提交该操作"); }
-            else if (["meal_phase_changed", "meal_phase_locked", "phase_incomplete", "meal_empty"].includes(result.reason || "")) { await dequeue(result.op_id); if (original) markPending(original, false); flash(result.message || "本餐阶段已经变化"); resync = true; }
-            else if (result.status === "conflict" && original?.entity_type.startsWith("meal_")) { await dequeue(result.op_id); markPending(original, false); flash(result.message || "这项本餐操作已失效，没有提交"); resync = true; }
+      const result = await synchronizeBatch({
+        cursor: cursorRef.current,
+        queued,
+        uploadPhoto: async operation => {
+          const digest = String(operation.payload?.photo_sha256 || "");
+          if (!digest) return;
+          const photo = await cachedAsset(digest);
+          if (photo) {
+            const uploaded = await fetch(`${server}/api/v1/assets/${digest}`, { method: "PUT", headers: { Authorization: `Bearer ${device.token}`, "Content-Type": photo.type }, body: photo });
+            if (!uploaded.ok) throw new Error("实践照片上传失败");
           }
-        }
-        changes.push(...payload.changes);
-        bootstrap ||= payload.bootstrap === true;
-        if ("meal" in payload) mealSnapshot = payload.meal;
-        nextCursor = payload.next_cursor;
-        firstPage = false;
-        if (!payload.has_more) break;
-      }
+        },
+        requestPage: async (nextCursor, operations) => {
+          const response = await fetch(`${server}/api/v1/sync`, { method: "POST", headers: { Authorization: `Bearer ${device.token}`, "Content-Type": "application/json" }, body: JSON.stringify({ cursor: nextCursor, operations, capabilities: CAPABILITIES }) });
+          if (response.status === 401) { await deleteState("device"); setDevice(null); throw new Error("设备已被撤销，请重新加入"); }
+          if (!response.ok) throw new Error("同步失败");
+          return await response.json() as SyncPayload;
+        },
+        effects: { queue, dequeue, markPending, flash, prompt: (message, initial) => window.prompt(message, initial), newUuid },
+      });
+      const { changes, bootstrap, mealSnapshot, nextCursor } = result;
+      resync = result.resync;
       setRecipes(current => mergeChanges<Recipe>(current, changes, "recipe", bootstrap));
       setPractices(current => mergeChanges<Practice>(current, changes, "practice_log", bootstrap));
       setPlans(current => mergeChanges<Plan>(current, changes, "meal_plan", bootstrap));
@@ -495,9 +351,7 @@ export default function App() {
     }
   }
 
-  const availableRecipes = useMemo(() => recipes
-    .filter(recipe => recipe.published !== false)
-    .sort((first, second) => Number(Boolean(second.recommended)) - Number(Boolean(first.recommended)) || first.title.localeCompare(second.title, "zh-CN")), [recipes]);
+  const availableRecipes = useMemo(() => menuRecipes(recipes), [recipes]);
   const categoryCounts = useMemo(() => {
     const counts = new Map<OrderCategory, number>([["全部", availableRecipes.length]]);
     for (const recipe of availableRecipes) {

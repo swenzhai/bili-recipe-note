@@ -63,6 +63,58 @@ HF_HUB_OFFLINE=1 python -c "from faster_whisper import WhisperModel; WhisperMode
 
 模型缓存在当前用户的 `~/.cache/huggingface/hub`（设置了 `HF_HOME` 或 `HF_HUB_CACHE` 时以对应路径为准）。下载并验证后，继续原批次或重试失败项。若希望完全避免模型联网检查，可在启动 UI 或批次前设置 `export HF_HUB_OFFLINE=1`；此时所选模型必须已经缓存。
 
+## 数据目录与迁移
+
+应用代码和个人数据分开保存，默认数据根目录为项目下的 `data/`：
+
+```text
+data/
+├── recipes/                 # 菜谱、原始字幕、来源、审核和媒体
+│   ├── <UP主>/
+│   │   └── <菜名>--<BVID>/
+│   ├── .ai-review/          # 审核任务与历史快照
+│   └── curation-review/     # 整理报告与人工决定
+├── creators/                # 按 UID 保存视频链接与 UP 主资料
+│   └── <UID>-<UP名称>/
+│       ├── video_links.txt
+│       └── creator.json
+├── state/                   # 配置、批次、知识库、数据库和私人状态
+│   ├── config.json
+│   ├── batches/
+│   ├── knowledge_base.json
+│   ├── mobile-sync.sqlite3
+│   ├── mobile-media/
+│   └── cookies/
+├── sources/                 # PDF、结构化原资料等输入材料
+├── exports/                 # 部署包、工作交接包、默认 obsidian-vault 归档
+└── logs/                    # 运行日志
+```
+
+可将数据放到独立磁盘或共享挂载目录。Linux/macOS 在启动 CLI、UI 或服务之前设置：
+
+```bash
+export BILI_RECIPE_DATA_DIR=/srv/bili-recipe-data
+```
+
+Windows PowerShell：
+
+```powershell
+$env:BILI_RECIPE_DATA_DIR = "D:\bili-recipe-data"
+```
+
+CLI 也可通过 `--data-dir /srv/bili-recipe-data` 为本次运行指定数据根目录。所有进程使用相同设置即可访问同一份数据。`--out` 仍可指定其他菜谱输出目录；配置、数据库与 UP 主清单统一归属于数据根目录。代码可独立通过 Git 更新，默认 `data/` 已由 Git 忽略；自定义目录建议放在代码仓库外。
+
+已有 `outputs*`、`cunlv`、`creators`、`.bili-recipe-notes`、`deployments` 和 `obsidian-vault` 可使用一次性迁移命令整理：
+
+```bash
+python -m bili_recipe_notes --migrate-data preview
+python -m bili_recipe_notes --migrate-data apply
+```
+
+先停止 UI、手机 API 和后台任务，再执行迁移。预览会列出来源和目标位置；执行时保留原始菜谱、字幕、图片和审核内容，按 UP 主建立子目录，更新运行状态中的路径并保留迁移记录。同名目录不会自动合并：来自不同旧目录的数据会保留来源子层，确保同名菜谱和不同版本都保留。升级后先完成迁移，再使用新默认目录启动服务。后续搬家只需复制数据根目录并设置环境变量，无需再分散查找数据库和链接清单。
+
+`state/layout.json` 保存旧路径到当前数据目录的映射，搬家时请一并保留。旧配置、批次和知识库中的路径在读取时自动适配，无需改写原始文件；迁移清单和文件校验值保存在 `state/migrations/`。
+
 ## 使用方式
 
 ### 命令行
@@ -74,7 +126,7 @@ python -m bili_recipe_notes "https://www.bilibili.com/video/BVxxxx"
 可选参数：
 
 - `--cookies cookies.txt`
-- `--out outputs`
+- `--out data/recipes`
 - `--no-screenshot`
 - `--max-steps 10`（最终版保留 4–12 个关键阶段，默认最多 10 个）
 - `--max-images 3`（只保存 1–4 张关键步骤图片，默认最多 3 张）
@@ -91,7 +143,7 @@ python -m bili_recipe_notes "https://www.bilibili.com/video/BVxxxx"
 - `--llm-extra-instructions "附加提示词"`
 - `--llm-extra-instructions-file prompt.txt`（从 UTF-8 文件载入高级提示词）
 - `--creator-home`（输入博主主页链接，提取全部视频链接）
-- `--creator-links-file all_links.txt`（提取结果文件名，默认 `creator_video_links.txt`）
+- `--creator-links-file all_links.txt`（额外指定链接清单副本；默认按 UP 主保存到 `data/creators/`）
 - `--batch`（创建持久化批次并在当前终端顺序执行）
 - `--batch-file links.txt`（从文本文件读取批量 URL，可重复使用；传 `-` 时从 stdin 读取）
 - `--batch-url URL`（额外加入一个 URL，可多次指定）
@@ -100,9 +152,10 @@ python -m bili_recipe_notes "https://www.bilibili.com/video/BVxxxx"
 - `--create-only`（只创建 pending 批次，不执行下载、字幕、Whisper 或 LLM）
 - `--resume-batch ID` / `--retry-batch ID`（继续未完成阶段 / 只重试失败阶段）
 - `--list-batches` / `--show-batch ID`（查看批次列表或逐条状态）
+- `--migrate-data preview|apply`（预览或执行旧数据统一迁移）
 - `--normalize-output-folders preview|apply`（预览或执行旧输出目录规范化）
 - `--export-curation-review [PATH]`（生成同名/近似名菜谱审核表）
-- `--export-deployment-bundle [PATH]`（只导出菜谱、图片、知识库和整理进度的数据迁移包；源码与运行环境由 Git 管理）
+- `--export-deployment-bundle [PATH]`（导出菜谱、UP 主清单、图片、知识库及完整数据库的数据迁移包；源码与运行环境由 Git 管理）
 - `--export-handoff ID`（把批次和已完成工作导出为跨平台交接包）
 - `--import-handoff PATH`（校验并导入 `.handoff.zip`）
 - `--handoff-destination PATH`（指定交接包导出文件或目录）
@@ -110,10 +163,10 @@ python -m bili_recipe_notes "https://www.bilibili.com/video/BVxxxx"
 提取博主全部视频链接示例：
 
 ```bash
-python -m bili_recipe_notes "https://space.bilibili.com/123456/video" --creator-home --out outputs
+python -m bili_recipe_notes "https://space.bilibili.com/123456/video" --creator-home --out data/recipes
 ```
 
-执行后会在 `outputs/creator_video_links.txt` 生成该主页下全部视频 URL，便于后续批量整理菜谱。
+执行后会在 `data/creators/<UID>-<UP名称>/video_links.txt` 保存该主页下全部视频 URL，并保存 `creator.json`，便于后续补抓和批量整理菜谱。
 
 ### CLI 批量处理
 
@@ -124,10 +177,10 @@ python -m bili_recipe_notes "https://space.bilibili.com/123456/video" --creator-
 ```bash
 python -m bili_recipe_notes \
   --batch \
-  --batch-file "outputs/creators/419872064-老饭骨/video_links.txt" \
+  --batch-file "data/creators/419872064-老饭骨/video_links.txt" \
   --batch-id laofangu-raw \
   --target-stage raw \
-  --cookies .bili-recipe-notes/cookies/bilibili-edge.txt \
+  --cookies data/state/cookies/bilibili-edge.txt \
   --whisper-model medium \
   --no-screenshot
 ```
@@ -149,7 +202,7 @@ python -m bili_recipe_notes \
 python -m bili_recipe_notes \
   --resume-batch my-recipes \
   --target-stage raw \
-  --cookies .bili-recipe-notes/cookies/bilibili-edge.txt \
+  --cookies data/state/cookies/bilibili-edge.txt \
   --whisper-model medium
 ```
 
@@ -205,7 +258,7 @@ python -m bili_recipe_notes --show-batch my-recipes
 python -m bili_recipe_notes \
   --retry-batch my-recipes \
   --target-stage recipe \
-  --cookies .bili-recipe-notes/cookies/bilibili-edge.txt
+  --cookies data/state/cookies/bilibili-edge.txt
 ```
 
 Windows PowerShell 的参数完全相同，只需按 PowerShell 语法换行：
@@ -213,39 +266,47 @@ Windows PowerShell 的参数完全相同，只需按 PowerShell 语法换行：
 ```powershell
 python -m bili_recipe_notes `
   --batch `
-  --batch-file "outputs\creators\419872064-老饭骨\video_links.txt" `
+  --batch-file "data\creators\419872064-老饭骨\video_links.txt" `
   --batch-id laofangu-win `
   --target-stage raw `
-  --cookies ".bili-recipe-notes\cookies\bilibili-edge.txt" `
+  --cookies "data\state\cookies\bilibili-edge.txt" `
   --whisper-model medium
 ```
 
-批次状态保存在 `.bili-recipe-notes/batches/<批次ID>.json`，输出仍写入 `--out` 指定的目录。每次续跑都会采用当前命令传入的 Whisper、LLM、截图和审核设置；Cookie 不会写入工作产物，换电脑后应传入该电脑自己的 Cookie 文件。批次中只要有条目失败，CLI 会返回退出码 `1`；全部成功或没有待处理条目时返回 `0`。
+批次状态保存在 `data/state/batches/<批次ID>.json`，输出仍写入 `--out` 指定的目录。每次续跑都会采用当前命令传入的 Whisper、LLM、截图和审核设置；Cookie 不会写入工作产物，换电脑后应传入该电脑自己的 Cookie 文件。批次中只要有条目失败，CLI 会返回退出码 `1`；全部成功或没有待处理条目时返回 `0`。
 
-完整菜谱目录采用 `规范菜名--BVID`，分 P/CID 视频会继续附加稳定分段 ID。原始阶段暂时使用 `待整理--BVID`，菜谱抽取成功后自动改成最终名称；视频宣传标题和 UP 主名称只保存在元数据中，不进入目录名。旧目录可先预览、确认无冲突后再迁移：
+完整菜谱目录采用 `<UP主>/规范菜名--BVID`，分 P/CID 视频会继续附加稳定分段 ID。原始阶段暂时使用 `<UP主>/待整理--BVID`，菜谱抽取成功后自动改成最终名称；UP 主子目录便于人工浏览，视频宣传标题保存在元数据中。旧目录可先预览、确认无冲突后再迁移：
 
 ```bash
-python -m bili_recipe_notes --normalize-output-folders preview --out outputs
-python -m bili_recipe_notes --normalize-output-folders apply --out outputs
+python -m bili_recipe_notes --normalize-output-folders preview --out data/recipes
+python -m bili_recipe_notes --normalize-output-folders apply --out data/recipes
 ```
 
-迁移会同步更新 `job.json`、批次状态和移动端索引，并在 `.bili-recipe-notes/migrations/` 保存旧路径到新路径的清单。运行中的后台批次存在时会拒绝迁移。
+迁移会同步更新 `job.json`、批次状态和移动端索引，并在 `data/state/migrations/` 保存旧路径到新路径的清单。运行中的后台批次存在时会拒绝迁移。
 
 准备合并最终版菜谱前，可先生成不会修改原始输出的审核表：
 
 ```bash
-python -m bili_recipe_notes --export-curation-review --out outputs
+python -m bili_recipe_notes --export-curation-review --out data/recipes
 ```
 
-默认生成 `outputs/curation-review/recipe-review.csv` 和 `recipe-review.json`。工具会聚合同名菜谱，谨慎提示仅相差一个字的近似名称，并根据步骤完整度、视频时长、质量分、字幕重合和推广信号推荐 `primary_candidate`、`variant_candidate`、`short_clip_candidate`、`exclude_candidate` 或 `name_review_candidate`。也可以在网页的“最终菜谱整理”页面对照全部来源的用料、步骤、字幕证据和原视频，保存主版本、不同做法、短剪合并或排除决定。人工结果独立保存在 `outputs/curation-review/curation-decisions.json`，重新扫描不会覆盖。
+默认生成 `data/recipes/curation-review/recipe-review.csv` 和 `recipe-review.json`。工具会聚合同名菜谱，谨慎提示仅相差一个字的近似名称，并根据步骤完整度、视频时长、质量分、字幕重合和推广信号推荐 `primary_candidate`、`variant_candidate`、`short_clip_candidate`、`exclude_candidate` 或 `name_review_candidate`。也可以在网页的“最终菜谱整理”页面对照全部来源的用料、步骤、字幕证据和原视频，保存主版本、不同做法、短剪合并或排除决定。人工结果独立保存在 `data/recipes/curation-review/curation-decisions.json`，重新扫描不会覆盖。
 
 ### AI 审核归类
 
-批量生成完成后，可进入管理页的“AI 审核归类”，使用当前输出目录和 LLM 设置，对已有菜谱逐条审核。在“批量处理”点击“AI 逐项审核本批次”，还可直接带入该批次已生成的菜谱范围。点击“开始 AI 批量审核”后任务在后台顺序运行，进度每 5 秒自动更新；点击“刷新审核进度与结果”查看最新分类和待确认问题，或选择“AI 审核这一条”单独审核。点击“完成当前条后暂停”会保留已保存结果，之后可继续未完成项或重试失败项。默认跳过有效审核，源菜谱变化后会提示重审。
+批量生成完成后，可进入管理页的“AI 审核归类”，使用当前输出目录和 LLM 设置，对已有菜谱逐条审核。在“批量处理”点击“AI 逐项审核本批次”，还可直接带入该批次已生成的菜谱范围。点击“开始 AI 批量审核”后任务在后台顺序运行，进度每 5 秒自动更新；点击“刷新审核进度与结果”查看最新分类和待确认问题，或选择“AI 审核这一条”单独审核。点击“完成当前条后暂停”会保留已保存结果，之后可继续未完成项或重试失败项。继续或重试默认使用当前侧栏配置，也可选择原任务配置。超时等短暂错误默认最多尝试 3 次并退避重试；配置错误或连续失败达到阈值时暂停，保留原因和每次尝试记录，避免不断重复失败调用。
+
+默认跳过有效审核。菜谱用料、步骤、字幕、来源上下文或审核规则变化后会提示重审；评分、封面、截图、检索分类标签和 Markdown 排版不使审核失效。旧版只有菜谱文件哈希的审核需要重新审核，原有人工展示决定继续有效。
 
 AI 会把内容归为“菜谱”“烹饪技巧”“非菜谱”或“无法确认”，并对菜谱逐项核对食材、调料和步骤的字幕依据。其他分类可仅给出内容判断和证据。只有证据明确、置信度至少为 `0.9` 的烹饪技巧或非菜谱才会默认隐藏，不再主动进入菜谱展示和点餐。完整做菜视频不会仅因含推广口播被隐藏，同名菜谱的合理做法变体也会保留。证据不足的内容继续展示并标记待人工确认。
 
-在审核页查看隐藏项，可以阅读归类理由并人工恢复展示；人工展示决定会在后续复审中保留，手机菜单在下一次同步时更新。审核记录独立写入菜谱目录的 `recipe.ai-review.json`，批次状态位于输出根目录的 `.ai-review/`。原始报告、字幕、来源、任务与质量报告，以及既有 `recipe.json`、`note.md`、人工审核文件和媒体均不会被本流程改写、删除或移动。AI 的修改意见也只保存在审核记录中。
+审核页的“人工核对”并列展示生成版原文、可检索的字幕和 AI 意见，支持跳转到原视频时间点、修正内容分类、逐项记录核对结论并进入下一条待确认内容。菜谱需要所有用料和步骤明确核实后才能完成人工确认；技巧或非菜谱只需核实分类。通过字幕确认时保留原文引用，通过视频确认时填写依据说明。人工逐项确认随内容变化失效，但单纯 AI 规则升级不会清除人工确认。
+
+在审核页查看隐藏项，可以阅读归类理由并人工恢复展示；人工分类和展示决定会在后续复审中保留。菜谱库、详情、烹饪模式和点餐共用展示规则，人工恢复可覆盖 AI 与旧来源排除分类；菜单的手动下架仍需在“手机客户端”重新上架，手机菜单在下一次同步时更新。“清除人工展示覆盖”后恢复按分类和有效审核决定展示。
+
+审核记录独立写入菜谱目录的 `recipe.ai-review.json`，批次状态位于输出根目录的 `.ai-review/`，每次变更前的记录保存在 `.ai-review/history/`，可在“审核历史”查看和下载。原始报告、字幕、来源、任务与质量报告，以及既有 `recipe.json`、`note.md`、人工审核文件和媒体均不会被本流程改写、删除或移动。AI 的修改意见也只保存在审核记录中。普通浏览缺失质量报告时仅在内存中计算，不自动补写文件。
+
+移动端后台按变更增量更新索引和图片哈希，文件读取使用内存缓存并检查失效；单次异常后自动退避重试，保留上次可用菜谱。“手机客户端”显示最近成功索引时间与异常，`/api/v1/health` 和需设备认证的 `/api/v1/index-status` 提供运行状态。
 
 项目内的 [AGENTS.md](AGENTS.md) 和 [菜谱审核 Agent 指南](docs/agents/recipe-audit.md) 规定了审核工作流、分类边界、证据要求及人工恢复规则，可用于指导 AI 后续整理。原有“审核确认”仍是人工修改并应用生成版的独立流程。
 
@@ -254,32 +315,30 @@ AI 会把内容归为“菜谱”“烹饪技巧”“非菜谱”或“无法�
 需要把当前菜谱数据、知识库和整理进度搬到另一台已从 Git 获取源码的服务器时，生成数据迁移包：
 
 ```bash
-python -m bili_recipe_notes --export-deployment-bundle --out outputs
+python -m bili_recipe_notes --export-deployment-bundle --out data/recipes
 ```
 
-默认写入 `deployments/bili-recipe-notes-<时间>.deployment.zip`。包内只包含菜谱 JSON/Markdown、字幕、步骤图片、知识库、批次状态、整理报告和人工决定；不会包含源码、依赖清单、启动脚本、Cookie、`.venv`、Git 历史、缓存、原始音视频、`.bak`、已有 ZIP 或移动端数据库。导出结束前会逐文件校验大小和 SHA-256。
+默认写入 `data/exports/deployments/bili-recipe-notes-<时间>.deployment.zip`。包内包含菜谱 JSON/Markdown、字幕、图片、UP 主链接清单、知识库、批次、整理和审核记录，以及移动同步 SQLite 的一致快照、实践照片、`sources/` 原资料和默认 Obsidian 归档。数据库保留设备配对、套餐、本餐、实践记录、来源分类、人工上下架和推荐状态，JSON 固定备份一并保留。导出结束前会逐文件校验大小和 SHA-256。
 
-目标服务器先从 Git 获取应用源码和运行环境，再把数据包解压到临时目录；包内统一的 `data/` 目录包含全部迁移数据。将 `data/outputs/` 和 `data/.bili-recipe-notes/` 合并到 Git 项目根目录即可。
+数据包包含私人使用记录和设备认证信息，应作为私有备份保存。源码、依赖、启动脚本、Cookie、运行环境、Git 历史、运行日志、缓存、原始音视频和已有 ZIP 不进入数据包；外部自定义 Obsidian vault 需单独备份。需要原样保留 Cookie、媒体和历史导出包时，停止所有后台任务和服务后直接复制整个数据根目录。
 
-Windows PowerShell 数据包解压示例（假定 Git 项目位于 `C:\\apps\\bili-recipe-notes`）：
+目标服务器先从 Git 获取同版本应用源码和运行环境，再把数据包解压到临时目录；将包内的 `bili-recipe-notes/data/` 放到项目根目录，或放到独立磁盘并设置 `BILI_RECIPE_DATA_DIR`。恢复前先停止目标服务并备份已有数据，避免覆盖同名内容。
+
+Windows PowerShell 示例（项目位于 `C:\apps\bili-recipe-notes`）：
 
 ```powershell
 Expand-Archive .\bili-recipe-notes-*.deployment.zip -DestinationPath C:\temp\bili-recipe-data
-Copy-Item -Recurse -Force C:\temp\bili-recipe-data\bili-recipe-notes\data\outputs\* C:\apps\bili-recipe-notes\outputs\
-Copy-Item -Recurse -Force C:\temp\bili-recipe-data\bili-recipe-notes\data\.bili-recipe-notes\* C:\apps\bili-recipe-notes\.bili-recipe-notes\
+Copy-Item -Recurse -Force C:\temp\bili-recipe-data\bili-recipe-notes\data C:\apps\bili-recipe-notes\
 ```
 
-Linux 数据包解压示例（假定 Git 项目位于 `/srv/apps/bili-recipe-notes`）：
+Linux/macOS 示例（项目位于 `/srv/apps/bili-recipe-notes`）：
 
 ```bash
 unzip bili-recipe-notes-*.deployment.zip -d /tmp/bili-recipe-data
-rsync -a /tmp/bili-recipe-data/bili-recipe-notes/data/outputs/ /srv/apps/bili-recipe-notes/outputs/
-rsync -a /tmp/bili-recipe-data/bili-recipe-notes/data/.bili-recipe-notes/ /srv/apps/bili-recipe-notes/.bili-recipe-notes/
+rsync -a /tmp/bili-recipe-data/bili-recipe-notes/data/ /srv/apps/bili-recipe-notes/data/
 ```
 
-macOS 数据包解压方式与 Linux 相同：
-
-数据恢复后从 Git 项目现有的启动方式启动应用；首次进入“最终菜谱整理”后点击“重新扫描输出”，让报告路径适配新服务器。包内另附 `DATA-MIGRATION.md`，可离线查看数据恢复说明。
+恢复后按项目现有方式启动应用，移动菜谱索引会自动更新。首次进入“最终菜谱整理”后点击“重新扫描输出”，让报告路径适配新服务器。包内另附 `DATA-MIGRATION.md`，可离线查看恢复说明。
 
 ### 本地 UI
 
@@ -331,7 +390,7 @@ chmod +x start-ui-linux.sh
 
 macOS 直接双击 `start-ui-mac.command` 即可。首次打开会自动在项目目录创建隔离的 `.venv` 并安装依赖，可能需要几分钟；以后双击会直接启动并打开浏览器，不会把依赖安装到 Conda base 环境。
 
-macOS 启动器会自动设置稳定的 Arrow 内存池，把 Whisper 批处理放在独立进程，并在 UI 意外退出时最多自动重启 3 次。UI 诊断日志保存在 `.venv/ui.log`，手机 API 日志保存在 `.venv/mobile-api.log`。后台批次拥有独立 PID 和持久状态，即使网页刷新或 UI 重启也会继续运行。
+macOS 启动器会自动设置稳定的 Arrow 内存池，把 Whisper 批处理放在独立进程，并在 UI 意外退出时最多自动重启 3 次。UI 诊断日志与手机 API 日志统一保存在 `data/logs/`（自定义数据根目录时跟随该目录）。后台批次拥有独立 PID 和持久状态，即使网页刷新或 UI 重启也会继续运行。
 
 Linux/macOS 可在“批量处理”选择运行中的批次，或在“任务仪表盘”的任务卡片上点击“暂停任务”。暂停会保留当前处理位置；点击“继续任务”会沿用原配置继续同一个任务。刷新页面或重启 UI 后仍可继续；电脑重启后则使用“继续未完成”恢复已保存的阶段。暂停中的批次会阻止重复启动相同链接，暂停时间不计入处理速度。长时间暂停可能导致当前外部请求在继续后超时，届时可在批次结束后选择“只重试失败”。Windows 暂不支持即时暂停，按钮会禁用。
 
@@ -388,12 +447,12 @@ UI 会在浏览器中打开，支持：
 - 对已有视频做 LLM 二次分析，例如提取通用烹饪技巧、食材替换建议、常见失败点
 - 导出 Obsidian Markdown、PDF、Word
 
-三个平台的启动器都会启动 `8501` 管理页和 `8765` 移动点餐/API。移动端使用长期设备令牌，管理页面本身没有登录认证，因此两项服务都只适合可信家庭局域网，不能暴露到互联网或公共 Wi-Fi。输出仍写入 `outputs/` 或界面中指定的目录。
+三个平台的启动器都会启动 `8501` 管理页和 `8765` 移动点餐/API。移动端使用长期设备令牌，管理页面本身没有登录认证，因此两项服务都只适合可信家庭局域网，不能暴露到互联网或公共 Wi-Fi。输出仍写入 `data/recipes/` 或界面中指定的目录。
 
 UI 默认配置会保存到：
 
 ```text
-.bili-recipe-notes/config.json
+data/state/config.json
 ```
 
 支持保存的默认项包括输出目录、cookies 路径、语言、Whisper 模型、截图/LLM/保留媒体开关、LLM provider、步骤/图片上限、审核版开关、Obsidian vault 路径和自动归档策略。
@@ -424,7 +483,7 @@ UI 默认配置会保存到：
 
 点餐台可设置总人数、儿童人数和日常家宴、朋友聚餐、带小孩、清淡家宴等类型。系统根据现有菜谱的分类、标题、标签和完整度推荐荤菜、素菜、汤羹、主食等组合；带儿童时会降低明显辛辣和含酒菜品的优先级，但过敏原和实际忌口仍需人工确认。
 
-本餐中的每道菜可以单独调整份量倍率和备注，页面会生成跨菜品采购汇总并支持下载。组合可保存到 `.bili-recipe-notes/meal-plans.json`，同一套餐可以记录多次实践日期、评分和调整经验；数据迁移包会携带套餐库，方便迁移到另一台服务器。
+本餐中的每道菜可以单独调整份量倍率和备注，页面会生成跨菜品采购汇总并支持下载。组合可保存到 `data/state/meal-plans.json`，同一套餐可以记录多次实践日期、评分和调整经验；数据迁移包会携带套餐库，方便迁移到另一台服务器。
 
 ### 移动烹饪模式
 
@@ -446,7 +505,7 @@ UI 默认配置会保存到：
 Vault 默认结构：
 
 ```text
-obsidian-vault/
+data/exports/obsidian-vault/
 ├── 菜谱/
 │   ├── 中餐/
 │   ├── 汤羹/
@@ -468,13 +527,13 @@ AI 提炼的通用烹饪技巧先标记为“AI 候选”。在知识库中人�
 批量任务状态会保存到：
 
 ```text
-.bili-recipe-notes/batches/
+data/state/batches/
 ```
 
 UP 主全量链接会按 UID 独立保存：
 
 ```text
-outputs/creators/<UID>-<UP名称>/
+data/creators/<UID>-<UP名称>/
 ├── video_links.txt
 └── creator.json
 ```
@@ -505,7 +564,7 @@ Linux 服务器不需要启动 UI。导入交接包：
 ```bash
 python -m bili_recipe_notes \
   --import-handoff /srv/transfer/my-recipes.handoff.zip \
-  --out outputs
+  --out data/recipes
 ```
 
 成功后最后一行会输出 `BATCH_ID=<批次ID>`。查看并继续运行：
@@ -524,7 +583,7 @@ python -m bili_recipe_notes \
 ```bash
 python -m bili_recipe_notes \
   --export-handoff my-recipes \
-  --out outputs \
+  --out data/recipes \
   --handoff-destination /srv/transfer/out
 ```
 
@@ -533,7 +592,7 @@ python -m bili_recipe_notes \
 个人厨艺知识库会保存到：
 
 ```text
-.bili-recipe-notes/knowledge_base.json
+data/state/knowledge_base.json
 ```
 
 知识库独立于单个视频输出目录，用于长期积累从不同视频中提炼出的通用技巧、原理、适用场景和视频依据。
@@ -541,12 +600,12 @@ python -m bili_recipe_notes \
 
 配置、批次、知识库和质量报告采用原子替换写入；覆盖前会把上一版保留为同目录下的 `*.bak`。如果 JSON 已损坏，程序会明确报错并停止覆盖。此时应先检查并恢复对应的 `.bak`，不要用空文件覆盖原数据。
 
-部署包和批次交接包会同时携带 `.bili-recipe-notes/knowledge_base.json`，部署包还会携带固定备份，保证迁移电脑时不会丢失个人烹饪技巧。
+部署包会携带 `data/state/knowledge_base.json` 和固定备份；批次交接包也会携带知识库，保证迁移电脑时不会丢失个人烹饪技巧。
 
 生成和修复后的质量报告会保存到每个菜谱输出目录：
 
 ```text
-outputs/规范菜名--BVID/quality.json
+data/recipes/<UP主>/规范菜名--BVID/quality.json
 ```
 
 ### LLM provider
@@ -585,7 +644,7 @@ UI 中的菜谱预览会把 `note.md` 内的 `images/...` 相对路径解析到�
 
 部分视频需登录态。可将浏览器导出的 Netscape 格式 cookies 保存为 `cookies.txt`，通过 `--cookies` 传入。
 
-本地 UI 的“Bilibili 登录”设置也支持直接从已登录的 Edge 手动导入和刷新。工具只保留 Bilibili 域 Cookie，验证登录成功后保存到 `.bili-recipe-notes/cookies/bilibili-edge.txt`，不会在日志或批次文件中写入 Cookie 内容。
+本地 UI 的“Bilibili 登录”设置也支持直接从已登录的 Edge 手动导入和刷新。工具只保留 Bilibili 域 Cookie，验证登录成功后保存到 `data/state/cookies/bilibili-edge.txt`，不会在日志或批次文件中写入 Cookie 内容。
 
 如果遇到 Bilibili `HTTP Error 412: Precondition Failed`：
 
@@ -598,7 +657,7 @@ UI 中的菜谱预览会把 `note.md` 内的 `images/...` 相对路径解析到�
 ## 输出示例
 
 ```text
-outputs/规范菜名--BVID/
+data/recipes/<UP主>/规范菜名--BVID/
 ├── source.json          # 原视频元数据；原始阶段即生成
 ├── recipe.json
 ├── recipe.review.json   # 开启逐项审核时生成
@@ -619,7 +678,7 @@ outputs/规范菜名--BVID/
 
 - 打 `v*` tag（如 `v0.2.0`）会自动构建 Linux / macOS / Windows 的 CLI 和 UI 可执行文件。
 - 构建后会自动附加到 GitHub Release。
-- Pull Request 会运行测试、语法检查和 CLI 打包启动冒烟测试。
+- Pull Request 会运行 Python 测试、语法检查、CLI 打包启动冒烟测试，以及 Web 锁定依赖安装、构建和同步行为测试。
 - 本地也可手动构建 CLI：`python -m PyInstaller --clean --noconfirm bili-recipe-notes.spec`。
 
 本地 UI 打包脚本：

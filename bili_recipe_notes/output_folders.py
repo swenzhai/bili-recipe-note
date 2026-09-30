@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
-from .config import CONFIG_DIR_NAME
+from .data_paths import state_dir
+from .output_layout import iter_output_folders
 from .storage import atomic_write_bytes, atomic_write_json
 from .utils import build_output_folder_name
 
@@ -54,7 +55,7 @@ def _pid_is_alive(pid: Any) -> bool:
 
 
 def _assert_no_running_batches(project_root: Path) -> None:
-    runtime_root = project_root / CONFIG_DIR_NAME / "batches" / "runtime"
+    runtime_root = state_dir(project_root) / "batches" / "runtime"
     for status_path in runtime_root.glob("*.status.json"):
         status = _read_object(status_path)
         if status.get("status") == "running" and _pid_is_alive(status.get("pid")):
@@ -104,7 +105,7 @@ def plan_output_folder_migration(out_dir: str | Path) -> list[OutputFolderRename
         return []
     plans: list[OutputFolderRename] = []
     targets: dict[Path, Path] = {}
-    for source in sorted(path for path in root.iterdir() if path.is_dir() and path.name != "creators"):
+    for source in iter_output_folders(root):
         target = desired_output_folder(source)
         if target == source:
             continue
@@ -234,7 +235,7 @@ def apply_output_folder_migration(
             job_path = plan.target / "job.json"
             if job_path.is_file() and _rewrite_json_document(job_path, replacements, originals):
                 updated_documents += 1
-        batches_root = root / CONFIG_DIR_NAME / "batches"
+        batches_root = state_dir(root) / "batches"
         for path in sorted(batches_root.glob("*.json")):
             if _rewrite_json_document(path, replacements, originals):
                 updated_documents += 1
@@ -242,7 +243,7 @@ def apply_output_folder_migration(
         for path in sorted(runtime_root.glob("*.result.json")):
             if _rewrite_json_document(path, replacements, originals):
                 updated_documents += 1
-        updated_documents += _update_mobile_database(root / CONFIG_DIR_NAME / "mobile-sync.sqlite3", replacements)
+        updated_documents += _update_mobile_database(state_dir(root) / "mobile-sync.sqlite3", replacements)
     except Exception:
         for path, content in originals.items():
             atomic_write_bytes(path, content, backup=False)
@@ -254,7 +255,7 @@ def apply_output_folder_migration(
     manifest_path = None
     if write_manifest:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        manifest_path = root / CONFIG_DIR_NAME / "migrations" / f"output-folders-{stamp}.json"
+        manifest_path = state_dir(root) / "migrations" / f"output-folders-{stamp}.json"
         atomic_write_json(
             manifest_path,
             {
@@ -318,7 +319,7 @@ def repair_output_folder_references(
             job_path = plan.target / "job.json"
             if job_path.is_file() and _rewrite_json_document(job_path, replacements, originals):
                 updated_documents += 1
-        batches_root = root / CONFIG_DIR_NAME / "batches"
+        batches_root = state_dir(root) / "batches"
         for path in sorted(batches_root.glob("*.json")):
             if _rewrite_json_document(path, replacements, originals):
                 updated_documents += 1
@@ -326,14 +327,14 @@ def repair_output_folder_references(
         for path in sorted(runtime_root.glob("*.result.json")):
             if _rewrite_json_document(path, replacements, originals):
                 updated_documents += 1
-        updated_documents += _update_mobile_database(root / CONFIG_DIR_NAME / "mobile-sync.sqlite3", replacements)
+        updated_documents += _update_mobile_database(state_dir(root) / "mobile-sync.sqlite3", replacements)
     except Exception:
         for path, content in originals.items():
             atomic_write_bytes(path, content, backup=False)
         raise
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    manifest_path = root / CONFIG_DIR_NAME / "migrations" / f"output-folders-{stamp}.json"
+    manifest_path = state_dir(root) / "migrations" / f"output-folders-{stamp}.json"
     atomic_write_json(
         manifest_path,
         {

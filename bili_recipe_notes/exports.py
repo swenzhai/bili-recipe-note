@@ -7,6 +7,8 @@ import sqlite3
 import zipfile
 from pathlib import Path
 
+from .data_paths import state_dir
+
 
 IMAGE_LINE_RE = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)\s*$")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
@@ -216,14 +218,12 @@ def _add_practice_logs_to_bundle(archive: zipfile.ZipFile, folder: Path) -> None
         recipe_id = str(json.loads(metadata_path.read_text(encoding="utf-8")).get("recipe_id") or "")
     except (OSError, UnicodeError, json.JSONDecodeError):
         return
-    database = next(
-        (
-            parent / ".bili-recipe-notes" / "mobile-sync.sqlite3"
-            for parent in [folder.parent, *folder.parents]
-            if (parent / ".bili-recipe-notes" / "mobile-sync.sqlite3").is_file()
-        ),
-        None,
-    )
+    database_candidates = [
+        directory / "mobile-sync.sqlite3"
+        for parent in folder.resolve().parents
+        for directory in (parent / "state", state_dir(parent), parent / ".bili-recipe-notes")
+    ]
+    database = next((path for path in database_candidates if path.is_file()), None)
     if not recipe_id or database is None:
         return
     try:

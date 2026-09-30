@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from uuid import uuid4
 
-from .config import CONFIG_DIR_NAME
+from .data_paths import ensure_data_layout, state_dir
 from .storage import CorruptDataError, atomic_write_json, file_lock, read_json
 
 MEAL_PLANS_SCHEMA_VERSION = 1
@@ -50,8 +50,7 @@ def _now() -> str:
 
 
 def meal_plans_path(project_root: str | Path | None = None) -> Path:
-    root = Path(project_root) if project_root else Path.cwd()
-    return root / CONFIG_DIR_NAME / MEAL_PLANS_FILE_NAME
+    return state_dir(project_root) / MEAL_PLANS_FILE_NAME
 
 
 def _parse_item(value: Any) -> MealPlanItem:
@@ -154,6 +153,7 @@ def save_meal_plan(
     if not 0 <= child_count <= guest_count:
         raise ValueError("儿童人数不能超过用餐人数")
 
+    ensure_data_layout(project_root)
     path = meal_plans_path(project_root)
     with file_lock(path):
         plans = load_meal_plans(project_root)
@@ -189,6 +189,7 @@ def record_meal_plan_practice(
 ) -> MealPlan:
     if rating not in {1, 2, 3, 4, 5}:
         raise ValueError("实践评分必须在 1–5 星之间")
+    ensure_data_layout(project_root)
     path = meal_plans_path(project_root)
     with file_lock(path):
         plans = load_meal_plans(project_root)
@@ -211,6 +212,7 @@ def record_meal_plan_practice(
 
 
 def delete_meal_plan(plan_id: str, project_root: str | Path | None = None) -> bool:
+    ensure_data_layout(project_root)
     path = meal_plans_path(project_root)
     with file_lock(path):
         plans = load_meal_plans(project_root)

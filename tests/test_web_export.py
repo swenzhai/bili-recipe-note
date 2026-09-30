@@ -5,7 +5,10 @@ import json
 from pathlib import Path
 
 from bili_recipe_notes.mobile_sync import MobileSyncStore
-from bili_recipe_notes.review_policy import AI_REVIEW_FILE_NAME, review_recipe_hash, set_ai_review_visibility
+from bili_recipe_notes.review_policy import (
+    AI_REVIEW_FILE_NAME, AI_REVIEW_RULES_VERSION, AI_REVIEW_PROMPT_VERSION,
+    review_recipe_hash, review_input_fingerprint, set_ai_review_visibility,
+)
 from bili_recipe_notes.web_export import build_web_library_payload, export_web_library
 
 
@@ -88,14 +91,21 @@ def test_web_export_omits_ai_hidden_content_and_allows_manual_restore(tmp_path: 
     outputs = tmp_path / "outputs"
     folder = outputs / "demo"
     _write_recipe(folder)
+    (folder / "transcript.json").write_text(json.dumps([{"text": "测试技巧引用"}]), encoding="utf-8")
     (folder / AI_REVIEW_FILE_NAME).write_text(json.dumps({
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "completed",
         "source_recipe_sha256": review_recipe_hash(folder),
+        "input_fingerprint": review_input_fingerprint(folder),
+        "rules_version": AI_REVIEW_RULES_VERSION,
+        "prompt_version": AI_REVIEW_PROMPT_VERSION,
         "classification": "technique",
         "visibility": "hidden",
         "confidence": 0.99,
         "tags": ["烹饪技巧"],
+        "reason": "仅讲技巧",
+        "evidence": [{"text": "测试技巧引用"}],
+        "item_checks": [],
     }), encoding="utf-8")
     destination = tmp_path / "library.json"
 

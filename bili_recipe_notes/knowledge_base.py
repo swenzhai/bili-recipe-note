@@ -9,8 +9,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
-from .config import CONFIG_DIR_NAME
+from .data_paths import ensure_data_layout, exports_dir, relocate_value, state_dir
 from .content_analysis import _recipe_to_context, _read_json, _read_text, _transcript_to_text
 from .llm import clean_llm_markdown_output, complete_markdown_prompt, get_last_llm_error
 from .storage import CorruptDataError, atomic_write_json, atomic_write_text, file_lock, read_json
@@ -94,8 +95,7 @@ class KnowledgeBatchExtractionResult:
 
 
 def knowledge_base_path(project_root: Path | None = None) -> Path:
-    root = project_root or Path.cwd()
-    return root / CONFIG_DIR_NAME / KNOWLEDGE_BASE_FILE_NAME
+    return state_dir(project_root) / KNOWLEDGE_BASE_FILE_NAME
 
 
 def _now() -> str:
@@ -242,11 +242,44 @@ def _load_knowledge_entries_from_path(path: Path) -> list[CookingKnowledgeEntry]
     return entries
 
 
+def _relocate_document_url(value: str, project_root: Path | None) -> str:
+    """Rebase known local document URLs without normalizing other sources."""
+
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value
+    if parsed.scheme != "file":
+        return value
+    source = unquote(parsed.path)
+    if parsed.netloc and parsed.netloc != "localhost":
+        source = f"//{parsed.netloc}{source}"
+    elif re.match(r"^/[A-Za-z]:/", source):
+        source = source[1:]
+    relocated = relocate_value(source, project_root)
+    if relocated == source:
+        return value
+    destination = urlsplit(Path(relocated).as_uri())
+    return destination._replace(query=parsed.query, fragment=parsed.fragment).geturl()
+
+
 def load_knowledge_entries(project_root: Path | None = None) -> list[CookingKnowledgeEntry]:
     path = knowledge_base_path(project_root)
     if not path.exists():
         return []
-    return _load_knowledge_entries_from_path(path)
+    entries = _load_knowledge_entries_from_path(path)
+    for entry in entries:
+        entry.source_url = _relocate_document_url(entry.source_url, project_root)
+        entry.source_output_folder = relocate_value(entry.source_output_folder, project_root)
+        for reference in entry.source_refs:
+            if "url" in reference:
+                reference["url"] = _relocate_document_url(reference["url"], project_root)
+            if "output_folder" in reference:
+                reference["output_folder"] = relocate_value(reference["output_folder"], project_root)
+        for record in entry.practice_records:
+            if "photo_path" in record:
+                record["photo_path"] = relocate_value(record["photo_path"], project_root)
+    return entries
 
 
 def knowledge_quality_issues(entry: CookingKnowledgeEntry) -> list[str]:
@@ -405,6 +438,7 @@ def _write_knowledge_entries(path: Path, entries: list[CookingKnowledgeEntry]) -
 
 
 def save_knowledge_entries(entries: list[CookingKnowledgeEntry], project_root: Path | None = None) -> Path:
+    ensure_data_layout(project_root)
     path = knowledge_base_path(project_root)
     with file_lock(path):
         if path.exists():
@@ -500,6 +534,7 @@ def upsert_knowledge_entries(
     entries: list[CookingKnowledgeEntry],
     project_root: Path | None = None,
 ) -> tuple[Path, int, int]:
+    ensure_data_layout(project_root)
     path = knowledge_base_path(project_root)
     with file_lock(path):
         existing = _load_knowledge_entries_from_path(path) if path.exists() else []
@@ -532,6 +567,7 @@ def upsert_knowledge_entries(
 
 
 def update_knowledge_entry(entry_id: str, updates: dict[str, Any], project_root: Path | None = None) -> CookingKnowledgeEntry:
+    ensure_data_layout(project_root)
     path = knowledge_base_path(project_root)
     with file_lock(path):
         entries = _load_knowledge_entries_from_path(path) if path.exists() else []
@@ -551,6 +587,7 @@ def update_knowledge_entry(entry_id: str, updates: dict[str, Any], project_root:
 
 
 def delete_knowledge_entry(entry_id: str, project_root: Path | None = None) -> Path:
+    ensure_data_layout(project_root)
     path = knowledge_base_path(project_root)
     with file_lock(path):
         entries = _load_knowledge_entries_from_path(path) if path.exists() else []
@@ -567,6 +604,7 @@ def merge_knowledge_entries(
     if primary_id in duplicate_ids:
         raise ValueError("The primary knowledge entry cannot be merged into itself.")
     duplicates = set(duplicate_ids)
+    ensure_data_layout(project_root)
     path = knowledge_base_path(project_root)
     with file_lock(path):
         entries = _load_knowledge_entries_from_path(path) if path.exists() else []
@@ -592,6 +630,7 @@ def record_knowledge_review(entry_id: str, mastery: str, project_root: Path | No
         "需要实践": 1,
         "new": 1,
     }
+    ensure_data_layout(project_root)
     path = knowledge_base_path(project_root)
     with file_lock(path):
         entries = _load_knowledge_entries_from_path(path) if path.exists() else []
@@ -639,6 +678,7 @@ def add_practice_record(
     photo_path: str = "",
     project_root: Path | None = None,
 ) -> CookingKnowledgeEntry:
+    ensure_data_layout(project_root)
     path = knowledge_base_path(project_root)
     with file_lock(path):
         entries = _load_knowledge_entries_from_path(path) if path.exists() else []
@@ -731,8 +771,7 @@ def export_knowledge_base(kind: str = "markdown", category: str = "", project_ro
     entries = load_knowledge_entries(project_root)
     if category.strip():
         entries = [entry for entry in entries if entry.category == category.strip()]
-    root = project_root or Path.cwd()
-    out_dir = root / CONFIG_DIR_NAME
+    out_dir = exports_dir(project_root) / "knowledge"
     out_dir.mkdir(parents=True, exist_ok=True)
     suffix = f"_{_safe_export_suffix(category)}" if category.strip() else ""
     if kind == "anki":

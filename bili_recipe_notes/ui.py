@@ -25,7 +25,8 @@ from streamlit_cropper import st_cropper
 
 try:
     from .ai_review_ui import render_ai_review_page
-    from .review_policy import is_recipe_hidden
+    from .ui_batch_page import BatchPageHelpers, render_batch_page
+    from .ui_edit_page import EditPageHelpers, INGREDIENT_COLUMNS, STEP_COLUMNS, render_edit_page
     from .batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state, selectable_items
     from .batch_runner import (
         get_background_batch_status, pause_background_batch, read_batch_log,
@@ -33,6 +34,7 @@ try:
     )
     from .branding import default_logo_path, remove_logo, save_logo
     from .config import UIConfig, load_config, save_config
+    from .data_paths import creators_dir, data_root
     from .content_analysis import ContentAnalysisOptions, analyze_video_content
     from .cover_policy import MANUALLY_APPROVED_COVER_STATUSES
     from .curation import (
@@ -81,7 +83,7 @@ try:
         write_related_knowledge_to_note,
     )
     from .llm import apply_cli_extra_instructions
-    from .mobile_sync import MobileSyncStore
+    from .mobile_sync import MobileSyncStore, VisibilityStateError, recipe_visibility_states
     from .meal_order_component import render_meal_order_component
     from .meal_plans import (
         MealCandidate,
@@ -140,7 +142,8 @@ try:
     from .web_export import build_web_library_payload, web_library_bytes
 except ImportError:  # pragma: no cover - supports direct streamlit script execution
     from bili_recipe_notes.ai_review_ui import render_ai_review_page
-    from bili_recipe_notes.review_policy import is_recipe_hidden
+    from bili_recipe_notes.ui_batch_page import BatchPageHelpers, render_batch_page
+    from bili_recipe_notes.ui_edit_page import EditPageHelpers, INGREDIENT_COLUMNS, STEP_COLUMNS, render_edit_page
     from bili_recipe_notes.batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state, selectable_items
     from bili_recipe_notes.batch_runner import (
         get_background_batch_status, pause_background_batch, read_batch_log,
@@ -148,6 +151,7 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
     )
     from bili_recipe_notes.branding import default_logo_path, remove_logo, save_logo
     from bili_recipe_notes.config import UIConfig, load_config, save_config
+    from bili_recipe_notes.data_paths import creators_dir, data_root
     from bili_recipe_notes.content_analysis import ContentAnalysisOptions, analyze_video_content
     from bili_recipe_notes.cover_policy import MANUALLY_APPROVED_COVER_STATUSES
     from bili_recipe_notes.curation import (
@@ -196,7 +200,7 @@ except ImportError:  # pragma: no cover - supports direct streamlit script execu
         write_related_knowledge_to_note,
     )
     from bili_recipe_notes.llm import apply_cli_extra_instructions
-    from bili_recipe_notes.mobile_sync import MobileSyncStore
+    from bili_recipe_notes.mobile_sync import MobileSyncStore, VisibilityStateError, recipe_visibility_states
     from bili_recipe_notes.meal_order_component import render_meal_order_component
     from bili_recipe_notes.meal_plans import (
         MealCandidate,
@@ -305,17 +309,6 @@ EXPORT_MIME_TYPES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".zip": "application/zip",
 }
-INGREDIENT_COLUMNS = ("name", "amount", "note")
-STEP_COLUMNS = (
-    "title",
-    "start_time",
-    "end_time",
-    "action",
-    "heat",
-    "duration",
-    "tips",
-    "screenshot_path",
-)
 FLASH_STATE_KEY = "_ui_flash_message"
 LARGE_TABLE_PAGE_SIZE = 50
 CURATION_DECISION_LABELS = {
@@ -519,7 +512,8 @@ def _merge_editor_rows(value: Any, columns: Iterable[str], originals: Any) -> li
 
 def _saved_creator_link_documents(out_dir: str | Path) -> list[Path]:
     root = Path(out_dir).expanduser()
-    documents = [path for path in (root / "creators").glob("*/video_links.txt") if path.is_file()]
+    directories = {creators_dir(), root / "creators"}
+    documents = {path.resolve() for directory in directories for path in directory.glob("*/video_links.txt") if path.is_file()}
     return sorted(documents, key=lambda path: path.stat().st_mtime, reverse=True)
 
 
@@ -980,7 +974,12 @@ def _open_folder(path: Path) -> None:
 
 
 def _history_options(items: list[HistoryItem]) -> dict[str, HistoryItem]:
-    return {f"{item.title} | {item.output_folder.name}": item for item in items}
+    labels = [f"{item.title} | {item.output_folder.name}" for item in items]
+    counts = Counter(labels)
+    return {
+        label if counts[label] == 1 else f"{item.title} | {item.output_folder}": item
+        for label, item in zip(labels, items)
+    }
 
 
 def _select_history_item(st, label: str, options: dict[str, HistoryItem], key: str) -> HistoryItem:
@@ -1262,6 +1261,7 @@ def _display_quality(st, output_folder: Path) -> None:
 def _render_sidebar(st, config: UIConfig) -> UIConfig:
     st.sidebar.subheader("运行配置")
     with st.sidebar.expander("文件与登录", expanded=False):
+        st.caption(f"数据目录：{data_root()}")
         config.out_dir = st.text_input("输出目录", value=config.out_dir)
         st.markdown("##### Bilibili 登录")
         config.cookies = _optional_text(st.text_input("cookies 文件路径", value=config.cookies or ""))
@@ -1709,12 +1709,25 @@ def _render_cooking_tips_column(st, config: UIConfig) -> None:
                 st.warning("质量提醒：" + "、".join(issues))
 
 
+def _visible_history_items(items: list[HistoryItem], config: UIConfig, *, menu: bool = False, st: Any = None) -> list[HistoryItem]:
+    """Use the same content decisions as mobile sync without creating a database."""
+    try:
+        states = recipe_visibility_states(config.out_dir, folders=[item.output_folder for item in items])
+    except VisibilityStateError as exc:
+        if st is None:
+            raise
+        st.error(f"暂时无法确认菜谱展示状态，请恢复同步数据库后刷新：{exc}")
+        st.stop()
+    field = "visible" if menu else "content_visible"
+    return [item for item in items if states.get(str(item.output_folder.resolve()), {}).get(field, True)]
+
+
 def _render_library_overview(st, config: UIConfig) -> None:
     st.subheader("菜谱库全览")
     st.caption("查看当前菜谱库的规模、分类、菜系和标签分布；统计只读取现有菜谱，不会修改文件。")
     items = [item for item in scan_history(config.out_dir) if item.recipe_path]
-    if not st.checkbox("包含 AI 审核后隐藏的内容", key="overview_include_hidden"):
-        items = [item for item in items if not is_recipe_hidden(item.output_folder)]
+    if not st.checkbox("包含已隐藏的内容", key="overview_include_hidden"):
+        items = _visible_history_items(items, config, st=st)
     if not items:
         st.info("菜谱库还是空的。生成或导入菜谱后，这里会自动形成统计图表。")
         return
@@ -1860,8 +1873,8 @@ def _render_recipe_detail(st, config: UIConfig) -> None:
     st.subheader("菜谱详情")
     st.caption("完整只读查看一条菜谱；用料、备菜、全部步骤和关键提示集中在同一页。")
     available = [item for item in scan_history(config.out_dir) if item.recipe_path]
-    if not st.checkbox("包含 AI 审核后隐藏的内容", key="detail_include_hidden"):
-        available = [item for item in available if not is_recipe_hidden(item.output_folder)]
+    if not st.checkbox("包含已隐藏的内容", key="detail_include_hidden"):
+        available = _visible_history_items(available, config, st=st)
     if not available:
         st.info("还没有可查看的菜谱。请先生成或导入一条菜谱。")
         return
@@ -2114,10 +2127,9 @@ def _render_restaurant_meal_ui(st, config: UIConfig) -> None:
     if st.button("← 返回管理界面", key="meal_return_main"):
         _close_meal_mode(st)
 
-    available = [
-        item for item in scan_history(config.out_dir)
-        if item.recipe_path and not is_recipe_hidden(item.output_folder)
-    ]
+    available = _visible_history_items(
+        [item for item in scan_history(config.out_dir) if item.recipe_path], config, menu=True, st=st,
+    )
     if not available:
         st.info("菜谱库还是空的。请先生成或导入菜谱。")
         return
@@ -2548,10 +2560,9 @@ def _render_cooking_mode(st, config: UIConfig) -> None:
         unsafe_allow_html=True,
     )
 
-    available = [
-        item for item in scan_history(config.out_dir)
-        if item.recipe_path and not is_recipe_hidden(item.output_folder)
-    ]
+    available = _visible_history_items(
+        [item for item in scan_history(config.out_dir) if item.recipe_path], config, menu=False, st=st,
+    )
     if not available:
         st.info("还没有可用于烹饪模式的菜谱。请先生成或导入一条菜谱。")
         return
@@ -3259,8 +3270,11 @@ def _render_quick_recipe_review(st, config: UIConfig) -> None:
     st.subheader("快速审核")
     st.caption(
         "一条内容从左到右完成：确认是否为菜谱 → 修正菜名与分类 → 选择并裁剪成品图。"
-        "确认封面或选择暂时留空后，会自动进入下一条。"
+        "确认封面或选择暂时留空后，会自动进入下一条。这里的进度仅统计封面确认。"
     )
+    if st.button("查看 AI 内容审核", key="quick_review_ai_audit"):
+        st.session_state["_next_page"] = "AI 审核归类"
+        st.rerun()
     try:
         store = MobileSyncStore(Path.cwd(), out_dir=config.out_dir)
         store.index_recipes()
@@ -3278,11 +3292,11 @@ def _render_quick_recipe_review(st, config: UIConfig) -> None:
     ]
     metrics = st.columns(3)
     metrics[0].metric("总数", len(reviews))
-    metrics[1].metric("已完成", len(reviews) - len(pending))
-    metrics[2].metric("待处理", len(pending))
+    metrics[1].metric("封面已确认", len(reviews) - len(pending))
+    metrics[2].metric("封面待确认", len(pending))
     st.progress(
         (len(reviews) - len(pending)) / len(reviews),
-        text=f"快速审核进度 {len(reviews) - len(pending)}/{len(reviews)}",
+        text=f"封面确认进度 {len(reviews) - len(pending)}/{len(reviews)}",
     )
 
     status_filter = st.radio(
@@ -3293,7 +3307,7 @@ def _render_quick_recipe_review(st, config: UIConfig) -> None:
     )
     visible = pending if status_filter == "待处理" else reviews
     if not visible:
-        st.success("所有菜谱都已完成快速审核。可切换到“全部”重新修改。")
+        st.success("所有菜谱都已完成封面确认。可切换到“全部”重新修改；内容与字幕依据的审核状态请查看“AI 审核归类”。")
         return
     visible_ids = [str(item["id"]) for item in visible]
     preferred_folder = st.session_state.pop("_quick_review_preferred_folder", None)
@@ -3548,6 +3562,16 @@ def _render_mobile_client_admin(st, config: UIConfig) -> None:
         with urlopen("http://127.0.0.1:8765/api/v1/health", timeout=0.8) as response:  # noqa: S310
             health = json.load(response)
         st.success(f"同步 API 正常 · 协议 v{health.get('protocol_version', '?')}")
+        indexing = health.get("indexing") or {}
+        if indexing.get("last_success"):
+            st.caption(f"菜谱索引最近成功同步：{indexing['last_success']}")
+        if indexing.get("status") == "degraded":
+            st.warning(
+                f"菜谱索引暂时失败，已连续失败 {indexing.get('consecutive_failures', 0)} 次；"
+                f"将在 {indexing.get('next_retry_seconds', 0):g} 秒后自动重试。"
+            )
+            if indexing.get("last_error"):
+                st.caption(str(indexing["last_error"]))
     except Exception:  # noqa: BLE001
         st.warning(
             "同步 API 当前不可访问；请使用对应系统的一键启动器（Linux: start-ui-linux.sh；"
@@ -4500,15 +4524,20 @@ def main() -> None:
         if last_generated and (last_generated / "recipe.json").is_file():
             st.markdown("#### 下一步")
             st.caption("当前结果已进入草稿箱；可以先完整编辑、逐项审核，也可以不修改直接归档。")
-            col_detail, col_edit, col_review, col_drafts = st.columns(4)
+            col_detail, col_ai_review, col_edit, col_review, col_drafts = st.columns(5)
             with col_detail:
                 if st.button("查看完整菜谱", key="generated_go_detail"):
                     _navigate_to_record(st, "菜谱详情", last_generated)
+            with col_ai_review:
+                if st.button("AI 审核归类", key="generated_go_ai_review"):
+                    st.session_state["_ai_review_focus_folder"] = str(last_generated.resolve())
+                    st.session_state["_next_page"] = "AI 审核归类"
+                    st.rerun()
             with col_edit:
                 if st.button("编辑完整菜谱", key="generated_go_edit"):
                     _navigate_to_record(st, "编辑修复", last_generated)
             with col_review:
-                if st.button("逐项审核 AI 结果", key="generated_go_review"):
+                if st.button("人工核对用料与步骤", key="generated_go_review"):
                     _navigate_to_record(st, "审核确认", last_generated)
             with col_drafts:
                 if st.button("查看草稿与归档", key="generated_go_drafts"):
@@ -4792,462 +4821,27 @@ def main() -> None:
         _render_curation_review(st, config)
 
     if active_page == "批量处理":
-        st.subheader("批量处理")
-        try:
-            batch_source_store = MobileSyncStore(Path.cwd(), out_dir=config.out_dir)
-        except Exception as exc:  # noqa: BLE001
-            batch_source_store = None
-            st.warning(f"视频来源分类数据库暂不可用：{_clean_error(exc)}")
-        if st.button("打开后台任务仪表盘", type="primary", key="batch_open_dashboard"):
-            st.session_state["_next_page"] = "任务仪表盘"
-            st.rerun()
-        saved_link_documents = _saved_creator_link_documents(config.out_dir)
-        saved_link_options = [""] + [str(path) for path in saved_link_documents]
-        if st.session_state.get("batch_saved_creator_links") not in saved_link_options:
-            st.session_state["batch_saved_creator_links"] = saved_link_options[1] if saved_link_documents else ""
-        selected_saved_links = st.selectbox(
-            "已保存的 UP 主链接清单",
-            saved_link_options,
-            format_func=_creator_link_document_label,
-            key="batch_saved_creator_links",
-            help="默认选择最近一次抓取的 UP 主清单；创建新批次时会直接读取，不需要粘贴 URL。",
-        )
-        if selected_saved_links:
-            selected_count = len(_load_batch_urls("", "", selected_saved_links))
-            st.success(f"已导入最近保存的链接清单，共 {selected_count} 条。")
-        elif not saved_link_documents:
-            st.info("还没有已保存的 UP 主链接清单；可先到“UP 主链接”页面抓取，或在下面手动输入。")
-        with st.expander("手动添加 URL 或导入其他文件（可选）", expanded=not bool(selected_saved_links)):
-            links_text = st.text_area("视频 URL，每行一个", height=180)
-            links_file = st.text_input("其他链接文件路径", placeholder="outputs/creator_video_links.txt")
-        suggested_creator_name = _creator_name_from_document(selected_saved_links)
-        creator_name_input = st.text_input(
-            "本批次 UP 主名称（选填）",
-            placeholder=f"留空则使用视频信息{f'，当前识别为：{suggested_creator_name}' if suggested_creator_name else ''}",
-            help="用于统一同一位 UP 主的名称，并随菜谱写入数据库；不会覆盖视频原始作者字段。",
-        )
-        batch_creator_name = creator_name_input.strip() or suggested_creator_name
-        target_label = st.radio(
-            "运行到目标阶段",
-            ["仅形成原始版", "生成完整菜谱版"],
-            horizontal=True,
-            help="完整菜谱版会自动补齐缺失的原始版；已有原始版不会重复抓字幕。",
-        )
-        target_stage = "raw" if target_label == "仅形成原始版" else "recipe"
-        skip_existing = st.checkbox("已生成则跳过", value=True)
-        st.caption("批量任务在独立后台进程中运行并持续保存进度；刷新页面、关闭浏览器或重启 UI 后仍可恢复查看。")
-        try:
-            batch_states = list_batch_states()
-        except Exception as exc:  # noqa: BLE001
-            cached_states = st.session_state.get("_batch_states_cache")
-            batch_states = cached_states if isinstance(cached_states, list) else []
-            if batch_states:
-                st.warning(f"本次读取批次状态失败，暂时显示上次成功读取的数据：{_clean_error(exc)}")
-            else:
-                st.error(f"读取批次状态失败：{_clean_error(exc)}")
-        else:
-            st.session_state["_batch_states_cache"] = batch_states
-        batch_by_id = {state.batch_id: state for state in batch_states}
-        runtime_by_id = {
-            state.batch_id: get_background_batch_status(state.batch_id)
-            for state in batch_states
-        }
-        running_batch_ids = [
-            state.batch_id
-            for state in batch_states
-            if runtime_by_id.get(state.batch_id) and runtime_by_id[state.batch_id].status == "running"
-        ]
-        active_batch_ids = [
-            state.batch_id
-            for state in batch_states
-            if runtime_by_id.get(state.batch_id) and runtime_by_id[state.batch_id].status in {"running", "paused"}
-        ]
-        if running_batch_ids:
-            st.success("正在运行的批次：" + "、".join(running_batch_ids))
-        paused_batch_ids = [batch_id for batch_id in active_batch_ids if batch_id not in running_batch_ids]
-        if paused_batch_ids:
-            st.info("已暂停的批次：" + "、".join(paused_batch_ids))
-        overlapping_running_pairs = []
-        for index, batch_id in enumerate(running_batch_ids):
-            left = batch_by_id[batch_id]
-            left_urls = {item.url for item in left.items}
-            for other_id in running_batch_ids[index + 1 :]:
-                right = batch_by_id[other_id]
-                overlap = len(left_urls.intersection(item.url for item in right.items))
-                if overlap:
-                    overlapping_running_pairs.append(f"{batch_id} 与 {other_id} 重复 {overlap} 条")
-        if overlapping_running_pairs:
-            st.warning(
-                "检测到同时运行的批次包含重复链接，可能争用同一输出目录："
-                + "；".join(overlapping_running_pairs)
-                + "。请先观察现有任务，不要再次启动相同批次。"
-            )
-        next_batch_select = st.session_state.pop("_next_batch_select", None)
-        preferred_batch_id = _preferred_batch_id(
-            batch_states,
-            runtime_by_id,
-            str(next_batch_select) if next_batch_select else None,
-            str(st.session_state.get("batch_select") or ""),
-        )
-        if preferred_batch_id:
-            st.session_state["batch_select"] = preferred_batch_id
-        else:
-            st.session_state.pop("batch_select", None)
-
-        def batch_label(value: str) -> str:
-            state = batch_by_id.get(value)
-            if state:
-                summary = _batch_progress_summary(state)
-                runtime = runtime_by_id.get(value)
-                runtime_label = {
-                    "running": "运行中",
-                    "paused": "已暂停",
-                    "done": "已完成",
-                    "done_with_errors": "完成但有失败",
-                    "failed": "后台失败",
-                    "stopped": "已停止（可继续）",
-                }.get(runtime.status, runtime.status) if runtime else "历史批次"
-                return (
-                    f"{value} | {runtime_label} | {summary['completed']}/{summary['total']} 已完成"
-                    f" | {summary['failed']} 失败"
-                )
-            return value
-
-        if batch_by_id:
-            selected_batch_value = st.selectbox(
-                "已有批次",
-                list(batch_by_id),
-                format_func=batch_label,
-                key="batch_select",
-            )
-            selected_batch_id = str(selected_batch_value).split(" | ", 1)[0]
-        else:
-            selected_batch_id = None
-            st.info("还没有持久化批次。创建后即使刷新或重启网页，也会自动显示最新运行状态。")
-
-        selected_runtime = runtime_by_id.get(selected_batch_id)
-        selected_active = bool(selected_runtime and selected_runtime.status in {"running", "paused"})
-        if selected_batch_id:
-            _render_batch_pause_control(st, selected_batch_id, selected_runtime, key_prefix="batch")
-
-        col_new, col_resume, col_retry = st.columns(3)
-        run_mode = None
-        with col_new:
-            if st.button("创建新批次并运行", type="primary"):
-                run_mode = "new-queue"
-        with col_resume:
-            if st.button("继续未完成", disabled=not selected_batch_id or selected_active):
-                run_mode = "resume-unfinished"
-        with col_retry:
-            if st.button("只重试失败", disabled=not selected_batch_id or selected_active):
-                run_mode = "retry-failed"
-
-        if st.button("开始批量生成", type="primary"):
-            run_mode = "new-direct"
-
-        if run_mode:
-            try:
-                if run_mode in {"resume-unfinished", "retry-failed"} and selected_batch_id:
-                    urls = []
-                else:
-                    urls = _load_batch_urls(links_text, links_file, selected_saved_links)
-                    if batch_source_store is not None:
-                        known_non_recipes = batch_source_store.known_non_recipe_urls(urls)
-                        if known_non_recipes:
-                            urls = [url for url in urls if url not in known_non_recipes]
-                            st.warning(
-                                f"已自动排除 {len(known_non_recipes)} 条曾标记为非菜谱的视频，不会重复处理。"
-                            )
-                if not urls and run_mode not in {"resume-unfinished", "retry-failed"}:
-                    raise ValueError("没有可处理的视频；请添加链接，或检查它们是否已归类为非菜谱。")
-                if run_mode in {"resume-unfinished", "retry-failed"} and selected_batch_id:
-                    selected_urls = [
-                        item.url for item in selectable_items(batch_by_id[selected_batch_id], run_mode, target_stage)
-                    ]
-                    _check_batch_overlaps(selected_urls, active_batch_ids, batch_by_id, exclude=selected_batch_id)
-                else:
-                    _check_batch_overlaps(urls, active_batch_ids, batch_by_id)
-
-                save_config(config)
-                batch_id: str | None = None
-                resume_mode = "new"
-                if run_mode in {"new-queue", "new-direct"}:
-                    batch_id = create_batch_id()
-                elif run_mode in {"resume-unfinished", "retry-failed"}:
-                    batch_id = selected_batch_id
-                    resume_mode = run_mode
-                options = BatchJobOptions(
-                    urls=urls,
-                    cookies=_optional_text(config.cookies),
-                    out=config.out_dir,
-                    no_screenshot=not config.enable_screenshot,
-                    whisper_model=config.whisper_model,
-                    language=config.language,
-                    keep_media=config.keep_media,
-                    no_llm_summary=not config.enable_llm_summary or config.llm_provider == "none",
-                    llm_provider=config.llm_provider,
-                    openai_model=config.openai_model,
-                    local_llm_command=config.local_llm_command,
-                    codex_model=config.codex_model,
-                    codex_profile=config.codex_profile,
-                    llm_cli_extra_instructions=config.llm_cli_extra_instructions,
-                    max_recipe_steps=config.max_recipe_steps,
-                    max_step_images=config.max_step_images,
-                    enable_recipe_review=config.enable_recipe_review,
-                    skip_existing=skip_existing,
-                    batch_id=batch_id,
-                    resume_mode=resume_mode,
-                    target_stage=target_stage,
-                    creator_name=batch_creator_name or None,
-                    source_database_path=str(batch_source_store.database_path) if batch_source_store else None,
-                )
-                if run_mode in {"new-queue", "new-direct"}:
-                    options_snapshot = {key: value for key, value in options.__dict__.items() if key != "urls"}
-                    create_batch_state(urls, options_snapshot, batch_id=batch_id)
-                    options.urls = []
-                    options.resume_mode = "resume-unfinished"
-
-                def post_process(result) -> None:
-                    if not config.auto_archive_after_generation:
-                        return
-                    completed_folders = [
-                        item.output_folder for item in result.items if item.output_folder and item.status == "done"
-                    ]
-                    if completed_folders:
-                        archive_recipe_batch(completed_folders, _vault_path(config))
-                        if config.archive_knowledge_with_recipe:
-                            _archive_approved_knowledge(config)
-
-                background = start_background_batch(options, on_complete=post_process)
-            except Exception as exc:  # noqa: BLE001 - batch failures must not take down the UI
-                st.error(f"批量处理失败：{_clean_error(exc)}")
-            else:
-                st.session_state["_next_batch_select"] = batch_id
-                _rerun_with_notice(st, f"批次已在后台启动：{background.batch_id}")
-
-        if selected_batch_id:
-            selected_state = batch_by_id.get(selected_batch_id)
-            if selected_state:
-                st.markdown("#### 批次状态")
-                background = runtime_by_id.get(selected_batch_id)
-                if background:
-                    status_text = {
-                        "running": "后台运行中",
-                        "paused": "后台已暂停（点击“继续任务”接着处理）",
-                        "done": "后台运行完成",
-                        "done_with_errors": "后台运行完成（有失败项）",
-                        "failed": "后台运行失败",
-                        "stopped": "后台已停止（可继续未完成项）",
-                    }.get(background.status, background.status)
-                    st.info(f"{status_text}；启动时间：{background.started_at}")
-                    if background.error:
-                        st.error(f"后台状态：{background.error}")
-                summary = _batch_progress_summary(selected_state)
-                progress_columns = st.columns(5)
-                progress_columns[0].metric("总数", summary["total"])
-                progress_columns[1].metric("已完成", summary["completed"])
-                progress_columns[2].metric(
-                    "暂停中" if background and background.status == "paused" else "执行中", summary["running"]
-                )
-                progress_columns[3].metric("待处理", summary["pending"])
-                progress_columns[4].metric("失败", summary["failed"])
-                st.progress(
-                    summary["completed"] / summary["total"] if summary["total"] else 1.0,
-                    text=f"完成进度 {summary['completed']}/{summary['total']}",
-                )
-                if st.button("刷新批次进度", key=f"refresh_batch_{selected_batch_id}"):
-                    st.session_state["_next_batch_select"] = selected_batch_id
-                    st.rerun()
-                visible_batch_items, _ = _paged_values(
-                    st,
-                    selected_state.items,
-                    key=f"batch_table_page_{selected_batch_id}",
-                )
-                st.dataframe([_batch_item_row(item) for item in visible_batch_items], width="stretch")
-                markable_items = [
-                    item for item in selected_state.items
-                    if item.status not in {"raw_running", "recipe_running", "running", "non_recipe", "technique"}
-                ]
-                if markable_items and batch_source_store is not None:
-                    with st.expander("归类来源：非菜谱或烹饪技巧"):
-                        st.caption(
-                            "两类来源都会保留并从点餐菜单移除；烹饪技巧视频可在知识库页面继续提取和沉淀学习内容。"
-                        )
-                        source_classification = st.radio(
-                            "归类类型",
-                            ["non_recipe", "technique"],
-                            format_func={
-                                "non_recipe": "非菜谱 / 广告 / 无用信息",
-                                "technique": "烹饪技巧 / 学习资料",
-                            }.get,
-                            horizontal=True,
-                            key=f"batch_source_classification_{selected_batch_id}",
-                        )
-                        non_recipe_urls = st.multiselect(
-                            "选择视频",
-                            [item.url for item in markable_items],
-                            key=f"batch_classification_urls_{selected_batch_id}",
-                        )
-                        if st.button(
-                            "确认归类",
-                            disabled=not non_recipe_urls,
-                            key=f"batch_mark_source_{selected_batch_id}",
-                        ):
-                            creator = str(selected_state.options.get("creator_name") or "").strip() or None
-                            batch_source_store.set_video_classifications(
-                                non_recipe_urls,
-                                source_classification,
-                                creator_name=creator,
-                                batch_id=selected_batch_id,
-                            )
-                            stamp = datetime.now(timezone.utc).isoformat()
-                            selected_urls = set(non_recipe_urls)
-                            for item in selected_state.items:
-                                if item.url not in selected_urls:
-                                    continue
-                                item.status = source_classification
-                                item.error = (
-                                    "人工归类为烹饪技巧"
-                                    if source_classification == "technique"
-                                    else "人工归类为非菜谱"
-                                )
-                                item.finished_at = stamp
-                                for stage in item.stages.values():
-                                    stage.status = "done"
-                                    stage.error = None
-                                    stage.finished_at = stamp
-                            save_batch_state(selected_state)
-                            batch_source_store.index_recipes()
-                            _rerun_with_notice(
-                                st,
-                                f"已将 {len(non_recipe_urls)} 条视频归类为"
-                                f"{'烹饪技巧学习资料' if source_classification == 'technique' else '非菜谱'}，"
-                                "并从点餐菜单中移除。",
-                            )
-                batch_log = read_batch_log(selected_batch_id)
-                if batch_log:
-                    st.text_area("后台运行日志（最新）", value=batch_log, height=220, disabled=True)
-                completed_batch_items = [
-                    item
-                    for item in selected_state.items
-                    if item.status in {"done", "skipped"}
-                    and item.output_folder
-                    and (Path(item.output_folder) / "recipe.json").is_file()
-                ]
-                if completed_batch_items:
-                    st.markdown("#### 批量结果后处理")
-                    st.caption("每条结果都是独立草稿，可以逐条编辑、审核或归档；批量生成不会锁死后续修改。")
-                    if st.button("AI 逐项审核本批次", key=f"batch_ai_review_{selected_state.batch_id}"):
-                        st.session_state["_ai_review_scope_folders"] = [
-                            str(Path(item.output_folder).resolve()) for item in completed_batch_items
-                        ]
-                        st.session_state["_next_page"] = "AI 审核归类"
-                        st.rerun()
-                    batch_item_labels = {
-                        f"{Path(item.output_folder).name} | {item.status}": item for item in completed_batch_items
-                    }
-                    batch_item = batch_item_labels[
-                        st.selectbox("选择一条结果", list(batch_item_labels), key=f"batch_post_{selected_state.batch_id}")
-                    ]
-                    batch_folder = Path(str(batch_item.output_folder))
-                    force_batch_overwrite = st.checkbox(
-                        "确认覆盖 Vault 中这条笔记的手写修改",
-                        key=f"batch_force_archive_{selected_state.batch_id}",
-                    )
-                    batch_ratings = _render_rating_controls(
-                        st,
-                        batch_folder / "recipe.json",
-                        key_prefix=f"batch_{selected_state.batch_id}_{_record_key(batch_folder)}_rating_",
-                    )
-                    col_detail, col_quick, col_edit, col_review, col_archive = st.columns(5)
-                    with col_detail:
-                        if st.button("查看这条", key=f"batch_detail_{selected_state.batch_id}"):
-                            _navigate_to_record(st, "菜谱详情", batch_folder)
-                    with col_quick:
-                        if st.button("快速审核", key=f"batch_quick_{selected_state.batch_id}"):
-                            st.session_state["_quick_review_preferred_folder"] = str(batch_folder)
-                            st.session_state["_next_page"] = "快速审核"
-                            st.rerun()
-                    with col_edit:
-                        if st.button("编辑这条", key=f"batch_edit_{selected_state.batch_id}"):
-                            _navigate_to_record(st, "编辑修复", batch_folder)
-                    with col_review:
-                        if st.button("审核这条", key=f"batch_review_{selected_state.batch_id}"):
-                            _navigate_to_record(st, "审核确认", batch_folder)
-                    with col_archive:
-                        if st.button("直接归档这条", type="primary", key=f"batch_archive_{selected_state.batch_id}"):
-                            try:
-                                archived, archived_knowledge, knowledge_error = _archive_output(
-                                    batch_folder,
-                                    config,
-                                    overwrite=force_batch_overwrite,
-                                    ratings=batch_ratings,
-                                )
-                            except Exception as exc:  # noqa: BLE001
-                                st.error(f"归档失败：{_clean_error(exc)}")
-                            else:
-                                message = f"已归档：{archived.note_path}"
-                                if knowledge_error:
-                                    message += f"；技巧同步失败：{_clean_error(knowledge_error)}"
-                                _rerun_with_notice(st, message)
-                    if st.button("归档本批次全部已完成草稿", key=f"batch_archive_all_{selected_state.batch_id}"):
-                        folders = [Path(str(item.output_folder)) for item in completed_batch_items]
-                        archived_batch = archive_recipe_batch(
-                            folders,
-                            _vault_path(config),
-                            conflict="overwrite" if force_batch_overwrite else "update",
-                        )
-                        knowledge_results, knowledge_error = (
-                            _archive_approved_knowledge(config, overwrite=force_batch_overwrite)
-                            if config.archive_knowledge_with_recipe
-                            else ((), None)
-                        )
-                        knowledge_message = f"；同步 {len(knowledge_results)} 条技巧" if knowledge_results else ""
-                        if knowledge_error:
-                            knowledge_message += f"；技巧同步失败：{_clean_error(knowledge_error)}"
-                        _rerun_with_notice(
-                            st,
-                            f"批量归档完成：成功 {archived_batch.archived_count}，"
-                            f"跳过 {archived_batch.skipped_count}，失败 {archived_batch.failed_count}"
-                            f"{knowledge_message}。",
-                        )
-
-        if batch_source_store is not None:
-            excluded_sources = [
-                item
-                for item in batch_source_store.list_video_sources()
-                if item.get("classification") in {"non_recipe", "technique"}
-            ]
-            if excluded_sources:
-                with st.expander(f"已归档的非菜谱/烹饪技巧来源（{len(excluded_sources)}）"):
-                    st.caption("这里保留来源去重记录；烹饪技巧可前往知识库提取干货，误判时可恢复为菜谱。")
-                    st.dataframe(
-                        [
-                            {
-                                "UP 主": item.get("creator_name") or "",
-                                "视频": item.get("title") or item.get("source_url") or "",
-                                "来源": item.get("source_url") or "",
-                                "归类": "烹饪技巧" if item.get("classification") == "technique" else "非菜谱",
-                                "更新时间": item.get("updated_at") or "",
-                            }
-                            for item in excluded_sources[:200]
-                        ],
-                        hide_index=True,
-                        width="stretch",
-                    )
-                    restore_urls = st.multiselect(
-                        "恢复为菜谱来源",
-                        [str(item["source_url"]) for item in excluded_sources],
-                        key="batch_restore_excluded_urls",
-                    )
-                    if st.button(
-                        "恢复所选来源",
-                        disabled=not restore_urls,
-                        key="batch_restore_excluded",
-                    ):
-                        batch_source_store.set_video_classifications(restore_urls, "recipe")
-                        batch_source_store.index_recipes()
-                        _rerun_with_notice(st, f"已恢复 {len(restore_urls)} 条来源，可重新加入批处理。")
+        render_batch_page(st, config, BatchPageHelpers(
+            archive_approved_knowledge=_archive_approved_knowledge,
+            archive_output=_archive_output,
+            batch_item_row=_batch_item_row,
+            batch_progress_summary=_batch_progress_summary,
+            check_batch_overlaps=_check_batch_overlaps,
+            clean_error=_clean_error,
+            creator_link_document_label=_creator_link_document_label,
+            creator_name_from_document=_creator_name_from_document,
+            load_batch_urls=_load_batch_urls,
+            navigate_to_record=_navigate_to_record,
+            optional_text=_optional_text,
+            paged_values=_paged_values,
+            preferred_batch_id=_preferred_batch_id,
+            record_key=_record_key,
+            render_batch_pause_control=_render_batch_pause_control,
+            render_rating_controls=_render_rating_controls,
+            rerun_with_notice=_rerun_with_notice,
+            saved_creator_link_documents=_saved_creator_link_documents,
+            vault_path=_vault_path,
+        ))
 
     if active_page == "工作交接":
         st.subheader("两台电脑工作交接")
@@ -5397,546 +4991,30 @@ def main() -> None:
                     st.rerun()
 
     if active_page == "编辑修复":
-        st.subheader("编辑与修复")
-        items = scan_history(config.out_dir)
-        editable = [item for item in items if item.recipe_path]
-        if not editable:
-            st.info("没有可编辑的菜谱。")
-        else:
-            edit_options = _history_options(editable)
-            selected = _select_history_item(st, "选择菜谱", edit_options, "edit_select")
-            record_key = _record_key(selected.output_folder)
-            state_prefix = f"edit_{record_key}_"
-            st.markdown("#### 质量报告")
-            _display_quality(st, selected.output_folder)
-            confirm_overwrite = st.checkbox(
-                "确认覆盖当前记录的已有文件",
-                key=f"{state_prefix}confirm_overwrite",
-            )
-            st.caption("优化、重写、保存、重新抽取和截图都会覆盖已有文件；每次操作前会创建带时间戳的备份。")
-            if st.button(
-                "一键优化当前笔记",
-                disabled=not selected.note_path or not confirm_overwrite,
-                key=f"{state_prefix}optimize",
-            ):
-                try:
-                    backups = _backup_files([selected.note_path], "optimize")
-                    optimized = optimize_existing_note(selected.output_folder, _optimize_options(config))
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"优化失败：{_clean_error(exc)}")
-                else:
-                    _rerun_with_notice(
-                        st,
-                        f"优化完成：{optimized.quality_before.score} -> {optimized.quality_after.score}"
-                        f"{_backup_summary(backups)}",
-                        clear_prefix=f"{state_prefix}confirm_",
-                    )
-            if st.button(
-                "仅重写当前 note.md（不下载视频）",
-                disabled=not selected.recipe_path or not confirm_overwrite,
-                key=f"{state_prefix}rewrite_note",
-            ):
-                try:
-                    backups = _backup_files([selected.note_path], "rewrite")
-                    result = regenerate_note_from_recipe(selected.output_folder, **_regenerate_note_kwargs(config))
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"重写失败：{_clean_error(exc)}")
-                else:
-                    message = f"已重写：{result.note_path}{_backup_summary(backups)}"
-                    if result.stage_errors:
-                        message += f"；提示：{'；'.join(result.stage_errors)}"
-                    _rerun_with_notice(st, message, clear_prefix=f"{state_prefix}confirm_")
-
-            recipe_data, recipe_error = _safe_recipe_to_data(selected.recipe_path)  # type: ignore[arg-type]
-            if recipe_error or recipe_data is None:
-                st.error(f"当前 recipe.json 已损坏，已跳过结构编辑：{recipe_error}")
-                st.caption(f"文件：{selected.recipe_path}。可先从备份恢复，其他功能页仍可继续使用。")
-                with st.expander("查看损坏的 recipe.json"):
-                    st.code(_read_text(selected.recipe_path), language="json")
-            else:
-                recipe_data = _dump_model(normalize_recipe_taxonomy(_validate_recipe(recipe_data)))
-                st.markdown("#### 菜谱结构")
-                recipe_data["title"] = st.text_input(
-                    "标题",
-                    value=recipe_data.get("title", ""),
-                    key=f"{state_prefix}title",
-                )
-                recipe_data["servings"] = st.text_input(
-                    "份量",
-                    value=recipe_data.get("servings") or "",
-                    key=f"{state_prefix}servings",
-                )
-                recipe_data["total_time"] = st.text_input(
-                    "总耗时",
-                    value=recipe_data.get("total_time") or "",
-                    key=f"{state_prefix}total_time",
-                )
-                recipe_data["difficulty"] = st.text_input(
-                    "难度",
-                    value=recipe_data.get("difficulty") or "",
-                    key=f"{state_prefix}difficulty",
-                )
-                rating_col_taste, rating_col_difficulty, rating_col_time = st.columns(3)
-                with rating_col_taste:
-                    recipe_data["taste_rating"] = st.selectbox(
-                        "个人喜爱度",
-                        [None, 1, 2, 3, 4, 5],
-                        index=int(recipe_data.get("taste_rating") or 0),
-                        format_func=_rating_option_label,
-                        key=f"{state_prefix}taste_rating",
-                    )
-                with rating_col_difficulty:
-                    recipe_data["difficulty_rating"] = st.selectbox(
-                        "烹饪难度评级",
-                        [1, 2, 3, 4, 5],
-                        index=int(recipe_data.get("difficulty_rating") or 1) - 1,
-                        format_func=_rating_option_label,
-                        key=f"{state_prefix}difficulty_rating",
-                        help="系统根据步骤和技法自动给出初值，可手动修改。",
-                    )
-                with rating_col_time:
-                    recipe_data["time_rating"] = st.selectbox(
-                        "时间投入评级",
-                        [1, 2, 3, 4, 5],
-                        index=int(recipe_data.get("time_rating") or 1) - 1,
-                        format_func=_rating_option_label,
-                        key=f"{state_prefix}time_rating",
-                        help="系统根据总耗时自动给出初值，可手动修改。",
-                    )
-                category_options = list(dict.fromkeys([recipe_data.get("category") or "未分类", *RECIPE_CATEGORIES]))
-                recipe_data["category"] = st.selectbox(
-                    "归档分类",
-                    category_options,
-                    key=f"{state_prefix}category",
-                    help="用于 Obsidian 菜谱目录，例如中餐、汤羹、西餐、糕点。",
-                )
-                cuisine_options = list(dict.fromkeys([recipe_data.get("cuisine") or "未分类", *RECIPE_CUISINES]))
-                recipe_data["cuisine"] = st.selectbox(
-                    "菜系",
-                    cuisine_options,
-                    key=f"{state_prefix}cuisine",
-                )
-                recipe_data["tags"] = [
-                    tag.strip().lstrip("#")
-                    for tag in st.text_input(
-                        "检索标签，用逗号分隔",
-                        value=", ".join(recipe_data.get("tags") or []),
-                        key=f"{state_prefix}tags",
-                    ).split(",")
-                    if tag.strip().lstrip("#")
-                ]
-                original_ingredients = recipe_data.get("ingredients")
-                ingredient_editor = st.data_editor(
-                    _editor_table(original_ingredients, INGREDIENT_COLUMNS),
-                    num_rows="dynamic",
-                    column_order=list(INGREDIENT_COLUMNS),
-                    column_config={"name": "名称", "amount": "用量", "note": "备注"},
-                    key=f"{state_prefix}ingredients",
-                )
-                recipe_data["ingredients"] = _merge_editor_rows(
-                    ingredient_editor, INGREDIENT_COLUMNS, original_ingredients
-                )
-                original_seasonings = recipe_data.get("seasonings")
-                seasoning_editor = st.data_editor(
-                    _editor_table(original_seasonings, INGREDIENT_COLUMNS),
-                    num_rows="dynamic",
-                    column_order=list(INGREDIENT_COLUMNS),
-                    column_config={"name": "名称", "amount": "用量", "note": "备注"},
-                    key=f"{state_prefix}seasonings",
-                )
-                recipe_data["seasonings"] = _merge_editor_rows(
-                    seasoning_editor, INGREDIENT_COLUMNS, original_seasonings
-                )
-                recipe_data["tools"] = [
-                    item.strip()
-                    for item in st.text_area(
-                        "工具，每行一个",
-                        value="\n".join(recipe_data.get("tools") or []),
-                        key=f"{state_prefix}tools",
-                    ).splitlines()
-                    if item.strip()
-                ]
-                recipe_data["shopping_list"] = [
-                    item.strip()
-                    for item in st.text_area(
-                        "购物清单，每行一个",
-                        value="\n".join(recipe_data.get("shopping_list") or []),
-                        key=f"{state_prefix}shopping_list",
-                    ).splitlines()
-                    if item.strip()
-                ]
-                recipe_data["prep_items"] = [
-                    item.strip()
-                    for item in st.text_area(
-                        "备菜清单，每行一个",
-                        value="\n".join(recipe_data.get("prep_items") or []),
-                        key=f"{state_prefix}prep_items",
-                    ).splitlines()
-                    if item.strip()
-                ]
-                recipe_data["summary_tips"] = [
-                    item.strip()
-                    for item in st.text_area(
-                        "关键点速查，每行一个",
-                        value="\n".join(recipe_data.get("summary_tips") or []),
-                        key=f"{state_prefix}summary_tips",
-                    ).splitlines()
-                    if item.strip()
-                ]
-                original_steps = recipe_data.get("steps")
-                steps_editor = st.data_editor(
-                    _editor_table(original_steps, STEP_COLUMNS),
-                    num_rows="dynamic",
-                    column_order=list(STEP_COLUMNS),
-                    column_config={
-                        "title": "步骤标题",
-                        "start_time": st.column_config.NumberColumn("开始（秒）", min_value=0.0),
-                        "end_time": st.column_config.NumberColumn("结束（秒）", min_value=0.0),
-                        "action": "操作",
-                        "heat": "火候",
-                        "duration": "时长",
-                        "tips": "提示",
-                        "screenshot_path": "截图路径",
-                    },
-                    key=f"{state_prefix}steps",
-                )
-                recipe_data["steps"] = _merge_editor_rows(steps_editor, STEP_COLUMNS, original_steps)
-                if st.button(
-                    "保存菜谱并重新生成 note.md",
-                    disabled=not confirm_overwrite,
-                    key=f"{state_prefix}save_recipe",
-                ):
-                    try:
-                        recipe = _validate_recipe(recipe_data)
-                        backups = _backup_files([selected.recipe_path, selected.note_path], "recipe-edit")
-                        atomic_write_json(selected.recipe_path, _dump_model(recipe))  # type: ignore[arg-type]
-                        result = regenerate_note_from_recipe(
-                            selected.output_folder,
-                            **_regenerate_note_kwargs(config),
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        st.error(f"保存失败：{_clean_error(exc)}")
-                    else:
-                        _rerun_with_notice(
-                            st,
-                            f"已保存：{result.note_path}{_backup_summary(backups)}",
-                            clear_prefix=state_prefix,
-                        )
-
-            st.markdown("#### 最终 Markdown 手动编辑")
-            st.caption("这里保存的是归档时使用的最终正文；以后点击“从结构重新生成”会覆盖这些手写修改。")
-            final_markdown = st.text_area(
-                "note.md",
-                value=_read_text(selected.note_path),
-                height=420,
-                key=f"{state_prefix}final_markdown",
-            )
-            force_edit_archive = st.checkbox(
-                "归档时覆盖 Vault 中这篇笔记的手写修改",
-                key=f"{state_prefix}force_archive",
-            )
-            col_save_markdown, col_save_archive = st.columns(2)
-            with col_save_markdown:
-                save_final_markdown = st.button(
-                    "保存最终 Markdown",
-                    disabled=not selected.note_path or not confirm_overwrite or not final_markdown.strip(),
-                    key=f"{state_prefix}save_final_markdown",
-                )
-            with col_save_archive:
-                save_and_archive = st.button(
-                    "保存并归档到 Obsidian",
-                    type="primary",
-                    disabled=not selected.note_path or not confirm_overwrite or not final_markdown.strip(),
-                    key=f"{state_prefix}save_and_archive",
-                )
-            if save_final_markdown or save_and_archive:
-                try:
-                    backups = _backup_files([selected.note_path], "markdown-edit")
-                    atomic_write_text(selected.note_path, final_markdown.strip() + "\n")  # type: ignore[arg-type]
-                    archived = None
-                    knowledge_results = ()
-                    knowledge_error = None
-                    if save_and_archive:
-                        edited_ratings = None
-                        if recipe_data is not None:
-                            edited_ratings = {
-                                "taste_rating": recipe_data.get("taste_rating"),
-                                "difficulty_rating": recipe_data.get("difficulty_rating"),
-                                "time_rating": recipe_data.get("time_rating"),
-                            }
-                        archived, knowledge_results, knowledge_error = _archive_output(
-                            selected.output_folder,
-                            config,
-                            overwrite=force_edit_archive,
-                            ratings=edited_ratings,
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"保存或归档失败：{_clean_error(exc)}")
-                else:
-                    message = f"最终 Markdown 已保存{_backup_summary(backups)}"
-                    if archived:
-                        message += f"；已归档：{archived.note_path}"
-                    if knowledge_results:
-                        message += f"；同步 {len(knowledge_results)} 条技巧"
-                    if knowledge_error:
-                        message += f"；技巧同步失败：{_clean_error(knowledge_error)}"
-                    _rerun_with_notice(st, message)
-
-            st.markdown("#### transcript 修正")
-            transcript_text = _read_text(selected.transcript_path)
-            edited_transcript = st.text_area(
-                "transcript.json",
-                value=transcript_text,
-                height=240,
-                key=f"{state_prefix}transcript",
-            )
-            if st.button(
-                "保存 transcript 并重新抽取菜谱",
-                disabled=not selected.transcript_path or not confirm_overwrite,
-                key=f"{state_prefix}save_transcript",
-            ):
-                try:
-                    json.loads(edited_transcript)
-                    backups = _backup_files(
-                        [selected.transcript_path, selected.recipe_path, selected.note_path],
-                        "transcript-edit",
-                    )
-                    atomic_write_text(selected.transcript_path, edited_transcript)  # type: ignore[arg-type]
-                    result = regenerate_recipe_from_transcript(selected.output_folder)
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"重新抽取失败：{_clean_error(exc)}")
-                else:
-                    _rerun_with_notice(
-                        st,
-                        f"已重新生成：{result.note_path}{_backup_summary(backups)}",
-                        clear_prefix=state_prefix,
-                    )
-
-            st.markdown("#### 步骤图片")
-            st.caption("自动截图会比较多个时间点；候选图只临时保存在当前会话，最终每道菜最多保留 4 张压缩图片。")
-            steps = recipe_data.get("steps", []) if recipe_data else []
-            if not isinstance(steps, list) or not steps:
-                st.info("当前菜谱没有可重截的步骤。")
-            else:
-                pending_image_count = sum(
-                    isinstance(step, dict) and step.get("screenshot_status") == "needs_review"
-                    for step in steps
-                )
-                if pending_image_count:
-                    st.warning(f"有 {pending_image_count} 个步骤的自动候选质量不足，建议人工确认；也可以明确选择不配图。")
-                step_indexes = list(range(1, len(steps) + 1))
-
-                def screenshot_step_label(index: int) -> str:
-                    step = steps[index - 1]
-                    status = str(step.get("screenshot_status") or "")
-                    marker = "待选图" if status == "needs_review" else "已有图" if step.get("screenshot_path") else "无图"
-                    return f"{index}. {step.get('title') or '未命名步骤'} · {marker}"
-
-                step_index = st.selectbox(
-                    "选择步骤",
-                    step_indexes,
-                    format_func=screenshot_step_label,
-                    key=f"{state_prefix}screenshot_step",
-                )
-                current_step = steps[int(step_index) - 1]
-                initial_timestamp = _nonnegative_float(current_step.get("start_time"))
-                current_image = _local_markdown_image(
-                    selected.output_folder,
-                    str(current_step.get("screenshot_path") or ""),
-                )
-                screenshot_status = str(current_step.get("screenshot_status") or "")
-                screenshot_score = current_step.get("screenshot_score")
-                if current_image and current_image.is_file():
-                    st.image(str(current_image), caption="当前保存图片", width=420)
-                if screenshot_status == "needs_review":
-                    st.warning("自动候选质量不足，因此没有强行配图。可以查看候选、精确重截、上传图片或选择不配图。")
-                elif screenshot_status == "none":
-                    st.info("此步骤已明确设置为不配图。")
-                elif screenshot_score is not None:
-                    st.caption(f"当前图片质量评分：{float(screenshot_score) * 100:.0f}%")
-                duration = _transcript_duration(selected.transcript_path)
-                known_times = [
-                    _nonnegative_float(value)
-                    for step in steps
-                    if isinstance(step, dict)
-                    for value in (step.get("start_time"), step.get("end_time"))
-                    if isinstance(value, (int, float))
-                ]
-                max_timestamp = max([initial_timestamp, duration or 0.0, *known_times], default=initial_timestamp)
-                col_time, col_video = st.columns([1, 3])
-                with col_time:
-                    timestamp = st.number_input(
-                        "时间点（秒）",
-                        min_value=0.0,
-                        max_value=max_timestamp if max_timestamp > 0 else None,
-                        value=initial_timestamp,
-                        step=0.5,
-                        key=f"{state_prefix}screenshot_time_{step_index}",
-                    )
-                with col_video:
-                    video_path = st.text_input(
-                        "视频文件路径（可留空自动下载/复用 media）",
-                        key=f"{state_prefix}screenshot_video",
-                    )
-                end_time = current_step.get("end_time")
-                available_range = (
-                    f"视频可用范围 0–{max_timestamp:.1f} 秒"
-                    if max_timestamp > 0
-                    else "未能读取视频总时长，请输入非负时间点"
-                )
-                if isinstance(end_time, (int, float)):
-                    st.caption(
-                        f"当前步骤约为 {initial_timestamp:.1f}–{_nonnegative_float(end_time):.1f} 秒；"
-                        f"{available_range}。"
-                    )
-                else:
-                    st.caption(f"当前步骤从 {initial_timestamp:.1f} 秒开始；{available_range}。")
-
-                candidate_key = f"{state_prefix}screenshot_candidates_{step_index}"
-                candidate_action, clear_action = st.columns(2)
-                with candidate_action:
-                    if st.button(
-                        "自动查找候选图",
-                        key=f"{state_prefix}suggest_screenshots_{step_index}",
-                        use_container_width=True,
-                    ):
-                        try:
-                            with st.spinner("正在截取并比较多个候选画面..."):
-                                for session_key in list(st.session_state):
-                                    if str(session_key).startswith(f"{state_prefix}screenshot_candidates_"):
-                                        st.session_state.pop(session_key, None)
-                                st.session_state[candidate_key] = suggest_step_screenshots(
-                                    selected.output_folder,
-                                    int(step_index),
-                                    cookies=_optional_text(config.cookies),
-                                    video_path=_optional_text(video_path),
-                                    keep_video=config.keep_media,
-                                )
-                        except Exception as exc:  # noqa: BLE001
-                            st.error(f"候选图生成失败：{_clean_error(exc)}")
-                with clear_action:
-                    if st.button(
-                        "此步骤不配图",
-                        disabled=not confirm_overwrite,
-                        key=f"{state_prefix}clear_screenshot_{step_index}",
-                        use_container_width=True,
-                    ):
-                        try:
-                            backups = _backup_files(
-                                [current_image, selected.recipe_path, selected.note_path],
-                                "remove-screenshot",
-                            )
-                            clear_step_screenshot(selected.output_folder, int(step_index))
-                        except Exception as exc:  # noqa: BLE001
-                            st.error(f"移除图片失败：{_clean_error(exc)}")
-                        else:
-                            _rerun_with_notice(
-                                st,
-                                f"此步骤已设为不配图{_backup_summary(backups)}",
-                                clear_prefix=state_prefix,
-                            )
-
-                candidates = st.session_state.get(candidate_key, [])
-                if candidates:
-                    st.markdown("##### 候选图片（质量较高者优先）")
-                    candidate_columns = st.columns(3)
-                    for candidate_index, candidate in enumerate(candidates):
-                        with candidate_columns[candidate_index % len(candidate_columns)]:
-                            st.image(candidate.content, width="stretch")
-                            timestamp_label = (
-                                f"{candidate.timestamp:.1f} 秒" if candidate.timestamp is not None else "本地图片"
-                            )
-                            st.caption(f"{timestamp_label} · 质量 {candidate.score * 100:.0f}%")
-                            if st.button(
-                                "采用这张",
-                                disabled=not confirm_overwrite,
-                                key=f"{state_prefix}use_candidate_{step_index}_{candidate_index}",
-                                use_container_width=True,
-                            ):
-                                try:
-                                    target_image = selected.output_folder / "images" / f"step_{int(step_index):02d}.jpg"
-                                    backups = _backup_files(
-                                        [target_image, selected.recipe_path, selected.note_path],
-                                        "choose-screenshot",
-                                    )
-                                    image_path = save_step_screenshot_candidate(
-                                        selected.output_folder,
-                                        int(step_index),
-                                        candidate,
-                                    )
-                                except Exception as exc:  # noqa: BLE001
-                                    st.error(f"保存候选图失败：{_clean_error(exc)}")
-                                else:
-                                    _rerun_with_notice(
-                                        st,
-                                        f"已采用：{image_path}{_backup_summary(backups)}",
-                                        clear_prefix=state_prefix,
-                                    )
-                elif candidate_key in st.session_state:
-                    st.warning("这个步骤范围内没有截到可读取的候选画面，可以扩大时间点精确重截、上传图片或不配图。")
-
-                uploaded_image = st.file_uploader(
-                    "上传替代图片",
-                    type=["jpg", "jpeg", "png", "webp"],
-                    key=f"{state_prefix}uploaded_screenshot_{step_index}",
-                    help="图片会转成压缩 JPEG 后保存，原文件不会复制进菜谱目录。",
-                )
-                if st.button(
-                    "采用上传图片",
-                    disabled=uploaded_image is None or not confirm_overwrite,
-                    key=f"{state_prefix}use_uploaded_screenshot_{step_index}",
-                ):
-                    try:
-                        uploaded_content = uploaded_image.getvalue()
-                        if len(uploaded_content) > 10 * 1024 * 1024:
-                            raise ValueError("上传图片不能超过 10 MB")
-                        target_image = selected.output_folder / "images" / f"step_{int(step_index):02d}.jpg"
-                        backups = _backup_files(
-                            [target_image, selected.recipe_path, selected.note_path],
-                            "upload-screenshot",
-                        )
-                        image_path = save_uploaded_step_screenshot(
-                            selected.output_folder,
-                            int(step_index),
-                            uploaded_content,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        st.error(f"上传图片保存失败：{_clean_error(exc)}")
-                    else:
-                        _rerun_with_notice(
-                            st,
-                            f"已采用上传图片：{image_path}{_backup_summary(backups)}",
-                            clear_prefix=state_prefix,
-                        )
-
-                st.markdown("##### 按时间点精确重截")
-                if st.button(
-                    "重新截图",
-                    disabled=not confirm_overwrite,
-                    key=f"{state_prefix}recapture",
-                ):
-                    try:
-                        target_image = selected.output_folder / "images" / f"step_{int(step_index):02d}.jpg"
-                        backups = _backup_files(
-                            [target_image, selected.recipe_path, selected.note_path],
-                            "recapture",
-                        )
-                        image_path = recapture_step_screenshot(
-                            selected.output_folder,
-                            int(step_index),
-                            float(timestamp),
-                            cookies=_optional_text(config.cookies),
-                            video_path=_optional_text(video_path),
-                            keep_video=config.keep_media,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        st.error(f"截图失败：{_clean_error(exc)}")
-                    else:
-                        _rerun_with_notice(
-                            st,
-                            f"已更新：{image_path}{_backup_summary(backups)}",
-                            clear_prefix=state_prefix,
-                        )
+        render_edit_page(st, config, EditPageHelpers(
+            archive_output=_archive_output,
+            backup_files=_backup_files,
+            backup_summary=_backup_summary,
+            clean_error=_clean_error,
+            display_quality=_display_quality,
+            dump_model=_dump_model,
+            editor_table=_editor_table,
+            history_options=_history_options,
+            local_markdown_image=_local_markdown_image,
+            merge_editor_rows=_merge_editor_rows,
+            nonnegative_float=_nonnegative_float,
+            optimize_options=_optimize_options,
+            optional_text=_optional_text,
+            rating_option_label=_rating_option_label,
+            read_text=_read_text,
+            record_key=_record_key,
+            regenerate_note_kwargs=_regenerate_note_kwargs,
+            rerun_with_notice=_rerun_with_notice,
+            safe_recipe_to_data=_safe_recipe_to_data,
+            select_history_item=_select_history_item,
+            transcript_duration=_transcript_duration,
+            validate_recipe=_validate_recipe,
+        ))
 
     if active_page == "知识库":
         st.subheader("个人厨艺知识库（提取与管理）")

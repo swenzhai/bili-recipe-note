@@ -3,11 +3,21 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
 from bili_recipe_notes import ai_review_ui
 from bili_recipe_notes.history import scan_history
-from bili_recipe_notes.review_policy import AI_REVIEW_FILE_NAME, review_recipe_hash
+from bili_recipe_notes.review_policy import (
+    AI_REVIEW_FILE_NAME, AI_REVIEW_PROMPT_VERSION, AI_REVIEW_RULES_VERSION,
+    get_review_state, review_input_fingerprint, review_recipe_hash, set_ai_review_visibility,
+)
+
+
+@pytest.fixture(autouse=True)
+def isolate_ui_data(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("BILI_RECIPE_DATA_DIR", raising=False)
 
 
 def _write_recipe(root: Path, name: str, *, hidden: bool = False) -> Path:
@@ -19,11 +29,13 @@ def _write_recipe(root: Path, name: str, *, hidden: bool = False) -> Path:
         "summary_tips": [], "uncertain_points": [], "tags": ["原标签"],
     }
     (folder / "recipe.json").write_text(json.dumps(recipe, ensure_ascii=False), encoding="utf-8")
-    (folder / "transcript.json").write_text('[{"text":"今天带大家探店，品尝餐厅菜品"}]', encoding="utf-8")
+    (folder / "transcript.json").write_text('[{"start":0,"text":"今天带大家探店，品尝餐厅菜品"}]', encoding="utf-8")
     (folder / "note.md").write_text(f"# {name}\n原始生成内容\n", encoding="utf-8")
     if hidden:
         (folder / AI_REVIEW_FILE_NAME).write_text(json.dumps({
-            "schema_version": 1, "status": "completed", "source_recipe_sha256": review_recipe_hash(folder),
+            "schema_version": 2, "status": "completed", "source_recipe_sha256": review_recipe_hash(folder),
+            "input_fingerprint": review_input_fingerprint(folder),
+            "rules_version": AI_REVIEW_RULES_VERSION, "prompt_version": AI_REVIEW_PROMPT_VERSION,
             "classification": "non_recipe", "visibility": "hidden", "confidence": 0.99,
             "tags": ["探店"], "reason": "仅探店，没有烹饪教学", "item_checks": [],
             "evidence": [{"text": "今天带大家探店，品尝餐厅菜品", "start": 0}],
@@ -118,7 +130,12 @@ def test_ai_page_shows_interrupted_progress_and_resumes(tmp_path: Path, monkeypa
     assert any("LLM timeout" in str(table.value) for table in at.dataframe)
     at.button(key="ai_review_retry").click().run()
     assert not at.exception
-    assert calls[0][1] == {"retry_failed": True}
+    assert calls[0][1]["retry_failed"] is True
+    assert calls[0][1]["provider"] == "opencode"
+    assert calls[0][1]["openai_model"]
+    at.radio(key="ai_review_retry_config").set_value("原任务配置")
+    at.button(key="ai_review_retry").click().run()
+    assert calls[-1][1] == {"retry_failed": True}
 
 
 def test_running_batch_disables_duplicate_start_and_can_request_pause(tmp_path: Path, monkeypatch) -> None:
@@ -144,6 +161,78 @@ def test_history_combines_review_tags_without_rewriting_recipe(tmp_path: Path) -
     item = scan_history(tmp_path)[0]
     assert item.tags == ["原标签", "探店"]
     assert (folder / "recipe.json").read_bytes() == original
+
+
+def test_manual_visibility_survives_stale_ai_and_is_recoverable_in_ui(tmp_path: Path) -> None:
+    folder = _write_recipe(tmp_path, "探店", hidden=True)
+    set_ai_review_visibility(folder, "hidden")
+    recipe = json.loads((folder / "recipe.json").read_text())
+    recipe["title"] = "新内容，待重审"
+    (folder / "recipe.json").write_text(json.dumps(recipe), encoding="utf-8")
+    at = _open_page(tmp_path)
+    assert not at.exception
+    assert at.metric[3].value == "1"
+    assert at.button(key="ai_review_visibility").label == "人工恢复展示"
+    at.button(key="ai_review_visibility").click().run()
+    assert not at.exception
+    assert at.metric[3].value == "0"
+
+
+def test_manual_workbench_confirms_each_item_and_leaves_original_files_untouched(tmp_path: Path) -> None:
+    folder = _write_recipe(tmp_path, "炒蛋")
+    recipe = json.loads((folder / "recipe.json").read_text())
+    recipe["ingredients"] = [{"name": "鸡蛋", "amount": "两个"}]
+    recipe["steps"] = [{"title": "炒熟", "start_time": 2, "action": "中火炒熟"}]
+    (folder / "recipe.json").write_text(json.dumps(recipe, ensure_ascii=False), encoding="utf-8")
+    (folder / "transcript.json").write_text('[{"start":0,"text":"准备两个鸡蛋"},{"start":2,"text":"中火炒熟"}]', encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in folder.iterdir()}
+    at = _open_page(tmp_path)
+    next(widget for widget in at.selectbox if widget.label == "人工内容分类").set_value("recipe")
+    next(widget for widget in at.button if widget.label == "保存人工分类").click().run()
+    assert not at.exception
+    for expected, quote in (("ingredients:0", "准备两个鸡蛋"), ("steps:0", "中火炒熟")):
+        selector = next(widget for widget in at.selectbox if widget.label == "核对用料或步骤")
+        assert selector.value == expected
+        next(widget for widget in at.radio if widget.label == "人工核对结论").set_value("supported")
+        next(widget for widget in at.text_area if widget.label == "引用字幕原文（可选）").set_value(quote)
+        next(widget for widget in at.button if widget.label == "保存并核对下一项").click().run()
+        assert not at.exception
+        assert not at.error, [message.value for message in at.error]
+    next(widget for widget in at.button if widget.label == "完成人工确认").click().run()
+    assert not at.exception
+    assert get_review_state(folder)["manual_completed"] is True
+    assert all((folder / name).read_bytes() == content for name, content in before.items())
+    assert list((tmp_path / ".ai-review" / "history").glob("*/*.json"))
+    assert any(widget.label == "历史版本" for widget in at.selectbox)
+
+    reopened = _open_page(tmp_path)
+    assert not reopened.exception
+    assert next(widget for widget in reopened.text_area if widget.label == "引用字幕原文（可选）").value == "准备两个鸡蛋"
+    next(widget for widget in reopened.button if widget.label == "保存并核对下一项").click().run()
+    assert not reopened.error
+    assert get_review_state(folder)["item_decisions"]["ingredients:0"]["evidence"] == [{"text": "准备两个鸡蛋"}]
+
+
+def test_workbench_handles_malformed_video_url(tmp_path: Path) -> None:
+    folder = _write_recipe(tmp_path, "来源链接损坏")
+    recipe = json.loads((folder / "recipe.json").read_text())
+    recipe["source_url"] = "https://["
+    (folder / "recipe.json").write_text(json.dumps(recipe), encoding="utf-8")
+    at = _open_page(tmp_path)
+    assert not at.exception
+
+
+def test_next_pending_record_clears_search_and_moves_to_review_queue(tmp_path: Path) -> None:
+    first = _write_recipe(tmp_path, "甲")
+    second = _write_recipe(tmp_path, "乙")
+    at = _open_page(tmp_path)
+    at.text_input(key="ai_review_search").set_value("甲").run()
+    assert at.selectbox(key="ai_review_record").value == str(first)
+    next(widget for widget in at.button if widget.label == "下一条待人工确认").click().run()
+    assert not at.exception
+    assert at.text_input(key="ai_review_search").value == ""
+    assert at.radio(key="ai_review_result_filter").value == "待人工确认"
+    assert at.selectbox(key="ai_review_record").value == str(second)
 
 
 def test_public_pages_hide_ai_classified_content_by_default(tmp_path: Path) -> None:

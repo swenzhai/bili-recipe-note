@@ -22,6 +22,7 @@ from .mobile_sync import (
 )
 from .branding import branding_payload, configured_logo_path
 from .config import load_config
+from .indexing_service import RecipeIndexSupervisor
 
 
 class PairRequest(BaseModel):
@@ -54,15 +55,12 @@ def create_app(
 ) -> FastAPI:
     store = MobileSyncStore(project_root, out_dir=out_dir, database_path=database_path)
 
-    async def index_loop() -> None:
-        while True:
-            await asyncio.to_thread(store.index_recipes)
-            await asyncio.sleep(10)
+    indexer = RecipeIndexSupervisor(store)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        await asyncio.to_thread(store.index_recipes)
-        task = asyncio.create_task(index_loop()) if start_background_indexer else None
+        next_delay = await indexer.run_once()
+        task = asyncio.create_task(indexer.run_forever(initial_delay=next_delay)) if start_background_indexer else None
         try:
             yield
         finally:
@@ -74,6 +72,7 @@ def create_app(
     app = FastAPI(title="Chef Zhai Family Kitchen API", version=str(PROTOCOL_VERSION), lifespan=lifespan)
     app.add_middleware(GZipMiddleware, minimum_size=1000)
     app.state.store = store
+    app.state.indexer = indexer
 
     @app.middleware("http")
     async def private_network_only(request: Request, call_next):
@@ -98,7 +97,13 @@ def create_app(
             "server_id": store.server_id,
             "revision": store.current_revision(),
             "self_join_enabled": store.self_join_enabled(),
+            "indexing": indexer.snapshot(),
         }
+
+    @app.get("/api/v1/index-status")
+    def index_status(device: dict[str, Any] = Depends(authenticated_device)) -> dict[str, Any]:
+        del device
+        return indexer.snapshot()
 
     @app.get("/api/v1/branding")
     def branding() -> dict[str, Any]:
@@ -232,4 +237,11 @@ def create_app(
     return app
 
 
-app = create_app()
+def __getattr__(name: str) -> Any:
+    # Uvicorn still resolves ``mobile_api:app`` at startup. Importing the factory
+    # for tests or other tools no longer initializes a database in their cwd.
+    if name == "app":
+        application = create_app()
+        globals()[name] = application
+        return application
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

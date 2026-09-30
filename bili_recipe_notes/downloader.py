@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable, TypeVar
 from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
-from .config import CONFIG_DIR_NAME
+from .data_paths import state_dir
 from .storage import atomic_write_bytes
 
 FINGERPRINT_URL = "https://api.bilibili.com/x/frontend/finger/spi"
@@ -51,8 +51,7 @@ class CreatorCrawlResult:
 
 
 def imported_cookie_path(project_root: str | Path | None = None) -> Path:
-    root = Path(project_root) if project_root else Path.cwd()
-    return root / CONFIG_DIR_NAME / "cookies" / "bilibili-edge.txt"
+    return state_dir(project_root) / "cookies" / "bilibili-edge.txt"
 
 
 def validate_bilibili_cookie_file(cookie_path: str | Path) -> bool:

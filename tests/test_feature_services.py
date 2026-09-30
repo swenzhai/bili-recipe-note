@@ -469,7 +469,7 @@ def test_knowledge_base_upsert_and_search(tmp_path) -> None:
 
     path, added, updated = upsert_knowledge_entries([entry], project_root=tmp_path)
 
-    assert path == tmp_path / ".bili-recipe-notes" / "knowledge_base.json"
+    assert path == tmp_path / "data" / "state" / "knowledge_base.json"
     assert added == 1
     assert updated == 0
     results = search_knowledge_entries("定型", "火候", project_root=tmp_path)
@@ -636,7 +636,7 @@ def test_extract_knowledge_from_video_writes_independent_kb(monkeypatch, tmp_pat
         project_root=tmp_path,
     )
 
-    assert result.knowledge_path == tmp_path / ".bili-recipe-notes" / "knowledge_base.json"
+    assert result.knowledge_path == tmp_path / "data" / "state" / "knowledge_base.json"
     assert result.added_count == 1
     assert result.updated_count == 0
     assert "只提取能迁移到其他菜" in captured["prompt"]

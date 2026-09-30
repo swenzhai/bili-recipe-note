@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+from .output_layout import iter_output_folders
+from .data_paths import relocate_value
+
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
 
 from .ai_review import _now, review_recipe
 from .batch_runner import _pid_is_alive, _process_start_id
+from .data_paths import DATA_DIR_ENV, data_root
 from .llm import SUPPORTED_LLM_PROVIDERS
 from .review_policy import load_ai_review
 from .storage import atomic_write_json, file_lock
@@ -85,11 +90,13 @@ def _folder(root: Path, value: str | Path) -> Path:
     candidate = Path(value)
     if not candidate.is_absolute():
         candidate = root / candidate
-    if candidate.is_symlink():
+    if candidate.is_symlink() or any(parent.is_symlink() for parent in candidate.parents if parent != root):
         raise ValueError("AI 审核拒绝符号链接菜谱目录")
     candidate = candidate.resolve()
-    if candidate.parent != root or candidate.name.startswith("."):
-        raise ValueError("AI 审核只能处理输出目录的直接子目录")
+    if candidate == root or not candidate.is_relative_to(root) or any(
+        part.startswith(".") for part in candidate.relative_to(root).parts
+    ):
+        raise ValueError("AI 审核只能处理输出目录内的菜谱子目录")
     if not candidate.is_dir() or not (candidate / "recipe.json").is_file():
         raise ValueError("仅支持已生成 recipe.json 的菜谱目录")
     return candidate
@@ -97,7 +104,7 @@ def _folder(root: Path, value: str | Path) -> Path:
 
 def _read(root: Path, batch_id: str) -> dict:
     path = _state_path(root, batch_id)
-    state = json.loads(path.read_text(encoding="utf-8"))
+    state = relocate_value(json.loads(path.read_text(encoding="utf-8")))
     if not isinstance(state, dict) or state.get("batch_id") != batch_id or state.get("out_dir") != str(root):
         raise ValueError("AI 审核任务状态无效")
     return state
@@ -192,12 +199,17 @@ def _launch(root: Path, state: dict) -> dict:
     if log_path.is_symlink():
         raise ValueError("审核任务日志不能是符号链接")
     state.update(status="queued", pid=os.getpid(), process_start_id=_identity(os.getpid()), run_token=uuid.uuid4().hex,
-                 stop_requested=False, current_folder=None, error=None, finished_at=None)
+                 stop_requested=False, current_folder=None, error=None, finished_at=None, pause_reason=None,
+                 consecutive_failures=0)
+    state.setdefault("runs", []).append({"run_token": state["run_token"], "started_at": _now(),
+        "provider": state["provider"], "llm_options": dict(state["llm_options"]),
+        "max_attempts": state.get("max_attempts", 3), "consecutive_failure_limit": state.get("consecutive_failure_limit", 5)})
     _write(root, state)
     args = [str(root), batch_id, state["run_token"]]
     command = ([sys.executable, "--ai-review-worker", *args] if getattr(sys, "frozen", False)
                else [sys.executable, "-m", "bili_recipe_notes.ai_review_worker", *args])
     env = os.environ.copy()
+    env[DATA_DIR_ENV] = str(data_root())
     package_root = str(Path(__file__).resolve().parent.parent)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [package_root, env.get("PYTHONPATH")]))
     try:
@@ -225,6 +237,9 @@ def start_ai_review_batch(
     only_pending: bool = True,
     retry_failed: bool = False,
     folders: list[str | Path] | None = None,
+    max_attempts: int = 3,
+    consecutive_failure_limit: int = 5,
+    retry_base_seconds: float = 1.0,
     **llm_options: Any,
 ) -> dict:
     root = _root(out_dir)
@@ -234,21 +249,27 @@ def start_ai_review_batch(
         raise ValueError("审核数量限制必须为正整数")
     if set(llm_options) - _OPTIONS:
         raise ValueError("未知的 AI 模型配置")
+    if type(max_attempts) is not int or not 1 <= max_attempts <= 5:
+        raise ValueError("每条自动尝试次数必须在 1 到 5 之间")
+    if type(consecutive_failure_limit) is not int or consecutive_failure_limit < 1:
+        raise ValueError("连续失败暂停阈值必须为正整数")
+    if type(retry_base_seconds) not in (int, float) or not 0 <= retry_base_seconds <= 30:
+        raise ValueError("重试等待必须在 0 到 30 秒之间")
     with file_lock(root / ".ai-review" / "control", timeout=15):
         batches = list_ai_review_batches(root)
         active = next((state for state in batches if state["active"]), None)
         if active:
             return active
         candidates = ([_folder(root, item) for item in folders] if folders is not None else
-                      [path for path in sorted(root.iterdir()) if path.is_dir() and not path.is_symlink()
-                       and not path.name.startswith(".") and (path / "recipe.json").is_file()])
+                      [_folder(root, path) for path in sorted(iter_output_folders(root))
+                       if (path / "recipe.json").is_file()])
         candidates = list(dict.fromkeys(candidates))
         if retry_failed:
             latest: dict[str, str] = {}
             for batch in batches:
                 for item in batch["items"]:
                     latest.setdefault(item["folder"], item["status"])
-            candidates = [path for path in candidates if latest.get(path.name) == "failed"]
+            candidates = [path for path in candidates if latest.get(path.relative_to(root).as_posix()) == "failed"]
             only_pending = False
         if only_pending:
             candidates = [path for path in candidates if load_ai_review(path) is None]
@@ -258,8 +279,10 @@ def start_ai_review_batch(
             "schema_version": 1, "batch_id": "audit-" + uuid.uuid4().hex[:16], "out_dir": str(root),
             "created_at": _now(), "status": "completed", "provider": provider,
             "llm_options": llm_options, "only_pending": only_pending, "stop_requested": False,
+            "max_attempts": max_attempts, "consecutive_failure_limit": consecutive_failure_limit,
+            "retry_base_seconds": retry_base_seconds, "consecutive_failures": 0,
             "pid": None, "process_start_id": None, "current_folder": None,
-            "items": [{"folder": path.name, "status": "pending", "error": None} for path in candidates],
+            "items": [{"folder": path.relative_to(root).as_posix(), "status": "pending", "error": None} for path in candidates],
         }
         if not candidates:
             state["finished_at"] = _now()
@@ -279,8 +302,13 @@ def request_stop_ai_review_batch(out_dir: str | Path, batch_id: str) -> dict:
         return _decorate(_update(root, batch_id, stop))
 
 
-def resume_ai_review_batch(out_dir: str | Path, batch_id: str, *, retry_failed: bool = False) -> dict:
+def resume_ai_review_batch(out_dir: str | Path, batch_id: str, *, retry_failed: bool = False,
+                          provider: str | None = None, **llm_options: Any) -> dict:
     root = _root(out_dir)
+    if provider is not None and provider not in SUPPORTED_LLM_PROVIDERS - {"none"}:
+        raise ValueError("请先选择可用的 AI 服务")
+    if set(llm_options) - _OPTIONS:
+        raise ValueError("未知的 AI 模型配置")
     with file_lock(root / ".ai-review" / "control", timeout=15):
         batches = list_ai_review_batches(root)
         active = next((state for state in batches if state["active"]), None)
@@ -291,12 +319,35 @@ def resume_ai_review_batch(out_dir: str | Path, batch_id: str, *, retry_failed: 
         state = get_ai_review_batch(root, batch_id)
         if state is None:
             raise ValueError("AI 审核任务不存在")
+        if provider is not None:
+            state["provider"] = provider
+        state["llm_options"] = {**state.get("llm_options", {}), **llm_options}
         for item in state["items"]:
             if item["status"] == "running" or (retry_failed and item["status"] == "failed"):
+                for attempt in item.get("attempts", []):
+                    if attempt.get("status") == "running":
+                        attempt.update(status="interrupted", finished_at=_now(), error="后台进程中断")
                 item.update(status="pending", error=None)
         if not any(item["status"] == "pending" for item in state["items"]):
             return state
         return _launch(root, state)
+
+
+def _error_kind(exc: Exception) -> str:
+    message = str(exc).casefold()
+    if any(fragment in message for fragment in (
+        "api_key is not set", "api key is not set", "invalid api key", "incorrect api key", "local command is empty",
+        "no such file or directory", "command not found", "unauthorized", "http error 401", "http error 403",
+        "model not found", "insufficient_quota", "unsupported llm provider",
+    )) and not isinstance(exc, FileNotFoundError):
+        return "configuration"
+    if isinstance(exc, (TimeoutError, ConnectionError, subprocess.TimeoutExpired)) or any(fragment in message for fragment in (
+        "timed out", "timeout", "connection reset", "connection refused", "temporarily unavailable",
+        "temporary failure", "name resolution", "network is unreachable", "remote end closed", "econnreset",
+        "rate limit", "429", "http error 500", "http error 502", "http error 503", "http error 504", "remote disconnected",
+    )):
+        return "transient"
+    return "validation" if isinstance(exc, (ValueError, FileNotFoundError)) else "permanent"
 
 
 def run_ai_review_batch(out_dir: str | Path, batch_id: str, run_token: str) -> dict:
@@ -331,17 +382,52 @@ def run_ai_review_batch(out_dir: str | Path, batch_id: str, run_token: str) -> d
         try:
             folder = _folder(root, name)
             if state["only_pending"] and load_ai_review(folder) is not None:
-                result = {"status": "skipped", "error": None}
+                result = {"status": "skipped", "error": None, "error_kind": None}
             else:
-                review = review_recipe(folder, provider=state["provider"], only_pending=state["only_pending"], **state["llm_options"])
-                result = {"status": "completed", "error": None, "classification": review["classification"],
-                          "review_status": review["status"], "visibility": review["visibility"]}
+                for retry_index in range(state.get("max_attempts", 3)):
+                    def attempt_start(current: dict) -> None:
+                        attempts = current["items"][pending].setdefault("attempts", [])
+                        attempts.append({"attempt": len(attempts) + 1, "started_at": _now(), "status": "running",
+                                         "provider": state["provider"], "llm_options": dict(state["llm_options"]),
+                                         "run_token": run_token})
+                    _update(root, batch_id, attempt_start)
+                    try:
+                        review = review_recipe(folder, provider=state["provider"], only_pending=state["only_pending"], **state["llm_options"])
+                    except Exception as exc:
+                        kind = _error_kind(exc)
+                        result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"[:2000], "error_kind": kind}
+                        def attempt_failed(current: dict) -> None:
+                            current["items"][pending]["attempts"][-1].update(result, finished_at=_now())
+                        _update(root, batch_id, attempt_failed)
+                        if kind != "transient" or retry_index + 1 >= state.get("max_attempts", 3):
+                            break
+                        delay = min(30.0, state.get("retry_base_seconds", 1.0) * 2 ** retry_index)
+                        def retrying(current: dict) -> None:
+                            current["items"][pending]["attempts"][-1]["retry_delay_seconds"] = delay
+                        _update(root, batch_id, retrying)
+                        time.sleep(delay)
+                    else:
+                        result = {"status": "completed", "error": None, "error_kind": None,
+                                  "classification": review["classification"], "review_status": review["status"],
+                                  "visibility": review["visibility"]}
+                        def attempt_done(current: dict) -> None:
+                            current["items"][pending]["attempts"][-1].update(status="completed", finished_at=_now(), error=None)
+                        _update(root, batch_id, attempt_done)
+                        break
         except Exception as exc:
-            result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"[:2000]}
+            result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"[:2000], "error_kind": _error_kind(exc)}
         def finished(current: dict) -> None:
             if current.get("run_token") != run_token:
                 raise RuntimeError("审核 worker 标识已过期")
             current["items"][pending].update(result, finished_at=_now())
             current["current_folder"] = None
-        _update(root, batch_id, finished)
+            current["consecutive_failures"] = current.get("consecutive_failures", 0) + 1 if result["status"] == "failed" else 0
+            if (result.get("error_kind") == "configuration" or
+                    current["consecutive_failures"] >= current.get("consecutive_failure_limit", 5)):
+                current.update(status="paused", pause_reason=("configuration" if result.get("error_kind") == "configuration" else "consecutive_failures"),
+                               error=("模型配置错误，请修正配置后重试" if result.get("error_kind") == "configuration" else "连续失败已达到阈值，自动暂停以避免重复消耗"),
+                               finished_at=_now())
+        updated = _update(root, batch_id, finished)
         print(f"{_now()} {name}: {result['status']}", flush=True)
+        if updated["status"] == "paused":
+            return updated

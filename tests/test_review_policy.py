@@ -7,9 +7,11 @@ import pytest
 
 from bili_recipe_notes.review_policy import (
     AI_REVIEW_FILE_NAME,
+    AI_REVIEW_RULES_VERSION,
     is_recipe_hidden,
     load_ai_review,
     review_recipe_hash,
+    review_input_fingerprint,
     set_ai_review_visibility,
 )
 
@@ -17,8 +19,15 @@ from bili_recipe_notes.review_policy import (
 def _write_review(folder: Path, **changes: object) -> dict:
     if not (folder / "recipe.json").exists():
         (folder / "recipe.json").write_text('{"title":"广告","steps":[]}', encoding="utf-8")
+    if not (folder / "transcript.json").exists():
+        (folder / "transcript.json").write_text(json.dumps([
+            {"text": "今天只介绍这个商品，没有菜谱制作教学", "start": 0},
+            {"text": "只介绍火候技巧", "start": 3.5},
+        ], ensure_ascii=False), encoding="utf-8")
     review = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "rules_version": AI_REVIEW_RULES_VERSION,
+        "input_fingerprint": review_input_fingerprint(folder),
         "status": "completed",
         "source_recipe_sha256": review_recipe_hash(folder),
         "classification": "non_recipe",
@@ -26,6 +35,8 @@ def _write_review(folder: Path, **changes: object) -> dict:
         "confidence": 0.99,
         "tags": ["非菜谱", "广告"],
         "reason": "仅介绍商品，没有烹饪过程",
+        "evidence": [{"text": "今天只介绍这个商品，没有菜谱制作教学"}],
+        "item_checks": [],
         **changes,
     }
     (folder / AI_REVIEW_FILE_NAME).write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
@@ -46,7 +57,7 @@ def test_review_policy_ignores_missing_corrupt_and_outdated_reviews(tmp_path: Pa
 @pytest.mark.parametrize(
     "changes",
     [
-        {"schema_version": 2},
+        {"schema_version": 3},
         {"schema_version": True},
         {"status": "running"},
         {"status": []},
@@ -92,8 +103,10 @@ def test_only_confident_completed_non_recipes_are_automatically_hidden(tmp_path:
 
 
 def test_review_accepts_structured_evidence_and_item_checks(tmp_path: Path) -> None:
+    (tmp_path / "recipe.json").write_text('{"title":"技巧","steps":[{"action":"观察火候"}]}', encoding="utf-8")
     _write_review(
         tmp_path,
+        status="needs_review",
         evidence=[{"text": "只介绍火候技巧", "start": 3.5}],
         item_checks=[{"id": "steps:0", "verdict": "needs_review", "reason": "缺少字幕依据"}],
     )
@@ -117,9 +130,12 @@ def test_manual_visibility_is_reversible_and_changes_only_the_sidecar(tmp_path: 
     assert is_recipe_hidden(tmp_path)
     assert (tmp_path / "recipe.json").read_bytes() == recipe_before
 
-    (tmp_path / "recipe.json").write_bytes(recipe_before + b"\n")
-    with pytest.raises(ValueError, match="有效"):
-        set_ai_review_visibility(tmp_path, "visible")
+    (tmp_path / "recipe.json").write_bytes(recipe_before.replace("广告".encode(), "新菜谱".encode()))
+    assert load_ai_review(tmp_path) is None
+    set_ai_review_visibility(tmp_path, "hidden")
+    assert is_recipe_hidden(tmp_path)
+    set_ai_review_visibility(tmp_path, "visible")
+    assert not is_recipe_hidden(tmp_path)
 
 
 def test_human_can_hide_a_valid_review_that_needs_verification(tmp_path: Path) -> None:

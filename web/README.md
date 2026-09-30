@@ -2,9 +2,21 @@
 
 标准 Vite + React 静态客户端，由 FastAPI 在 `8765` 端口同源托管。菜谱、心得、套餐和共享本餐以家庭服务器为主数据源，浏览器使用 IndexedDB 保存缓存与离线操作队列。
 
+服务器的菜谱和数据库统一放在项目 `data/` 下：菜谱位于 `data/recipes/`，移动同步数据库位于 `data/state/mobile-sync.sqlite3`。需要迁移或使用独立磁盘时，为管理页与手机 API 设置相同的 `BILI_RECIPE_DATA_DIR`；浏览器缓存仍由当前设备管理。完整目录和迁移命令见 [项目 README](../README.md#数据目录与迁移)。
+
+使用 Node.js 24 或更新版本、Corepack 和 pnpm 12.6.0；CI 固定使用 Node.js 24 与 pnpm 12.6.0。依赖版本保存在 `pnpm-lock.yaml`，安装时保持冻结锁文件：
+
 ```bash
-corepack pnpm install
-corepack pnpm build
+corepack pnpm@12.6.0 install --frozen-lockfile
+corepack pnpm@12.6.0 build
 ```
 
-开发时运行 `corepack pnpm dev`，`/api` 会代理到 `http://127.0.0.1:8765`。正式使用直接打开服务器的 `8765` 地址，输入设备名称即可加入；设备令牌和名称会长期保存在浏览器中。管理员可在 Streamlit 中临时关闭新设备加入。
+开发时运行 `corepack pnpm@12.6.0 dev`，`/api` 会代理到 `http://127.0.0.1:8765`。正式使用直接打开服务器的 `8765` 地址，输入设备名称即可加入；设备令牌和名称会长期保存在浏览器中。管理员可在 Streamlit 中临时关闭新设备加入。
+
+验证网页：
+
+```bash
+corepack pnpm@12.6.0 test
+```
+
+该命令先执行 TypeScript 检查和生产构建，再使用 Node 内置测试运行器检查生成文件与 `src/sync.ts` 中实际用于网页的同步逻辑。行为测试覆盖菜谱隐藏与恢复后的菜单更新、离线本餐操作保留与联网重试、响应丢失后的操作 ID 复用、过期操作处理、分页同步、超大离线队列和心得冲突处理。测试使用内存队列和模拟服务器响应，不访问家庭服务器或修改已有菜谱数据。

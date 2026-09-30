@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .data_paths import resolve_stored_path
+
 import hashlib
 import json
 import os
@@ -616,7 +618,7 @@ def recipe_archive_status(output_folder: str | Path) -> str:
         return "stale"
     if manifest.get("status") != "archived":
         return "archive_error"
-    note_path = Path(str(manifest.get("note_path") or ""))
+    note_path = resolve_stored_path(str(manifest.get("note_path") or ""))
     if not note_path.is_file():
         return "archive_error"
     source_note = folder / "note.md"

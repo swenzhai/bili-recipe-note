@@ -51,7 +51,12 @@ echo Mobile client: http://%LAN_IP%:8765
 echo Press Ctrl+C in this window to stop both services.
 echo.
 
-start "Bili Recipe Mobile" /b "%PYTHON_EXE%" -m uvicorn bili_recipe_notes.mobile_api:app --host 0.0.0.0 --port 8765 --no-access-log
+for /f "usebackq delims=" %%D in (`"%PYTHON_EXE%" -c "from bili_recipe_notes.data_paths import data_root; print(data_root())"`) do set "BILI_RECIPE_DATA_DIR=%%D"
+if not defined BILI_RECIPE_DATA_DIR exit /b 1
+if not exist "%BILI_RECIPE_DATA_DIR%\logs" mkdir "%BILI_RECIPE_DATA_DIR%\logs"
+if errorlevel 1 exit /b 1
+echo Data directory: %BILI_RECIPE_DATA_DIR%
+start "Bili Recipe Mobile" /b "%PYTHON_EXE%" -m uvicorn bili_recipe_notes.mobile_api:app --host 0.0.0.0 --port 8765 --no-access-log >"%BILI_RECIPE_DATA_DIR%\logs\mobile-api.log" 2>&1
 "%PYTHON_EXE%" -m streamlit run bili_recipe_notes/ui.py --server.address=0.0.0.0 --server.port=8501 --browser.serverAddress=%LAN_IP%
 taskkill /fi "WINDOWTITLE eq Bili Recipe Mobile" /t /f >nul 2>nul
 
