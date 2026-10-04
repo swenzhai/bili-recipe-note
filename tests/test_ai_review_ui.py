@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from bili_recipe_notes import ai_review_ui
+from bili_recipe_notes import ai_review_ui, ai_review_dashboard
 from bili_recipe_notes.history import scan_history
 from bili_recipe_notes.review_policy import (
     AI_REVIEW_FILE_NAME, AI_REVIEW_PROMPT_VERSION, AI_REVIEW_RULES_VERSION,
@@ -18,6 +18,7 @@ from bili_recipe_notes.review_policy import (
 def isolate_ui_data(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("BILI_RECIPE_DATA_DIR", raising=False)
+    monkeypatch.setattr(ai_review_dashboard, "list_ai_review_batches", lambda *args: ai_review_ui.list_ai_review_batches(*args))
 
 
 def _write_recipe(root: Path, name: str, *, hidden: bool = False) -> Path:
@@ -153,6 +154,29 @@ def test_running_batch_disables_duplicate_start_and_can_request_pause(tmp_path: 
     at.button(key="ai_review_stop").click().run()
     assert not at.exception
     assert calls == [(str(tmp_path), "running-test")]
+
+
+def test_resumed_older_task_is_selected_and_stays_visible_when_viewing_history(tmp_path: Path, monkeypatch) -> None:
+    _write_recipe(tmp_path, "鸡蛋")
+    current = {"batch_id": "older-running", "status": "running", "active": True,
+               "total": 20, "completed": 3, "items": [], "created_at": "2026-09-01"}
+    history = {"batch_id": "newer-finished", "status": "completed", "active": False,
+               "total": 1, "completed": 1, "items": [], "created_at": "2026-09-02"}
+    monkeypatch.setattr(ai_review_ui, "list_ai_review_batches", lambda *args: [history, current])
+    monkeypatch.setattr(ai_review_ui, "get_ai_review_batch", lambda root, batch_id=None: current if batch_id == current["batch_id"] else history)
+    at = _open_page(tmp_path)
+    assert not at.exception
+    assert at.selectbox(key="ai_review_batch_select").value == current["batch_id"]
+    at.selectbox(key="ai_review_batch_select").set_value(history["batch_id"]).run()
+    assert not at.exception
+    assert at.selectbox(key="ai_review_batch_select").value == history["batch_id"]
+    assert next(metric.value for metric in at.metric if metric.label == "审核总数") == "20"
+    assert at.button(key="ai_review_start").disabled
+    current.update(status="completed", active=False, updated_at="2026-09-30", completed=20)
+    at.button(key="ai_review_dashboard_refresh").click().run()
+    assert not at.exception
+    assert next(metric.value for metric in at.metric if metric.label == "审核完成") == "20"
+    assert not at.button(key="ai_review_start").disabled
 
 
 def test_history_combines_review_tags_without_rewriting_recipe(tmp_path: Path) -> None:

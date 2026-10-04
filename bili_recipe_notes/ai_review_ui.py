@@ -15,6 +15,9 @@ from .ai_review_runner import (
 )
 from .config import UIConfig
 from .ai_review_workbench import render_review_workbench
+from .ai_review_dashboard import (
+    STATUS_LABELS, preferred_review_batch, render_ai_review_dashboard, render_batch_status as _render_batch_status,
+)
 from .file_cache import read_json_cached
 from .mobile_sync import recipe_visibility_states
 from .review_policy import (
@@ -31,18 +34,6 @@ CLASSIFICATION_LABELS = {
     "non_recipe": "非菜谱",
     "uncertain": "无法确认",
 }
-STATUS_LABELS = {
-    "queued": "等待启动",
-    "running": "审核中",
-    "paused": "已暂停",
-    "completed": "已完成",
-    "completed_with_errors": "已结束，部分失败",
-    "interrupted": "任务中断，可续跑",
-    "failed": "失败",
-    "pending": "待审核",
-    "skipped": "已跳过",
-}
-
 
 def _llm_options(config: UIConfig) -> dict[str, Any]:
     return {
@@ -93,31 +84,6 @@ def _notice(st, message: str) -> None:
     st.rerun()
 
 
-def _render_batch_status(st, batch: dict[str, Any]) -> None:
-    completed = int(batch.get("completed") or 0)
-    failed = int(batch.get("failed") or 0)
-    skipped = int(batch.get("skipped") or 0)
-    total = int(batch.get("total") or 0)
-    st.caption(f"任务 {batch['batch_id']} · {STATUS_LABELS.get(batch.get('status'), batch.get('status'))}")
-    st.progress(
-        min(1.0, (completed + failed + skipped) / total) if total else 1.0,
-        text=f"成功 {completed} · 失败 {failed} · 跳过 {skipped} · 共 {total} 条",
-    )
-    if batch.get("current_folder"):
-        st.caption("当前：" + Path(batch["current_folder"]).name)
-    if batch.get("stop_requested") and batch.get("active"):
-        st.caption("已请求暂停，正在等待当前条目结束。")
-    if batch.get("error"):
-        st.warning(str(batch["error"]))
-    failures = [item for item in batch.get("items", []) if item.get("status") == "failed"]
-    if failures:
-        with st.expander(f"失败明细（{len(failures)} 条）"):
-            st.dataframe([
-                {"目录": Path(item["folder"]).name, "错误": item.get("error", "")}
-                for item in failures
-            ], hide_index=True, width="stretch")
-
-
 def _render_review_history(st, folder: Path) -> None:
     with st.expander("审核历史"):
         try:
@@ -155,6 +121,7 @@ def render_ai_review_page(st, config: UIConfig) -> None:
         "审核结果独立保存，原始报告、字幕和已有菜谱正文保持原样。"
         "明确的非菜谱或技巧资料默认隐藏；不确定内容保留展示，供人工复核。"
     )
+    render_ai_review_dashboard(st, config.out_dir)
     notice = st.session_state.pop("_ai_review_notice", None)
     if notice:
         st.success(notice)
@@ -164,7 +131,7 @@ def render_ai_review_page(st, config: UIConfig) -> None:
     try:
         records = _review_records(config.out_dir)
         batches = list_ai_review_batches(config.out_dir)
-        latest = get_ai_review_batch(config.out_dir)
+        latest = preferred_review_batch(batches)
     except Exception as exc:
         st.error(f"审核数据读取失败：{exc}")
         return
@@ -212,20 +179,14 @@ def render_ai_review_page(st, config: UIConfig) -> None:
     if batches:
         batch_ids = [item["batch_id"] for item in batches]
         if st.session_state.get("ai_review_batch_select") not in batch_ids:
-            st.session_state["ai_review_batch_select"] = batch_ids[0]
+            st.session_state["ai_review_batch_select"] = latest["batch_id"] if latest else batch_ids[0]
         batch_id = st.selectbox("审核任务", batch_ids, key="ai_review_batch_select")
         batch = get_ai_review_batch(config.out_dir, batch_id)
         if batch:
-            @st.fragment(run_every="5s" if batch.get("active") else None)
-            def live_progress():
-                current = get_ai_review_batch(config.out_dir, batch_id)
-                if current is None:
-                    return
-                if batch.get("active") and not current.get("active"):
-                    st.rerun()
-                _render_batch_status(st, current)
-
-            live_progress()
+            if latest and batch_id != latest["batch_id"]:
+                with st.expander("所选历史任务进度", expanded=True):
+                    _render_batch_status(st, batch)
+            st.caption(f"以下操作作用于任务 {batch_id} · {STATUS_LABELS.get(batch.get('status'), batch.get('status'))}")
             retry_config = st.radio(
                 "继续或重试时使用的配置", ["当前侧栏配置", "原任务配置"],
                 horizontal=True, key="ai_review_retry_config",

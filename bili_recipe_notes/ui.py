@@ -25,6 +25,7 @@ from streamlit_cropper import st_cropper
 
 try:
     from .ai_review_ui import render_ai_review_page
+    from .ai_review_dashboard import render_ai_review_dashboard
     from .ui_batch_page import BatchPageHelpers, render_batch_page
     from .ui_edit_page import EditPageHelpers, INGREDIENT_COLUMNS, STEP_COLUMNS, render_edit_page
     from .batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state, selectable_items
@@ -142,6 +143,7 @@ try:
     from .web_export import build_web_library_payload, web_library_bytes
 except ImportError:  # pragma: no cover - supports direct streamlit script execution
     from bili_recipe_notes.ai_review_ui import render_ai_review_page
+    from bili_recipe_notes.ai_review_dashboard import render_ai_review_dashboard
     from bili_recipe_notes.ui_batch_page import BatchPageHelpers, render_batch_page
     from bili_recipe_notes.ui_edit_page import EditPageHelpers, INGREDIENT_COLUMNS, STEP_COLUMNS, render_edit_page
     from bili_recipe_notes.batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state, selectable_items
@@ -1453,11 +1455,15 @@ def _render_batch_pause_control(st, batch_id: str, runtime: Any, *, key_prefix: 
         st.caption("任务已暂停，继续时沿用原配置。长时间暂停后，当前外部请求可能超时，失败项可在批次结束后重试。")
 
 
-def _render_background_dashboard(st) -> None:
+def _render_background_dashboard(st, config: UIConfig | None = None) -> None:
+    config = config or load_config()
     st.subheader("后台任务仪表盘")
-    st.caption("集中查看所有批处理任务；预计时间会根据本次运行的实际平均速度持续调整。")
+    st.caption("集中查看菜谱生成和 AI 审核任务；预计时间会根据本次运行的实际平均速度持续调整。")
+    render_ai_review_dashboard(
+        st, config.out_dir, key_prefix="dashboard_ai_review", refresh_seconds=5, show_open_button=True,
+    )
     refresh_seconds = st.selectbox(
-        "自动刷新频率",
+        "生成任务自动刷新频率",
         [10, 30, 60, 0],
         format_func=lambda value: "关闭自动刷新" if value == 0 else f"每 {value} 秒",
         key="dashboard_refresh_seconds",
@@ -1480,7 +1486,7 @@ def _render_background_dashboard(st) -> None:
         else:
             st.session_state["_dashboard_batch_states_cache"] = states
         if not states:
-            st.info("还没有后台批处理任务。可在“批量处理”中创建任务。")
+            st.info("还没有后台生成任务。可在“批量处理”中创建任务。")
             return
 
         runtime_by_id = {
@@ -1505,7 +1511,7 @@ def _render_background_dashboard(st) -> None:
 
         if active_states:
             paused_count = sum(runtime_by_id[state.batch_id].status == "paused" for state in active_states)
-            st.info(f"当前有 {len(active_states) - paused_count} 个后台任务正在运行，{paused_count} 个已暂停。")
+            st.info(f"当前有 {len(active_states) - paused_count} 个生成任务正在运行，{paused_count} 个已暂停。")
             for state in active_states:
                 runtime = runtime_by_id[state.batch_id]
                 summary = _batch_dashboard_summary(state, runtime)
@@ -1567,9 +1573,9 @@ def _render_background_dashboard(st) -> None:
                         st.session_state["_next_page"] = "批量处理"
                         st.rerun()
         else:
-            st.info("当前没有正在运行的后台任务。")
+            st.info("当前没有正在运行的后台生成任务。")
 
-        st.markdown("### 全部任务")
+        st.markdown("### 全部生成任务")
         dashboard_rows = []
         for state in states:
             runtime = runtime_by_id.get(state.batch_id)
@@ -4544,7 +4550,7 @@ def main() -> None:
                     _navigate_to_record(st, "草稿与归档", last_generated)
 
     if active_page == "任务仪表盘":
-        _render_background_dashboard(st)
+        _render_background_dashboard(st, config)
 
     if active_page == "菜谱库全览":
         _render_library_overview(st, config)

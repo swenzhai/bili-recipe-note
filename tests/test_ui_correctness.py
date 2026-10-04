@@ -830,6 +830,53 @@ def test_background_dashboard_renders_running_batch(monkeypatch) -> None:
     assert len(at.dataframe) == 1
 
 
+def test_background_dashboard_shows_ai_progress_without_generation_batches_and_opens_review(monkeypatch, tmp_path) -> None:
+    from bili_recipe_notes import ai_review_dashboard, ai_review_ui
+
+    out_dir = tmp_path / "selected-library"
+    folder = _write_record(out_dir, "current-dish", _recipe("当前审核菜谱"))
+    batch = {
+        "batch_id": "audit-only", "status": "running", "active": True,
+        "out_dir": str(out_dir), "created_at": "2026-08-19T03:00:00+00:00",
+        "updated_at": "2026-08-19T03:30:00+00:00", "run_token": "current-run",
+        "runs": [{"run_token": "current-run", "started_at": "2026-08-19T03:00:00+00:00"}],
+        "total": 3, "completed": 1, "failed": 0, "skipped": 0, "pending": 2,
+        "current_folder": folder.name,
+        "items": [
+            {"folder": "done-dish", "status": "completed", "finished_at": "2026-08-19T03:10:00+00:00"},
+            {"folder": folder.name, "status": "running", "started_at": "2026-08-19T03:10:00+00:00"},
+            {"folder": "pending-dish", "status": "pending"},
+        ],
+    }
+    requested_roots = []
+
+    def review_batches(root):
+        requested_roots.append(Path(root))
+        return [batch]
+
+    monkeypatch.setattr("bili_recipe_notes.batch_queue.list_batch_states", lambda: [])
+    monkeypatch.setattr(ai_review_dashboard, "list_ai_review_batches", review_batches)
+    monkeypatch.setattr(ai_review_ui, "list_ai_review_batches", lambda *_args: [batch])
+    monkeypatch.setattr(ai_review_ui, "get_ai_review_batch", lambda *_args: batch)
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(out_dir))
+    at.selectbox(key="main_page").set_value("任务仪表盘").run()
+
+    assert not at.exception
+    metrics = {metric.label: metric.value for metric in at.metric}
+    assert metrics["审核总数"] == "3"
+    assert metrics["审核完成"] == "1"
+    assert metrics["审核剩余"] == "2"
+    assert requested_roots and set(requested_roots) == {out_dir}
+    assert any("还没有后台生成任务" in message.value for message in at.info)
+
+    next(button for button in at.button if button.label == "查看审核详情").click().run()
+
+    assert not at.exception
+    assert at.selectbox(key="main_page").value == "AI 审核归类"
+    assert at.selectbox(key="ai_review_batch_select").value == "audit-only"
+
+
 @pytest.mark.parametrize("page,prefix", [("批量处理", "batch"), ("任务仪表盘", "dashboard")])
 @pytest.mark.skipif(not (sys.platform.startswith("linux") or sys.platform == "darwin"), reason="Requires Linux/macOS")
 def test_batch_pause_and_resume_buttons_survive_page_reload(monkeypatch, tmp_path, page, prefix) -> None:
