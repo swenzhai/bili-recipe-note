@@ -1,0 +1,33 @@
+import { useEffect, useState } from "react";
+import { api, errorMessage, post } from "./api";
+import type { PageProps } from "./types";
+import "./curation.css";
+
+const statuses: Record<string, string> = { draft: "待归档", archived: "已归档", stale: "归档后有修改", archive_error: "归档异常" };
+type Draft = { id: string; title: string; creator_name: string; category: string; archive_status: string; archive_note_path?: string; archived_at?: string; error?: string; revision: string };
+type Drafts = { items: Draft[]; total: number; page: number; page_size: number; counts: Record<string, number>; vault: string };
+
+export default function DraftsPage({ navigate }: PageProps) {
+  const query = new URLSearchParams(window.location.search);
+  const [search, setSearch] = useState(query.get("q") || "");
+  const [data, setData] = useState<Drafts | null>(null);
+  const [error, setError] = useState("");
+  const [revision, refresh] = useState(0);
+  const [selected, setSelected] = useState<Map<string, Draft>>(new Map());
+  const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const queryKey = query.toString();
+  useEffect(() => { const controller = new AbortController(); setError(""); api<Drafts>(`/drafts?${queryKey}`, { signal: controller.signal }).then(setData).catch(error => { if (!controller.signal.aborted) setError(errorMessage(error)); }); return () => controller.abort(); }, [queryKey, revision]);
+  function update(changes: Record<string, string>) { const next = new URLSearchParams(window.location.search); next.delete("page"); for (const [key, value] of Object.entries(changes)) if (value) next.set(key, value); else next.delete(key); navigate(`/drafts?${next}`); }
+  const toggle = (row: Draft) => { setSelected(current => { const next = new Map(current); if (next.has(row.id)) next.delete(row.id); else next.set(row.id, row); return next; }); setConfirming(false); };
+  async function archive() { setBusy(true); setError(""); try { const result = await post<{ id: string }>("/drafts/archive", { items: [...selected.values()].map(row => ({ id: row.id, revision: row.revision })) }); navigate(`/tasks?kind=settings&id=${encodeURIComponent(result.id)}`); } catch (error) { setError(errorMessage(error)); } finally { setBusy(false); } }
+  const allSelected = Boolean(data?.items.length) && data!.items.every(row => selected.has(row.id));
+  return <div className="adm-page"><header className="adm-page-head"><div><span className="adm-eyebrow">KEEP YOUR RECIPES CLOSE</span><h1>草稿与归档</h1><p className="adm-muted">把已整理的菜谱归档到 Obsidian，让好味道随时可查。</p></div><button className="adm-btn" onClick={() => navigate("/library")}>回到菜谱库</button></header>{error && <div className="adm-error" role="alert">{error}<button className="adm-btn small" onClick={() => { setSelected(new Map()); setConfirming(false); refresh(value => value + 1); }}>重新加载</button></div>}
+    <div className="adm-stat-grid">{Object.entries(statuses).map(([status, label]) => <button className="adm-stat-card" key={status} onClick={() => update({ status })}><div className="adm-stat-top">{label}</div><strong>{data?.counts[status] ?? "—"}</strong></button>)}</div>
+    <form className="adm-actions" onSubmit={event => { event.preventDefault(); update({ q: search }); }}><input aria-label="搜索归档菜谱" value={search} onChange={event => setSearch(event.target.value)} placeholder="搜索菜名、分类或 UP 主"/><select aria-label="归档状态" value={query.get("status") || "all"} onChange={event => update({ status: event.target.value })}><option value="all">全部状态</option>{Object.entries(statuses).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><button className="adm-btn" type="submit">搜索</button><button type="button" className="adm-btn" onClick={() => navigate("/settings?tab=config")}>归档设置</button></form>
+    {data && <p className="adm-muted adm-path-note">归档位置：{data.vault}</p>}
+    {selected.size > 0 && <section className="adm-selection-bar"><strong>已选择 {selected.size} 道菜谱</strong><div className="adm-actions"><button className="adm-text-button" onClick={() => { setSelected(new Map()); setConfirming(false); }}>清空选择</button><button className="adm-btn primary" disabled={busy || selected.size > 200} onClick={() => setConfirming(!confirming)}>归档所选菜谱</button></div>{selected.size > 200 && <p className="adm-error">每批最多 200 道，请减少选择。</p>}{confirming && <div className="adm-selection-confirm"><p>将这 {selected.size} 道菜谱的当前笔记和引用图片保存到上述 Obsidian 目录。已有归档会更新；若检测到 Vault 中的手写修改，会保留修改并记录冲突，其他菜谱继续处理。</p><div className="adm-actions"><button className="adm-btn primary" disabled={busy} onClick={() => void archive()}>{busy ? "正在安排归档…" : "开始后台归档"}</button><button className="adm-btn" onClick={() => setConfirming(false)}>取消</button></div></div>}</section>}
+    {!data ? <div className="adm-loading" role="status">正在读取草稿…</div> : !data.items.length ? <div className="adm-empty"><h2>当前没有符合条件的草稿</h2><p>可以调整筛选，或回菜谱库看看。</p></div> : <div className="adm-table-wrap"><table className="adm-table"><thead><tr><th><input type="checkbox" aria-label="选择本页草稿" checked={allSelected} onChange={() => { setSelected(current => { const next = new Map(current); for (const row of data.items) if (allSelected) next.delete(row.id); else next.set(row.id, row); return next; }); setConfirming(false); }}/></th><th>菜谱</th><th>状态</th><th>最近归档</th><th>操作</th></tr></thead><tbody>{data.items.map(row => <tr key={row.id}><td><input type="checkbox" checked={selected.has(row.id)} onChange={() => toggle(row)} aria-label={`选择${row.title}`}/></td><td><strong>{row.title}</strong><small className="adm-draft-meta">{row.creator_name} · {row.category}</small>{row.error && <small className="adm-draft-error">{row.error}</small>}</td><td><span className={`adm-badge ${row.archive_status === "archived" ? "success" : row.archive_status === "archive_error" ? "danger" : "warning"}`}>{statuses[row.archive_status]}</span></td><td>{row.archived_at ? new Date(row.archived_at).toLocaleDateString("zh-CN") : "—"}</td><td><div className="adm-actions"><button className="adm-text-button" onClick={() => navigate(`/recipes/${encodeURIComponent(row.id)}`)}>查看</button><button className="adm-text-button" onClick={() => navigate(`/recipes/${encodeURIComponent(row.id)}/edit`)}>编辑</button></div></td></tr>)}</tbody></table></div>}
+    {data && data.total > data.page_size && <nav className="adm-pagination" aria-label="草稿分页"><button className="adm-btn" disabled={data.page <= 1} onClick={() => update({ page: String(data.page - 1) })}>上一页</button><span>{data.page} / {Math.ceil(data.total / data.page_size)}</span><button className="adm-btn" disabled={data.page * data.page_size >= data.total} onClick={() => update({ page: String(data.page + 1) })}>下一页</button></nav>}
+  </div>;
+}

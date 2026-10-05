@@ -545,6 +545,9 @@ def _validate_required_recipe_outputs(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
+    if len(sys.argv) == 5 and sys.argv[1] == "--admin-creator-worker":
+        from .admin_creator_worker import main as creator_worker_main
+        return creator_worker_main(sys.argv[2:])
     if len(sys.argv) == 4 and sys.argv[1] == "--frame-selection-supervisor":
         from .frame_selection_service import supervisor_main
 

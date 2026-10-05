@@ -221,11 +221,16 @@ def create_app(
         path, mime_type = found
         return FileResponse(path, media_type=mime_type, filename=path.name)
 
+    from .admin_api import create_admin_router
+    app.include_router(create_admin_router(store, indexer))
+
     built_web = Path(static_dir).resolve() if static_dir else Path(__file__).resolve().parents[1] / "web" / "dist"
     index_file = built_web / "index.html"
     if index_file.is_file():
         @app.get("/{path:path}", include_in_schema=False)
         def static_app(path: str):
+            if path.startswith("api/"):
+                raise HTTPException(404, "API endpoint not found")
             candidate = (built_web / path).resolve()
             try:
                 candidate.relative_to(built_web)

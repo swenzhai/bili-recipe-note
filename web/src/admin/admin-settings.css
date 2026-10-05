@@ -1,0 +1,26 @@
+.adm-settings-grid { grid-template-columns: repeat(2,minmax(0,1fr)); align-items: start; }
+.adm-span-all { grid-column: 1 / -1; }
+.adm-check { display: inline-flex; gap: .65rem; align-items: center; line-height: 1.5; }
+.adm-check input { width: 1rem; height: 1rem; flex-shrink: 0; accent-color: #176653; }
+.adm-check-list { display: grid; gap: .85rem; margin-top: 1.2rem; }
+.adm-logo-tools { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-top: 1rem; }
+.adm-logo-tools img { width: 80px; height: 80px; object-fit: contain; border: 1px solid #e4e8e6; border-radius: 12px; padding: .5rem; }
+.adm-wrap { overflow-wrap: anywhere; white-space: pre-wrap; }
+.adm-operation { padding: 1.15rem 0; border-bottom: 1px solid #e6eae7; }
+.adm-operation:last-child { border-bottom: 0; }
+.adm-operation progress { width: 100%; height: .45rem; margin: .85rem 0; accent-color: #176653; }
+.adm-environment-check { padding: 1rem 0; border-top: 1px solid #e6eae7; }
+.adm-knowledge-layout { display: grid; grid-template-columns: minmax(280px,.8fr) minmax(0,1.2fr); gap: 1.25rem; align-items: start; }
+.adm-knowledge-card { background: #fff; border: 1px solid #e0e6e1; border-radius: 12px; padding: 1rem; margin-bottom: .75rem; cursor: pointer; width: 100%; color: inherit; text-align: left; }
+.adm-knowledge-card.selected { border-color: #176653; box-shadow: 0 0 0 1px #176653; }
+.adm-knowledge-card h3 { margin: .3rem 0; }
+.adm-knowledge-card p { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; margin: .5rem 0; }
+.adm-knowledge-body { white-space: pre-wrap; line-height: 1.8; overflow-wrap: anywhere; }
+.adm-knowledge-source { background: #f4f6f1; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+.adm-recipe-pick-list { max-height: 300px; overflow: auto; display: grid; gap: .6rem; padding: .5rem 0; }
+.adm-recipe-pick-list label { padding: .45rem; border-bottom: 1px solid #e8ece8; }
+.adm-menu-image-preview { width: 100%; max-height: 480px; object-fit: contain; display: block; margin: 1rem 0; border-radius: 8px; }
+.adm-pairing-preview { display: grid; justify-items: start; gap: 1rem; padding-top: 1rem; overflow-wrap: anywhere; }
+.adm-pairing-preview img { width: 220px; max-width: 100%; }
+.adm-pairing-preview textarea { width: 100%; }
+@media (max-width: 900px) { .adm-settings-grid, .adm-knowledge-layout { grid-template-columns: 1fr; } }

@@ -6,6 +6,9 @@ cd "$(dirname "$0")" || exit 1
 
 if [ -n "${PYTHON:-}" ]; then
     BOOTSTRAP_PYTHON="$PYTHON"
+elif [ -x ".venv/bin/python" ] && \
+     ".venv/bin/python" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+    BOOTSTRAP_PYTHON=".venv/bin/python"
 elif command -v python3 >/dev/null 2>&1; then
     BOOTSTRAP_PYTHON="$(command -v python3)"
 else
@@ -18,14 +21,14 @@ echo "项目目录：$(pwd)"
 echo
 
 if [ ! -f "web/dist/index.html" ]; then
-    echo "未找到手机网页构建产物 web/dist/index.html。"
+    echo "未找到网页构建产物 web/dist/index.html。"
     echo "请先运行：cd web && corepack pnpm install && corepack pnpm build"
     exit 1
 fi
 
 if ! "$BOOTSTRAP_PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
     echo "需要 Python 3.10 或更新版本。"
-    echo "当前版本：$($BOOTSTRAP_PYTHON --version 2>&1)"
+    echo "当前版本：$("$BOOTSTRAP_PYTHON" --version 2>&1)"
     exit 1
 fi
 
@@ -38,6 +41,10 @@ if [ ! -x ".venv/bin/python" ]; then
 fi
 
 PYTHON_EXE=".venv/bin/python"
+if ! "$PYTHON_EXE" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
+    echo "现有 .venv 无法运行 Python 3.10+。请备份该目录，再用有效的 Python 重建虚拟环境。"
+    exit 1
+fi
 if command -v sha256sum >/dev/null 2>&1; then
     REQUIREMENTS_ID="$(sha256sum requirements.txt | awk '{print $1}')"
 elif command -v shasum >/dev/null 2>&1; then
@@ -84,82 +91,24 @@ detect_lan_ip() {
 
 LAN_IP="$(detect_lan_ip)"
 echo
-echo "本机访问：http://127.0.0.1:8501"
+echo "本机访问：http://127.0.0.1:8765/admin/"
 if [ "$LAN_IP" != "127.0.0.1" ]; then
-    echo "局域网访问：http://$LAN_IP:8501"
+    echo "局域网访问：http://$LAN_IP:8765/admin/"
 else
-    echo "未能自动获取局域网 IP；可运行 'hostname -I' 查看后访问 http://<局域网IP>:8501"
+    echo "未能自动获取局域网 IP；可运行 'hostname -I' 查看后访问 http://<局域网IP>:8765/admin/"
 fi
 echo "移动点餐客户端：http://$LAN_IP:8765"
-echo "仅限可信局域网使用，请勿把 8501 或 8765 端口暴露到公网。"
-echo "按 Ctrl+C 可停止全部服务。"
+echo "仅限可信局域网使用，请勿把 8765 端口暴露到公网。"
+echo "按 Ctrl+C 可停止服务。"
 echo
 
 BILI_RECIPE_DATA_DIR="$("$PYTHON_EXE" -c 'from bili_recipe_notes.data_paths import data_root; print(data_root())')" || exit 1
 export BILI_RECIPE_DATA_DIR
 RECIPE_LOG_DIR="$BILI_RECIPE_DATA_DIR/logs"
 mkdir -p "$RECIPE_LOG_DIR" || exit 1
-API_LOG="$RECIPE_LOG_DIR/mobile-api.log"
-UI_LOG="$RECIPE_LOG_DIR/ui.log"
-echo "数据目录：$BILI_RECIPE_DATA_DIR"
-API_PID=""
-cleanup_api() {
-    if [ -n "$API_PID" ] && kill -0 "$API_PID" >/dev/null 2>&1; then
-        kill "$API_PID" >/dev/null 2>&1 || true
-        wait "$API_PID" >/dev/null 2>&1 || true
-    fi
-}
-trap cleanup_api EXIT INT TERM
-
-"$PYTHON_EXE" -m uvicorn bili_recipe_notes.mobile_api:app \
-    --host 0.0.0.0 \
-    --port 8765 \
-    --no-access-log >"$API_LOG" 2>&1 &
-API_PID=$!
-
-API_READY=0
-for _ in $(seq 1 40); do
-    if ! kill -0 "$API_PID" >/dev/null 2>&1; then
-        break
-    fi
-    if "$PYTHON_EXE" -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/v1/health', timeout=1)" >/dev/null 2>&1; then
-        API_READY=1
-        break
-    fi
-    sleep 0.25
-done
-if [ "$API_READY" -ne 1 ]; then
-    echo "手机同步 API 启动失败，最近的日志如下："
-    tail -n 30 "$API_LOG" 2>/dev/null || true
-    exit 1
-fi
-
-export ARROW_DEFAULT_MEMORY_POOL="system"
-UI_RESTART_COUNT=0
-UI_MAX_RESTARTS=3
-while true; do
-    "$PYTHON_EXE" -m streamlit run bili_recipe_notes/ui.py \
-        --server.address=0.0.0.0 \
-        --server.port=8501 \
-        --browser.serverAddress="$LAN_IP" \
-        --server.headless=true 2>&1 | tee -a "$UI_LOG"
-    UI_STATUS=${PIPESTATUS[0]}
-    if [ "$UI_STATUS" -eq 0 ] || [ "$UI_STATUS" -eq 130 ] || [ "$UI_STATUS" -eq 143 ]; then
-        break
-    fi
-    UI_RESTART_COUNT=$((UI_RESTART_COUNT + 1))
-    if [ "$UI_RESTART_COUNT" -gt "$UI_MAX_RESTARTS" ]; then
-        echo "UI 多次停止，最近的日志如下："
-        tail -n 60 "$UI_LOG" 2>/dev/null || true
-        break
-    fi
-    echo
-    echo "UI 异常退出（状态码 $UI_STATUS），2 秒后重新启动..."
-    echo "诊断日志：$UI_LOG"
-    sleep 2
-done
-
-cleanup_api
-trap - EXIT INT TERM
-echo
-echo "服务已停止。"
+UI_LOG="$RECIPE_LOG_DIR/admin-web.log"
+echo "Data directory: $BILI_RECIPE_DATA_DIR"
+"$PYTHON_EXE" -m bili_recipe_notes.ui_launcher --host 0.0.0.0 --port 8765 --no-browser 2>&1 | tee -a "$UI_LOG"
+UI_STATUS=${PIPESTATUS[0]}
+echo "Service stopped. Log: $UI_LOG"
+exit "$UI_STATUS"

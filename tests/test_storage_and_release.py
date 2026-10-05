@@ -138,7 +138,7 @@ def test_ui_launcher_resolves_bundled_ui_and_binds_loopback(monkeypatch, tmp_pat
     from streamlit.web import cli as streamlit_cli
 
     monkeypatch.setattr(streamlit_cli, "main", lambda: 0)
-    monkeypatch.setattr(sys, "argv", [])
+    monkeypatch.setattr(sys, "argv", ["ui", "--legacy-ui"])
     assert ui_launcher.main() == 0
     assert "--server.address=127.0.0.1" in sys.argv
     assert "--browser.serverAddress=127.0.0.1" in sys.argv
@@ -152,3 +152,19 @@ def test_packaging_specs_use_real_entrypoints_and_bundle_streamlit_ui() -> None:
     assert '"bili_recipe_notes/__main__.py"' in cli_spec
     assert '("bili_recipe_notes/ui.py", "bili_recipe_notes")' in ui_spec
     assert "collect_data_files(\"streamlit\")" in ui_spec
+    assert '("web/dist", "web/dist")' in ui_spec
+
+
+def test_react_launcher_defaults_to_loopback_and_serves_bundled_web(monkeypatch, tmp_path):
+    import uvicorn
+    from bili_recipe_notes import mobile_api
+    static = tmp_path / "web" / "dist"
+    static.mkdir(parents=True)
+    (static / "index.html").write_text("React")
+    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
+    monkeypatch.setattr(sys, "argv", ["ui", "--no-browser"])
+    seen = {}
+    monkeypatch.setattr(mobile_api, "create_app", lambda **kwargs: seen.update(kwargs) or "application")
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: seen.update(app=app, **kwargs))
+    assert ui_launcher.main() == 0
+    assert seen == {"static_dir": static, "app": "application", "host": "127.0.0.1", "port": 8765, "access_log": False}

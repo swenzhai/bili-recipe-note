@@ -1,0 +1,92 @@
+export type PageProps = { navigate: (path: string) => void };
+
+export type RecipeSummary = {
+  id: string;
+  title: string;
+  category: string;
+  creator_name: string;
+  published: boolean;
+  recommended?: boolean;
+  hidden: boolean;
+  cover_status?: string;
+  cover_url?: string | null;
+  updated_at?: string;
+  review_status?: string;
+};
+
+export type TaskSummary = {
+  id: string;
+  kind: string;
+  title: string;
+  status: string;
+  total: number;
+  processed: number;
+  completed: number;
+  failed: number;
+  skipped: number;
+  not_found?: number;
+  progress: number;
+  current?: string;
+  elapsed_seconds: number;
+  eta_seconds?: number | null;
+  updated_at: string;
+  can_pause: boolean;
+  can_resume: boolean;
+  can_retry: boolean;
+  items?: Record<string, unknown>[];
+  log?: string;
+  options?: Record<string, unknown>;
+  already_running?: boolean;
+  error?: string;
+  current_progress?: Record<string, unknown>;
+};
+
+export type RecipeIngredient = { name: string; amount?: string | null; note?: string | null; evidence?: string | null; source_time?: number | null };
+export type RecipeStep = { title?: string; action: string; heat?: string | null; duration?: string | null; tips?: string | null; start_time?: number; evidence?: string | null };
+export type DishInfo = {
+  summary?: string;
+  method?: string;
+  origin?: string;
+  background?: string;
+  source_note?: string;
+  status?: string;
+  search_status?: string;
+  warnings?: string[];
+  sources?: { title?: string; url?: string; excerpt?: string; match_status?: string }[];
+};
+export type RecipeDocument = {
+  title: string;
+  category?: string;
+  cuisine?: string;
+  creator_name?: string;
+  uploader?: string;
+  source_url?: string;
+  servings?: string | null;
+  total_time?: string | null;
+  difficulty?: string | null;
+  tags?: string[];
+  ingredients?: RecipeIngredient[];
+  seasonings?: RecipeIngredient[];
+  tools?: string[];
+  prep_items?: string[];
+  steps?: RecipeStep[];
+  summary_tips?: string[];
+  uncertain_points?: string[];
+  [key: string]: unknown;
+};
+export type RecipeDetail = {
+  sync_warning?: string | null;
+  id: string;
+  recipe: RecipeDocument;
+  revision: string;
+  review?: Record<string, unknown> | null;
+  visibility?: { hidden?: boolean; published?: boolean; reason?: string; [key: string]: unknown };
+  note?: string;
+  source?: Record<string, unknown>;
+  transcript?: unknown;
+  cover_url?: string | null;
+  step_images?: { index: number; url: string }[];
+  frame_candidate?: Record<string, unknown> | null;
+  dish_info?: DishInfo | null;
+  archive_status?: unknown;
+};

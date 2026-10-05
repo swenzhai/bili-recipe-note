@@ -4564,6 +4564,7 @@ def main() -> None:
         _render_restaurant_meal_ui(st, meal_config)
         return
     st.title("Bili Recipe Notes")
+    st.info(f"新版管理工作台已迁移到 React：[打开新版](http://{_lan_ip_address()}:8765/admin/)。当前为旧版兼容界面。")
     _show_pending_notice(st)
 
     next_page = st.session_state.pop("_next_page", None)

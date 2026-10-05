@@ -8,6 +8,11 @@ else
     PYTHON_EXE="${PYTHON:-python3}"
 fi
 
+if [ ! -f "web/dist/index.html" ]; then
+    echo "Build the React client first: cd web && corepack pnpm install --frozen-lockfile && corepack pnpm build"
+    exit 1
+fi
+
 echo "Installing packaging requirements..."
 if ! "$PYTHON_EXE" -m pip install -r requirements-dev.txt; then
     echo "Failed to install requirements."

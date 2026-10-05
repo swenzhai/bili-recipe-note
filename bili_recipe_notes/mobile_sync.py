@@ -1882,6 +1882,66 @@ class MobileSyncStore:
             ).fetchall()
         return [self._practice_payload(row) for row in rows]
 
+    def management_recipe_folder(self, recipe_id: str) -> Path | None:
+        """Resolve one admin record without materializing the entire catalog."""
+        candidates = [candidate for candidate in dict(self._recipe_candidates).values()
+                      if candidate.recipe_id == recipe_id]
+        if candidates:
+            return max(candidates, key=lambda candidate: candidate.modified_ns).folder
+        with self._connect() as connection:
+            row = connection.execute("SELECT output_folder FROM recipes WHERE id=?", (recipe_id,)).fetchone()
+        return Path(row["output_folder"]) if row else None
+
+    def list_management_recipes(self) -> list[dict[str, Any]]:
+        """Read the existing index, including hidden candidates, without scanning.
+
+        Hidden-on-first-scan recipes never enter the public sync table. Include
+        the indexer's candidate snapshot so administrators can inspect/restore
+        them too. A cold service exposes persisted records while its scan runs.
+        """
+        with self._connect() as connection:
+            records = connection.execute("SELECT * FROM recipes").fetchall()
+            classifications = {
+                str(row["source_key"]): str(row["classification"])
+                for row in connection.execute("SELECT source_key,classification FROM video_sources")
+            }
+        catalog = {
+            str(row["id"]): {**dict(row), "payload": json.loads(str(row["payload_json"]))}
+            for row in records
+        }
+        latest: dict[str, _RecipeCandidate] = {}
+        for candidate in dict(self._recipe_candidates).values():
+            if candidate.recipe_id not in latest or candidate.modified_ns > latest[candidate.recipe_id].modified_ns:
+                latest[candidate.recipe_id] = candidate
+        for recipe_id, candidate in latest.items():
+            old = catalog.get(recipe_id, {})
+            catalog[recipe_id] = {
+                **old, "id": recipe_id, "output_folder": str(candidate.folder), "payload": candidate.payload,
+                "published": old.get("published", True), "recommended": old.get("recommended", False),
+                "updated_at": old.get("updated_at", ""), "deleted_at": old.get("deleted_at"),
+                "review_state": candidate.review_state,
+            }
+        result = []
+        for row in catalog.values():
+            folder = Path(row["output_folder"]).resolve()
+            if not folder.is_relative_to(self.out_dir.resolve()) or not (folder / "recipe.json").is_file():
+                continue
+            payload = row["payload"]
+            review = row.get("review_state") or get_review_state(folder)
+            policy = resolve_record_visibility(
+                review["record"], review["ai_review"], published=bool(row["published"]),
+                source_classification=classifications.get(normalize_source_url(str(payload.get("source_url") or ""))),
+            )
+            result.append({
+                "id": row["id"], "output_folder": str(folder), "payload": payload,
+                "title": str(payload.get("title") or row["id"]), "category": str(payload.get("category") or ""),
+                "creator_name": str(payload.get("creator_name") or payload.get("uploader") or ""),
+                "published": bool(row["published"]), "recommended": bool(row["recommended"]),
+                "updated_at": row["updated_at"], "deleted_at": row.get("deleted_at"),
+                "hidden": policy["hidden"], "visibility": policy, "review_state": review,
+            })
+        return result
+
     def list_indexed_recipes(self, include_deleted: bool = False) -> list[dict[str, Any]]:
         where = "" if include_deleted else "WHERE deleted_at IS NULL"
         with self._connect() as connection:

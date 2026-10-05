@@ -8,6 +8,12 @@ if not exist "%PYTHON_EXE%" (
     set "PYTHON_EXE=python"
 )
 
+if not exist "web\dist\index.html" (
+    echo Build the React client first: cd web ^&^& corepack pnpm install --frozen-lockfile ^&^& corepack pnpm build
+    pause
+    exit /b 1
+)
+
 echo Installing packaging requirements...
 "%PYTHON_EXE%" -m pip install -r requirements-dev.txt
 if errorlevel 1 (
