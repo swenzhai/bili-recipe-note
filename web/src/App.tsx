@@ -3,14 +3,17 @@ import {
   menuRecipes, mergeChanges, optimisticallyAddQuantity, optimisticallySetDishStage,
   pendingActionKey, synchronizeBatch,
 } from "./sync";
+import { MENU_PAGE_SIZE, ORDER_CATEGORIES, recipeOrderCategories, recipeSearchText } from "./menu";
+import type { OrderCategory } from "./menu";
+import { RecipeContent } from "./RecipeContent";
+import { createSnapshotWriter } from "./persistence";
 import type { Recipe, Selection, MealPhase, Meal, Practice, Plan, Pair, Device, Branding, Operation, QueuedOperation, SyncPayload } from "./sync";
 
 const DB_NAME = "bili-recipe-lan";
 const OUTBOX_STORE = "outbox_v3";
 const CAPABILITIES = ["recipe", "practice_log", "meal_plan", "meal_order", "meal_selection", "meal_dish_state"];
 const CAPABILITY_KEY = CAPABILITIES.slice().sort().join(",");
-const ORDER_CATEGORIES = ["全部", "主厨推荐", "主菜", "肉类", "海鲜", "主食", "面条", "糕点", "汤羹", "小吃", "饮品", "素菜", "其他"] as const;
-type OrderCategory = typeof ORDER_CATEGORIES[number];
+let databasePromise: Promise<IDBDatabase> | undefined;
 
 function newUuid(): string {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
@@ -23,7 +26,8 @@ function newUuid(): string {
 }
 
 function openDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (databasePromise) return databasePromise;
+  databasePromise = new Promise<IDBDatabase>((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, 3);
     request.onupgradeneeded = () => {
       const database = request.result;
@@ -43,9 +47,13 @@ function openDb(): Promise<IDBDatabase> {
         }
       }
     };
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      request.result.onversionchange = () => { request.result.close(); databasePromise = undefined; };
+      resolve(request.result);
+    };
     request.onerror = () => reject(request.error);
-  });
+  }).catch(error => { databasePromise = undefined; throw error; });
+  return databasePromise;
 }
 
 async function readState<T>(key: string, fallback: T): Promise<T> {
@@ -63,6 +71,18 @@ async function writeState(key: string, value: unknown): Promise<void> {
     const transaction = database.transaction("state", "readwrite");
     transaction.objectStore("state").put(value, key);
     transaction.oncomplete = () => resolve(); transaction.onerror = () => reject(transaction.error);
+  });
+}
+
+async function writeSnapshot(entries: [string, unknown][]): Promise<void> {
+  const database = await openDb();
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction("state", "readwrite");
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error || new Error("缓存写入已中断"));
+    try { for (const [key, value] of entries) transaction.objectStore("state").put(value, key); }
+    catch (error) { transaction.abort(); reject(error); }
   });
 }
 
@@ -126,6 +146,24 @@ async function cachedAsset(digest: string): Promise<Blob | undefined> {
   });
 }
 
+const pendingAssets = new Map<string, Promise<Blob | undefined>>();
+function loadAsset(digest: string, server: string, token: string): Promise<Blob | undefined> {
+  const key = `${server}:${token}:${digest}`;
+  const existing = pendingAssets.get(key);
+  if (existing) return existing;
+  const request = (async () => {
+    const cached = await cachedAsset(digest).catch(() => undefined);
+    if (cached || !navigator.onLine) return cached;
+    const response = await fetch(`${server}/api/v1/assets/${digest}`, { headers: { Authorization: `Bearer ${token}` } });
+    if (!response.ok) return undefined;
+    const blob = await response.blob();
+    void cacheAsset(digest, blob).catch(() => undefined);
+    return blob;
+  })().finally(() => pendingAssets.delete(key));
+  pendingAssets.set(key, request);
+  return request;
+}
+
 function mealOp(action: string, meal: Meal | null, extra: Partial<Operation> = {}): Operation {
   return { op_id: newUuid(), entity_type: "meal_selection", action, order_id: meal?.order.id, epoch: meal?.order.epoch, phase: meal?.order.phase, ...extra };
 }
@@ -136,33 +174,9 @@ function recipeThumbnail(recipe?: Recipe): string | undefined {
     || recipe?.assets?.find(asset => asset.kind === "recipe_cover")?.sha256;
 }
 
-function recipeOrderCategories(recipe: Recipe): OrderCategory[] {
-  const category = String(recipe.category || "");
-  const title = String(recipe.title || "");
-  const text = [title, category, ...(recipe.tags || []), ...(recipe.ingredients || []).map(item => item.name || "")].join(" ");
-  const result = new Set<OrderCategory>();
-  if (recipe.recommended) result.add("主厨推荐");
-  const seafood = /(鱼|虾|蟹|贝|蚝|螺|鱿|鳝|海鲜|海胆|鲍|瑶柱|带子|龙虾|多宝鱼|生蚝)/;
-  const meat = /(猪|牛|羊|鸡|鸭|鹅|鸽|排骨|肉|叉烧|肥肠|生肠|牛杂|牛腩|牛展|乳鸽|猪手)/;
-  const noodle = /(炒面|汤面|拌面|伊面|面条|河粉|米粉|粉面|云吞|粉皮|牛河)/;
-  const staple = /(炒饭|煲仔饭|牛肉饭|米饭|砂锅粥|白粥|云吞|炒面|汤面|拌面|伊面|面条|河粉|米粉|牛河)/;
-  const pastry = /(蛋挞|拿破仑酥|糖沙翁|玉米糕|沙琪玛|糕点|点心|酥皮)/;
-  const vegetable = /(菜心|通菜|油麦菜|土豆丝|豆芽|韭菜|四季豆|菜花|凉瓜|节瓜|豆腐|茄子|青菜|蔬菜)/;
-  if (category === "中餐") result.add("主菜");
-  if (meat.test(text)) result.add("肉类");
-  if (seafood.test(text)) result.add("海鲜");
-  if (category === "主食" || staple.test(title)) result.add("主食");
-  if (noodle.test(text) && !/面粉/.test(title)) result.add("面条");
-  if (category === "糕点" || pastry.test(text)) result.add("糕点");
-  if (category === "汤羹" || /(汤|羹|炖汤|糖水)/.test(title)) result.add("汤羹");
-  if (category === "小吃") result.add("小吃");
-  if (category === "饮品") result.add("饮品");
-  if (category === "中餐" && vegetable.test(text) && !meat.test(text) && !seafood.test(text)) result.add("素菜");
-  if (![...result].some(item => item !== "主厨推荐") || category === "其他") result.add("其他");
-  return ORDER_CATEGORIES.filter(item => item !== "全部" && result.has(item));
-}
 
 export default function App() {
+  const [hydrated, setHydrated] = useState(false);
   const [device, setDevice] = useState<Device | null>(null);
   const [pair, setPair] = useState<Pair | null>(null);
   const [recipes, setRecipes] = useState<Recipe[]>([]);
@@ -178,7 +192,11 @@ export default function App() {
   const [tab, setTab] = useState<"menu" | "meal">("menu");
   const [deviceName, setDeviceName] = useState("");
   const [joinEnabled, setJoinEnabled] = useState(true);
-  const [selected, setSelected] = useState<Recipe | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selected = recipes.find(recipe => recipe.id === selectedId && recipe.published !== false) || null;
+  useEffect(() => { if (selectedId && !selected) setSelectedId(null); }, [selectedId, selected]);
+  const [visibleCount, setVisibleCount] = useState(MENU_PAGE_SIZE);
+  const [syncStatus, setSyncStatus] = useState<"loading" | "ready" | "error">("loading");
   const [branding, setBranding] = useState<Branding>({ name: "Chef Zhai", subtitle: "家庭厨房", has_logo: false });
   const mealRef = useRef<Meal | null>(null);
   const cursorRef = useRef(0);
@@ -186,12 +204,14 @@ export default function App() {
   const syncRequested = useRef(false);
   const realtime = useRef(false);
   const pendingActionsRef = useRef<Set<string>>(new Set());
+  const persistSnapshot = useRef(createSnapshotWriter(writeSnapshot));
   const server = location.origin;
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 2800); };
 
   useEffect(() => {
     if ("serviceWorker" in navigator) {
-      void navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).then(registration => registration.update());
+      void navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" })
+        .then(registration => registration?.update()).catch(() => undefined);
     }
     const encoded = new URLSearchParams(location.search).get("pairing");
     if (encoded) { try { setPair(JSON.parse(decodeURIComponent(encoded)) as Pair); } catch { flash("配对链接无效"); } }
@@ -203,8 +223,9 @@ export default function App() {
       if (savedPair) setPair(savedPair); if (savedDevice) setDevice(savedDevice);
       setRecipes(savedRecipes); mealRef.current = savedMeal; setMeal(savedMeal); setPractices(savedPractices); setPlans(savedPlans);
       const restoredCursor = key === CAPABILITY_KEY ? savedCursor : 0;
-      cursorRef.current = restoredCursor; setCursor(restoredCursor); void writeState("capability_key", CAPABILITY_KEY);
-    });
+      cursorRef.current = restoredCursor; setCursor(restoredCursor);
+      setHydrated(true);
+    }).catch(() => { setHydrated(true); flash("本机缓存暂时无法读取，正在连接服务器"); });
     void fetch("/api/v1/health").then(response => response.json()).then(health => setJoinEnabled(Boolean(health.self_join_enabled))).catch(() => undefined);
     void fetch("/api/v1/branding").then(response => response.ok ? response.json() : null).then(value => { if (value?.name) setBranding(value as Branding); }).catch(() => undefined);
     const updateOnline = () => setOnline(navigator.onLine);
@@ -214,11 +235,11 @@ export default function App() {
 
   useEffect(() => { if (pair) void writeState("pair", pair); }, [pair]);
   useEffect(() => { if (device) void writeState("device", device); }, [device]);
-  useEffect(() => { void writeState("recipes", recipes); }, [recipes]);
-  useEffect(() => { void writeState("meal", meal); }, [meal]);
-  useEffect(() => { void writeState("practices", practices); }, [practices]);
-  useEffect(() => { void writeState("plans", plans); }, [plans]);
-  useEffect(() => { cursorRef.current = cursor; void writeState("cursor", cursor); }, [cursor]);
+  useEffect(() => {
+    if (!hydrated) return;
+    void persistSnapshot.current({ recipes, meal, practices, plans, cursor, capability_key: CAPABILITY_KEY })
+      .catch(() => flash("本机缓存暂时无法保存，重新打开后将再次同步"));
+  }, [recipes, meal, practices, plans, cursor, hydrated]);
 
   const markPending = useCallback((operation: Partial<Operation>, pending: boolean) => {
     const key = pendingActionKey(operation);
@@ -264,16 +285,19 @@ export default function App() {
           return await response.json() as SyncPayload;
         },
         effects: { queue, dequeue, markPending, flash, prompt: (message, initial) => window.prompt(message, initial), newUuid },
+        onPage: ({ changes, bootstrap, mealSnapshot }) => {
+          setRecipes(current => mergeChanges<Recipe>(current, changes, "recipe", bootstrap));
+          setPractices(current => mergeChanges<Practice>(current, changes, "practice_log", bootstrap));
+          setPlans(current => mergeChanges<Plan>(current, changes, "meal_plan", bootstrap));
+          if (mealSnapshot !== undefined) { mealRef.current = mealSnapshot; setMeal(mealSnapshot); }
+        },
       });
-      const { changes, bootstrap, mealSnapshot, nextCursor } = result;
+      const { nextCursor } = result;
       resync = result.resync;
-      setRecipes(current => mergeChanges<Recipe>(current, changes, "recipe", bootstrap));
-      setPractices(current => mergeChanges<Practice>(current, changes, "practice_log", bootstrap));
-      setPlans(current => mergeChanges<Plan>(current, changes, "meal_plan", bootstrap));
-      if (mealSnapshot !== undefined) { mealRef.current = mealSnapshot; setMeal(mealSnapshot); }
       cursorRef.current = nextCursor;
       setCursor(nextCursor);
-    } catch (error) { if (navigator.onLine) flash(error instanceof Error ? error.message : "同步失败"); }
+      setSyncStatus("ready");
+    } catch (error) { setSyncStatus("error"); if (navigator.onLine) flash(error instanceof Error ? error.message : "同步失败"); }
     finally {
       syncing.current = false;
       if (resync || syncRequested.current) {
@@ -294,18 +318,24 @@ export default function App() {
     void sync();
     const polling = window.setInterval(() => { if (!realtime.current && navigator.onLine) void sync(); }, 3000);
     let stopped = false; let reconnectDelay = 1000;
+    const controller = new AbortController();
+    let reconnectTimer: number | undefined;
     const connect = async () => {
       try {
-        const response = await fetch(`${server}/api/v1/events`, { headers: { Authorization: `Bearer ${device.token}` } });
+        const response = await fetch(`${server}/api/v1/events`, { headers: { Authorization: `Bearer ${device.token}` }, signal: controller.signal });
         if (response.status === 401) { await deleteState("device"); setDevice(null); stopped = true; throw new Error(); }
         if (!response.ok || !response.body) throw new Error();
         realtime.current = true; reconnectDelay = 1000;
         const reader = response.body.getReader();
         while (!stopped) { const item = await reader.read(); if (item.done) break; if (item.value) void sync(); }
-      } catch { realtime.current = false; if (!stopped) { const delay = reconnectDelay; reconnectDelay = Math.min(30000, reconnectDelay * 2); window.setTimeout(connect, delay); } }
+      } catch { /* A disconnected stream uses the same reconnect path as a clean EOF. */ }
+      finally {
+        realtime.current = false;
+        if (!stopped) { const delay = reconnectDelay; reconnectDelay = Math.min(30000, reconnectDelay * 2); reconnectTimer = window.setTimeout(connect, delay); }
+      }
     };
     void connect();
-    return () => { stopped = true; realtime.current = false; window.clearInterval(polling); };
+    return () => { stopped = true; realtime.current = false; controller.abort(); window.clearTimeout(reconnectTimer); window.clearInterval(polling); };
   }, [device, server, sync]);
 
   async function pairDevice() {
@@ -352,18 +382,23 @@ export default function App() {
   }
 
   const availableRecipes = useMemo(() => menuRecipes(recipes), [recipes]);
+  const recipeIndex = useMemo(() => new Map(availableRecipes.map(recipe => [recipe.id, {
+    categories: recipeOrderCategories(recipe), search: recipeSearchText(recipe),
+  }])), [availableRecipes]);
   const categoryCounts = useMemo(() => {
     const counts = new Map<OrderCategory, number>([["全部", availableRecipes.length]]);
     for (const recipe of availableRecipes) {
-      for (const category of recipeOrderCategories(recipe)) counts.set(category, (counts.get(category) || 0) + 1);
+      for (const category of recipeIndex.get(recipe.id)?.categories || []) counts.set(category, (counts.get(category) || 0) + 1);
     }
     return counts;
-  }, [availableRecipes]);
+  }, [availableRecipes, recipeIndex]);
   const filtered = useMemo(() => availableRecipes.filter(recipe => {
-    const categoryMatches = selectedCategory === "全部" || recipeOrderCategories(recipe).includes(selectedCategory);
-    const queryMatches = !query || JSON.stringify(recipe).toLowerCase().includes(query.toLowerCase());
+    const index = recipeIndex.get(recipe.id)!;
+    const categoryMatches = selectedCategory === "全部" || index.categories.includes(selectedCategory);
+    const queryMatches = !query.trim() || index.search.includes(query.trim().toLocaleLowerCase());
     return categoryMatches && queryMatches;
-  }), [availableRecipes, query, selectedCategory]);
+  }), [availableRecipes, query, selectedCategory, recipeIndex]);
+  useEffect(() => { setVisibleCount(MENU_PAGE_SIZE); }, [query, selectedCategory]);
   const totalQuantity = (recipeId: string) => meal?.selections.filter(item => item.recipe_id === recipeId).reduce((sum, item) => sum + item.quantity, 0) || 0;
   const isOrdering = !meal?.order.phase || meal.order.phase === "ordering";
   const isChef = Boolean(meal?.order.chef_device_id && meal.order.chef_device_id === device?.id);
@@ -373,6 +408,7 @@ export default function App() {
   }, [categoryCounts, selectedCategory]);
 
   const brandLockup = <div className="brandLockup">{branding.has_logo && branding.logo_url ? <img className="brandLogo" src={branding.logo_url} alt={branding.name} /> : <div className="brandLogoFallback">{branding.name.toUpperCase()}</div>}<div><span className="eyebrow">{branding.name}</span><small>{branding.subtitle}</small></div></div>;
+  if (!hydrated) return <main className="pairing">{brandLockup}<p role="status">正在打开家庭厨房…</p></main>;
   if (!device) return <main className="pairing">{brandLockup}<h1>加入 {branding.name} {branding.subtitle}</h1><p>首次使用只需取一个设备名称，以后打开这个网址会自动进入家庭餐桌。</p>{joinEnabled ? <><input value={deviceName} onChange={event => setDeviceName(event.target.value)} placeholder="例如：小王的手机" autoFocus /><button onClick={() => void pairDevice()}>进入家庭厨房</button></> : <p className="hint">管理员暂时关闭了新设备加入。已加入的设备仍可正常使用。</p>}{notice && <div className="notice">{notice}</div>}</main>;
 
   return <main className="shell">
@@ -384,15 +420,26 @@ export default function App() {
       </div>
       <div className="menuSummary"><b>{selectedCategory}</b><span>{filtered.length} 道可选{selectedCategory === "全部" && categoryCounts.get("主厨推荐") ? ` · ${categoryCounts.get("主厨推荐")} 道推荐` : ""}{query ? " · 已应用搜索" : ""}</span></div>
       {!isOrdering && <div className="phaseNotice">{isChef ? "本餐已进入主厨模式，菜单内容只读，请前往本餐更新烹饪进度。" : "点单已完成。现在可以查看菜单和主厨实时进度，点餐内容已锁定。"}</div>}
-      {filtered.map(recipe => <article className={`recipe ${recipe.recommended ? "recommendedDish" : ""}`} key={recipe.id}><DishThumbnail recipe={recipe} server={server} token={device.token} /><button className="recipeInfo" onClick={() => setSelected(recipe)}><div className="recipeTitle"><b>{recipe.title}</b>{recipe.recommended && <span>Chef Zhai 推荐</span>}</div><small>{[recipe.category, recipeOrderCategories(recipe).filter(item => item !== recipe.category && item !== "主厨推荐").slice(0, 2).join(" · "), recipe.total_time].filter(Boolean).join(" · ")}</small><small>整桌已点 {totalQuantity(recipe.id).toFixed(1)} 份</small></button><button disabled={!isOrdering} aria-label={`添加${recipe.title}`} onClick={() => void enqueue(mealOp("add_quantity", meal, { recipe_id: recipe.id, quantity: 1 }))}>＋</button></article>)}
-      {!filtered.length && <div className="empty">这个分类下没有匹配的菜，试试其他分类或清空搜索。</div>}
-    </> : <MealView meal={meal} recipes={recipes} plans={plans} device={device} server={server} enqueue={enqueue} pendingActions={pendingActions} onRetry={() => void sync()} onClear={() => meal && window.confirm("确定清空共享本餐？") && void enqueue({ ...mealOp("clear_order", meal), entity_type: "meal_order" })} />}</div>
+      {syncStatus === "loading" && <p className="syncHint" role="status">{recipes.length ? "可以先选菜，其余菜单正在加载…" : "正在载入菜单…"}</p>}
+      {syncStatus === "error" && <div className="syncHint" role="status">{recipes.length ? "当前显示已缓存菜单。" : "菜单暂时未能载入。"}<button onClick={() => void sync()}>重试同步</button></div>}
+      {filtered.slice(0, visibleCount).map(recipe => <article className={`recipe ${recipe.recommended ? "recommendedDish" : ""}`} key={recipe.id}>
+        <button className="dishPreview" aria-label={`查看${recipe.title}详情`} onClick={() => setSelectedId(recipe.id)}><DishThumbnail recipe={recipe} server={server} token={device.token} /></button>
+        <button className="recipeInfo" onClick={() => setSelectedId(recipe.id)} aria-label={`查看${recipe.title}的介绍和做法`}>
+          <div className="recipeTitle"><b>{recipe.title}</b>{recipe.recommended && <span>Chef Zhai 推荐</span>}</div>
+          <small>{[recipe.category, recipeIndex.get(recipe.id)?.categories.filter(item => item !== recipe.category && item !== "主厨推荐").slice(0, 2).join(" · "), recipe.total_time].filter(Boolean).join(" · ")}</small>
+          <small>整桌已点 {totalQuantity(recipe.id).toFixed(1)} 份 · <span className="detailLink">介绍与做法 ›</span></small>
+        </button>
+        <button disabled={!isOrdering} aria-label={`添加${recipe.title}`} onClick={() => void enqueue(mealOp("add_quantity", meal, { recipe_id: recipe.id, quantity: 1 }))}>＋</button>
+      </article>)}
+      {filtered.length > visibleCount && <button className="loadMore" onClick={() => setVisibleCount(count => count + MENU_PAGE_SIZE)}>继续浏览 · 还有 {filtered.length - visibleCount} 道菜</button>}
+      {!filtered.length && (syncStatus !== "loading" || recipes.length > 0) && <div className="empty">这个分类下没有匹配的菜，试试其他分类或清空搜索。</div>}
+    </> : <MealView meal={meal} recipes={recipes} plans={plans} device={device} server={server} enqueue={enqueue} pendingActions={pendingActions} onRetry={() => void sync()} onOpenRecipe={setSelectedId} onClear={() => meal && window.confirm("确定清空共享本餐？") && void enqueue({ ...mealOp("clear_order", meal), entity_type: "meal_order" })} />}</div>
     <nav><button className={tab === "menu" ? "active" : ""} onClick={() => setTab("menu")}>菜单</button><button className={tab === "meal" ? "active" : ""} onClick={() => setTab("meal")}>本餐 {meal?.selections.length ? `· ${meal.selections.length}` : ""}</button></nav>
-    {selected && <RecipeDetail recipe={selected} practices={practices.filter(item => item.recipe_id === selected.id)} server={server} token={device.token} close={() => setSelected(null)} submit={operation => enqueue(operation, false)} />}{notice && <div className="notice">{notice}</div>}
+    {selected && <RecipeDetail key={selected.id} recipe={selected} practices={practices.filter(item => item.recipe_id === selected.id)} server={server} token={device.token} close={() => setSelectedId(null)} canOrder={isOrdering} quantity={totalQuantity(selected.id)} add={() => { void enqueue(mealOp("add_quantity", meal, { recipe_id: selected.id, quantity: 1 })); }} submit={operation => enqueue(operation, false)} />}{notice && <div className="notice">{notice}</div>}
   </main>;
 }
 
-function MealView({ meal, recipes, plans, device, server, enqueue, pendingActions, onClear, onRetry }: { meal: Meal | null; recipes: Recipe[]; plans: Plan[]; device: Device; server: string; enqueue: (operation: Operation, mealBound?: boolean) => Promise<void>; pendingActions: Set<string>; onClear: () => void; onRetry: () => void }) {
+function MealView({ meal, recipes, plans, device, server, enqueue, pendingActions, onClear, onRetry, onOpenRecipe }: { meal: Meal | null; recipes: Recipe[]; plans: Plan[]; device: Device; server: string; enqueue: (operation: Operation, mealBound?: boolean) => Promise<void>; pendingActions: Set<string>; onClear: () => void; onRetry: () => void; onOpenRecipe: (id: string) => void }) {
   const [history, setHistory] = useState<Meal[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -477,7 +524,7 @@ function MealView({ meal, recipes, plans, device, server, enqueue, pendingAction
       return <article id={`meal-dish-${recipeId}`} className={`mealDish ${completed ? "stageDone" : ""}`} key={recipeId}>
         <DishThumbnail recipe={recipe} server={server} token={device.token} />
         <div className="mealDishBody">
-          <div className="dishHeading"><div><h2>{recipe?.title || recipeId}</h2><strong>{quantity.toFixed(1)} 份</strong></div>{phase !== "ordering" && (isChef ? <div className="dishStageAction">{completed && <span>本阶段已完成</span>}<button disabled={stagePending} className={`stageToggle ${completed ? "done" : ""}`} onClick={() => void enqueue({ ...mealOp("set_dish_stage_completed", meal, { recipe_id: recipeId, stage: phase, completed: !completed }), entity_type: "meal_dish_state" })}>{stagePending ? "同步中…" : completed ? "撤销完成" : phase === "prep" ? "备餐完成" : phase === "cooking" ? "烹饪完成" : "已上桌"}</button></div> : <span className={`guestDishStatus ${completed ? "done" : ""}`}>{completed ? "已完成" : "主厨进行中"}</span>)}</div>
+          <div className="dishHeading"><div><h2>{recipe ? <button className="mealRecipeLink" onClick={() => onOpenRecipe(recipe.id)}>{recipe.title} <span>详情 ›</span></button> : recipeId}</h2><strong>{quantity.toFixed(1)} 份</strong></div>{phase !== "ordering" && (isChef ? <div className="dishStageAction">{completed && <span>本阶段已完成</span>}<button disabled={stagePending} className={`stageToggle ${completed ? "done" : ""}`} onClick={() => void enqueue({ ...mealOp("set_dish_stage_completed", meal, { recipe_id: recipeId, stage: phase, completed: !completed }), entity_type: "meal_dish_state" })}>{stagePending ? "同步中…" : completed ? "撤销完成" : phase === "prep" ? "备餐完成" : phase === "cooking" ? "烹饪完成" : "已上桌"}</button></div> : <span className={`guestDishStatus ${completed ? "done" : ""}`}>{completed ? "已完成" : "主厨进行中"}</span>)}</div>
           {phase === "ordering" && selections.map(item => <div className="person" key={item.device_id}><small>{item.device_name} {item.quantity} 份{item.note ? ` · ${item.note}` : ""}</small><button onClick={() => void enqueue(mealOp("add_quantity", meal, { recipe_id: recipeId, device_id: item.device_id, quantity: -.5 }))}>−</button><button onClick={() => void enqueue(mealOp("add_quantity", meal, { recipe_id: recipeId, device_id: item.device_id, quantity: .5 }))}>＋</button><button onClick={() => void enqueue(mealOp("remove_selection", meal, { recipe_id: recipeId, device_id: item.device_id }))}>×</button><input defaultValue={item.note} placeholder="备注" onBlur={event => void enqueue(mealOp("set_note", meal, { recipe_id: recipeId, device_id: item.device_id, note: event.target.value }))} /></div>)}
           {phase === "prep" && <div className="stageContent"><h3>准备事项</h3>{recipe?.prep_items?.length ? <ul>{recipe.prep_items.map((item, index) => <li key={index}>{item}</li>)}</ul> : <p>暂无单独备餐事项，请按食材清单准备。</p>}<details><summary>查看食材</summary><ul>{recipe?.ingredients?.map((item, index) => <li key={index}>{item.name || "未命名食材"}{item.amount ? ` · ${item.amount}` : ""}</li>)}</ul></details></div>}
           {phase === "cooking" && <div className="stageContent"><h3>烹饪步骤</h3>{recipe?.steps?.length ? <details className="cookingSteps" open={!completed}><summary>{completed ? "已收起步骤" : `展开查看 ${recipe.steps.length} 个步骤`}</summary><ol>{recipe.steps.map((step, index) => <li key={index}><b>{step.title || `第 ${index + 1} 步`}</b><span>{step.action || "按菜谱完成此步骤"}</span>{(step.heat || step.duration) && <small>{[step.heat, step.duration].filter(Boolean).join(" · ")}</small>}</li>)}</ol></details> : <p>暂无详细步骤，请按已有菜谱说明完成。</p>}</div>}
@@ -496,21 +543,67 @@ function MealView({ meal, recipes, plans, device, server, enqueue, pendingAction
   </>;
 }
 
-function RecipeDetail({ recipe, practices, server, token, close, submit }: { recipe: Recipe; practices: Practice[]; server: string; token: string; close: () => void; submit: (operation: Operation) => Promise<void> }) {
+function RecipeDetail({ recipe, practices, server, token, close, submit, canOrder, add, quantity }: { recipe: Recipe; practices: Practice[]; server: string; token: string; close: () => void; submit: (operation: Operation) => Promise<void>; canOrder: boolean; add: () => void; quantity: number }) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [practicesOpen, setPracticesOpen] = useState(false);
+  const cover = recipeThumbnail(recipe);
+  useEffect(() => {
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const overflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const element = dialog.current;
+    element?.showModal();
+    return () => { element?.close(); document.body.style.overflow = overflow; previous?.focus(); };
+  }, []);
   async function savePractice(form: HTMLFormElement) {
-    const data = new FormData(form); let photo_sha256: string | undefined; const photo = data.get("photo");
-    if (photo instanceof File && photo.size) {
-      const compressed = await compressPhoto(photo); const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", await compressed.arrayBuffer()))].map(value => value.toString(16).padStart(2, "0")).join("");
-      await cacheAsset(digest, compressed);
-      if (navigator.onLine) {
-        const uploaded = await fetch(`${server}/api/v1/assets/${digest}`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": compressed.type }, body: compressed });
-        if (!uploaded.ok) throw new Error("照片上传失败");
+    setSaving(true); setSaveError("");
+    try {
+      const data = new FormData(form); let photo_sha256: string | undefined; const photo = data.get("photo");
+      if (photo instanceof File && photo.size) {
+        const compressed = await compressPhoto(photo); const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", await compressed.arrayBuffer()))].map(value => value.toString(16).padStart(2, "0")).join("");
+        await cacheAsset(digest, compressed);
+        if (navigator.onLine) {
+          const uploaded = await fetch(`${server}/api/v1/assets/${digest}`, { method: "PUT", headers: { Authorization: `Bearer ${token}`, "Content-Type": compressed.type }, body: compressed });
+          if (!uploaded.ok) throw new Error("照片上传失败");
+        }
+        photo_sha256 = digest;
       }
-      photo_sha256 = digest;
-    }
-    const id = newUuid(); await submit({ op_id: newUuid(), entity_type: "practice_log", entity_id: id, action: "upsert", base_version: 0, payload: { id, recipe_id: recipe.id, cooked_on: String(data.get("date")), outcome: "success", rating: Number(data.get("rating")), notes: String(data.get("notes")), photo_sha256 } }); close();
+      const id = newUuid(); await submit({ op_id: newUuid(), entity_type: "practice_log", entity_id: id, action: "upsert", base_version: 0, payload: { id, recipe_id: recipe.id, cooked_on: String(data.get("date")), outcome: "success", rating: Number(data.get("rating")), notes: String(data.get("notes")), photo_sha256 } }); close();
+    } catch (error) { setSaveError(error instanceof Error ? error.message : "心得保存失败，请重试"); }
+    finally { setSaving(false); }
   }
-  return <div className="modal"><div><button className="close" onClick={close}>×</button><h1>{recipe.title}</h1><p>{recipe.ingredients?.map(item => `${item.name} ${item.amount || ""}`).join("、")}</p><h3>实践心得</h3>{practices.map(item => <article key={item.id}><b>{item.cooked_on} · {"★".repeat(item.rating || 0)}</b><p>{item.notes}</p>{item.photo_sha256 && <AuthenticatedImage digest={item.photo_sha256} server={server} token={token} />}<button onClick={() => { const notes = prompt("修改心得", item.notes); if (notes !== null) void submit({ op_id: newUuid(), entity_type: "practice_log", entity_id: item.id, action: "upsert", base_version: item.version, payload: { ...item, notes } }); }}>编辑</button> <button onClick={() => void submit({ op_id: newUuid(), entity_type: "practice_log", entity_id: item.id, action: "delete", base_version: item.version, payload: { id: item.id } })}>删除</button></article>)}<form onSubmit={event => { event.preventDefault(); void savePractice(event.currentTarget); }}><input name="date" type="date" defaultValue={new Date().toISOString().slice(0, 10)} required /><select name="rating" defaultValue="5"><option value="5">5 星</option><option value="4">4 星</option><option value="3">3 星</option><option value="2">2 星</option><option value="1">1 星</option></select><textarea name="notes" placeholder="这次做得怎么样？" required /><input name="photo" type="file" accept="image/jpeg,image/png,image/webp" /><button>保存心得</button></form></div></div>;
+  return <dialog ref={dialog} className="modal recipeDialog" aria-labelledby="recipe-detail-title" onCancel={event => { event.preventDefault(); close(); }} onClick={event => { if (event.target === event.currentTarget) close(); }}>
+    <div className="recipeDetail">
+      <div className="detailToolbar"><span>菜品详情</span><button className="close" aria-label="关闭菜品详情" onClick={close}>×</button></div>
+      {cover && <div className="detailCover"><AuthenticatedImage digest={cover} server={server} token={token} alt={recipe.title} /></div>}
+      <div className="detailBody"><h1 id="recipe-detail-title">{recipe.title}</h1>
+        <div className="dishMeta">{[recipe.category, recipe.cuisine, recipe.total_time, recipe.servings, recipe.difficulty].filter(Boolean).map((value, index) => <span key={index}>{value}</span>)}</div>
+        <RecipeContent recipe={recipe} renderImage={(digest, alt) => <LazyAssetImage digest={digest} server={server} token={token} alt={alt} />} />
+        <details className="practiceDetails" onToggle={event => setPracticesOpen(event.currentTarget.open)}><summary>实践心得{practices.length ? ` · ${practices.length}` : ""}<span>记录这次下厨</span></summary>
+          {practicesOpen && <>{practices.map(item => <article key={item.id}><b>{item.cooked_on} · {"★".repeat(item.rating || 0)}</b><p>{item.notes}</p>{item.photo_sha256 && <LazyAssetImage digest={item.photo_sha256} server={server} token={token} alt="实践照片" />}<button onClick={() => { const notes = prompt("修改心得", item.notes); if (notes !== null) void submit({ op_id: newUuid(), entity_type: "practice_log", entity_id: item.id, action: "upsert", base_version: item.version, payload: { ...item, notes } }); }}>编辑</button> <button onClick={() => void submit({ op_id: newUuid(), entity_type: "practice_log", entity_id: item.id, action: "delete", base_version: item.version, payload: { id: item.id } })}>删除</button></article>)}
+            <form onSubmit={event => { event.preventDefault(); void savePractice(event.currentTarget); }}><label>下厨日期<input name="date" type="date" defaultValue={new Date().toISOString().slice(0, 10)} required /></label><label>评分<select name="rating" defaultValue="5"><option value="5">5 星</option><option value="4">4 星</option><option value="3">3 星</option><option value="2">2 星</option><option value="1">1 星</option></select></label><label>心得<textarea name="notes" placeholder="这次做得怎么样？" required /></label><label>照片<input name="photo" type="file" accept="image/jpeg,image/png,image/webp" /></label>{saveError && <p role="alert">{saveError}</p>}<button disabled={saving}>{saving ? "正在保存…" : "保存心得"}</button></form>
+          </>}
+        </details>
+      </div>
+      <div className="detailOrder"><div><b>整桌已点 {quantity.toFixed(1)} 份</b><small>{canOrder ? "看好这道菜，就加入本餐" : "本餐已开始准备，点单已锁定"}</small></div><button disabled={!canOrder} onClick={add}>＋ 加入本餐</button></div>
+    </div>
+  </dialog>;
+}
+
+function LazyAssetImage({ digest, server, token, alt }: { digest: string; server: string; token: string; alt: string }) {
+  const root = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    if (!("IntersectionObserver" in window)) { setVisible(true); return; }
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) { setVisible(true); observer.disconnect(); }
+    }, { rootMargin: "160px" });
+    if (root.current) observer.observe(root.current);
+    return () => observer.disconnect();
+  }, []);
+  return <div className="lazyImage" ref={root}>{visible && <AuthenticatedImage digest={digest} server={server} token={token} alt={alt} />}</div>;
 }
 
 function DishThumbnail({ recipe, server, token }: { recipe?: Recipe; server: string; token: string }) {
@@ -535,16 +628,12 @@ function AuthenticatedImage({ digest, server, token, alt = "实践照片" }: { d
     let active = true; let objectUrl = "";
     setUrl("");
     void (async () => {
-      let blob = await cachedAsset(digest);
-      if (!blob && navigator.onLine) {
-        const response = await fetch(`${server}/api/v1/assets/${digest}`, { headers: { Authorization: `Bearer ${token}` } });
-        if (response.ok) { blob = await response.blob(); await cacheAsset(digest, blob); }
-      }
+      const blob = await loadAsset(digest, server, token);
       if (blob && active) { objectUrl = URL.createObjectURL(blob); setUrl(objectUrl); }
     })().catch(() => undefined);
     return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
   }, [digest, server, token]);
-  return url ? <img src={url} alt={alt} /> : null;
+  return url ? <img src={url} alt={alt} decoding="async" /> : null;
 }
 
 async function compressPhoto(file: File): Promise<Blob> {

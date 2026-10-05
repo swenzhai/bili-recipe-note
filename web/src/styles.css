@@ -2,6 +2,14 @@
 
 .recipe{display:grid;grid-template-columns:88px minmax(0,1fr) 42px;gap:12px;padding:10px}
 .recipeInfo{min-width:0}
+.recipe .dishPreview{padding:0;background:none;border:0;text-align:inherit}
+.recipe .dishPreview:focus-visible,.recipeInfo:focus-visible{outline:2px solid var(--red);outline-offset:4px}
+.detailLink{color:var(--red)}
+.loadMore{padding:14px;border:1px solid var(--line);background:#fffaf1;color:var(--deep);font-weight:700}
+.syncHint{font-size:13px;color:var(--muted);margin:0;padding:8px 2px;line-height:1.6}
+.syncHint button{margin-left:10px;border:0;background:none;color:var(--red);text-decoration:underline}
+.mealRecipeLink{font:inherit;color:inherit;border:0;background:none;padding:0;text-align:left}
+.mealRecipeLink span{color:var(--red);background:none;font-size:12px;font-weight:400}
 .recipe.recommendedDish{border-color:rgba(196,73,50,.55);box-shadow:inset 3px 0 0 var(--red);background:#fff7eb}
 .recipeTitle{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:7px}
 .recipeTitle b{margin:0}
@@ -71,8 +79,63 @@
 .historyMeal span{color:var(--muted);text-align:right}
 .historyError{color:var(--red)}
 
+.recipeDialog{border:0;width:100%;height:100%;max-width:none;max-height:none;margin:0;padding:20px;background:transparent;color:var(--ink)}
+.recipeDialog:not([open]){display:none}
+.recipeDialog::backdrop{background:rgba(25,29,24,.58)}
+.recipeDialog>.recipeDetail{padding:0;max-width:650px;box-shadow:0 16px 80px #0003}
+.detailToolbar{position:sticky;top:-20px;z-index:2;display:flex;align-items:center;justify-content:space-between;min-height:54px;padding:8px 20px;background:var(--paper);border-bottom:1px solid var(--line);font-size:13px;color:var(--muted)}
+.recipeDialog .detailToolbar .close{position:static;padding:3px 10px;font-size:26px;background:none;color:var(--deep);line-height:1.2}
+.detailCover{background:#e8e3d9;aspect-ratio:16/9;max-height:340px;overflow:hidden}
+.detailCover img{width:100%;height:100%;max-height:none;object-fit:cover;display:block}
+.detailBody{padding:22px}
+.detailBody h1{margin:0 0 12px;font-size:30px;line-height:1.3}
+.dishMeta{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:24px}
+.dishMeta span{border:1px solid var(--line);padding:4px 8px;font-size:12px;color:var(--muted)}
+.detailBody section{margin:24px 0}
+.detailBody h2{font-size:18px;margin:0 0 13px}
+.detailBody h3{font-size:14px;margin:16px 0 7px}
+.detailBody p,.detailBody li{font-size:14px;line-height:1.8;overflow-wrap:anywhere}
+.detailBody p{margin:7px 0;white-space:pre-line}
+.detailBody ul{padding-left:20px}
+.dishIntroduction{padding:18px;background:#fffaf1;border-left:3px solid var(--red)}
+.informationSource{display:block;color:var(--muted);font-size:12px!important;line-height:1.6;margin-top:12px}
+.ingredientGroups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}
+.ingredientGroups h3{margin-top:0;color:var(--muted)}
+.ingredientGroups ul{list-style:none;padding:0;margin:0}
+.ingredientGroups li{display:flex;justify-content:space-between;gap:12px;border-bottom:1px solid var(--line);padding:6px 0}
+.ingredientGroups b{font-weight:400;color:var(--muted);text-align:right}
+.dishTools{color:var(--muted)}
+.recipeSteps{list-style:none;padding:0;margin:0}
+.recipeSteps>li{display:grid;grid-template-columns:28px minmax(0,1fr);gap:12px;margin:20px 0}
+.stepNumber{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:var(--deep);color:#fff;font-size:12px;line-height:1}
+.recipeSteps h3{margin:2px 0 7px;font-size:16px}
+.recipeSteps .stepTiming{color:var(--red);font-size:12px}
+.recipeSteps .stepTip{padding:8px 12px;background:#ede7da;color:var(--muted);font-size:13px}
+.lazyImage{min-height:1px;margin-top:10px}
+.lazyImage img{display:block;border-radius:3px;width:100%;height:auto}
+.dishTips{padding:16px 18px;background:#eaf0e7}
+.dishTips ul{margin-bottom:0}
+.dishBackground,.practiceDetails{border-top:1px solid var(--line);padding:17px 0;margin-top:16px}
+.dishBackground summary,.practiceDetails summary{cursor:pointer;font-size:15px;font-weight:700}
+.practiceDetails summary>span{font-size:12px;font-weight:400;color:var(--muted);margin-left:12px}
+.referenceSource{padding:10px 0}
+.recipeSource{display:flex;flex-wrap:wrap;gap:12px;color:var(--muted);font-size:12px!important}
+.detailBody a{color:var(--red);text-underline-offset:3px}
+.practiceDetails form{margin-top:20px}
+.practiceDetails label{display:grid;gap:5px;font-size:13px}
+.detailOrder{position:sticky;bottom:-20px;display:flex;align-items:center;justify-content:space-between;gap:14px;padding:15px 22px calc(15px + env(safe-area-inset-bottom));background:#fffaf1;border-top:1px solid var(--line)}
+.detailOrder b{font-size:14px}
+.detailOrder small{display:block;font-size:11px;color:var(--muted);margin-top:4px}
+.recipeDialog .detailOrder button{background:var(--red);padding:12px 16px;white-space:nowrap;font-weight:700}
+.recipeDialog button:disabled{opacity:.45;cursor:not-allowed}
+
  .brandLockup{display:flex;align-items:center;gap:11px;min-height:42px}.brandLockup small{display:block;color:var(--muted);font-size:11px;margin-top:3px}.brandLogo{width:48px;height:48px;object-fit:contain;border-radius:10px;background:#fffaf1;border:1px solid var(--line)}.brandLogoFallback{display:grid;place-items:center;width:48px;height:48px;border-radius:10px;background:var(--deep);color:#f5d08a;font:700 9px Georgia,serif;letter-spacing:.08em;text-align:center;padding:4px}
 @media (max-width:520px){
+  .recipeDialog{padding:0}
+  .detailToolbar{top:0}
+  .detailOrder{bottom:0;padding-left:16px;padding-right:16px}
+  .detailBody{padding:20px 16px}
+  .ingredientGroups{gap:14px}
   .shell{padding-left:12px;padding-right:12px}
   .recipe{grid-template-columns:72px minmax(0,1fr) 42px;gap:10px}
   .dishThumbnail{width:72px}

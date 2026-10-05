@@ -371,7 +371,12 @@ def test_main_meal_page_is_a_launcher_for_the_restaurant_interface(tmp_path: Pat
 
     assert not at.exception
     assert at.button(key="meal_open_restaurant").label == "进入餐厅点餐界面 →"
+    assert any(widget.proto.label == "打开家庭点餐界面 →" for widget in at.get("link_button"))
     assert not [widget for widget in at.number_input if widget.key == "meal_child_count"]
+    at.button(key="meal_dish_info").click().run()
+    assert not at.exception
+    assert at.selectbox(key="main_page").value == "菜品介绍"
+    assert at.number_input(key="dish_info_limit").value == 10
 
 
 def test_restaurant_meal_ui_mounts_custom_component_and_builds_shopping_list(tmp_path: Path) -> None:

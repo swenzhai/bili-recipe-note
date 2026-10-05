@@ -75,7 +75,8 @@ def _write_recipe(folder: Path, url: str) -> None:
     (folder / "job.json").write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
 
 
-def test_batch_handoff_round_trip_keeps_work_and_remaps_paths(tmp_path: Path) -> None:
+def test_batch_handoff_round_trip_keeps_work_and_remaps_paths(tmp_path: Path, monkeypatch) -> None:
+    from bili_recipe_notes import dish_info
     source_root = tmp_path / "mac"
     source_out = source_root / "outputs"
     source_out.mkdir(parents=True)
@@ -86,6 +87,11 @@ def test_batch_handoff_round_trip_keeps_work_and_remaps_paths(tmp_path: Path) ->
     recipe_folder = source_out / "recipe-result"
     _write_raw(raw_folder, raw_url)
     _write_recipe(recipe_folder, recipe_url)
+    monkeypatch.setattr(dish_info, "complete_markdown_prompt", lambda *args, **kwargs: json.dumps({
+        "summary": "鸡蛋炒熟后享用。", "method": "用炒锅将鸡蛋炒熟。",
+        "background": None, "origin": None, "source_matches": [],
+    }))
+    introduction = dish_info.generate_dish_info(recipe_folder)
     (recipe_folder / "media").mkdir()
     (recipe_folder / "media" / "audio.m4a").write_bytes(b"must-not-transfer")
 
@@ -150,6 +156,7 @@ def test_batch_handoff_round_trip_keeps_work_and_remaps_paths(tmp_path: Path) ->
     imported_pending = next(item for item in imported_state.items if item.url == pending_url)
     assert is_raw_output(Path(imported_raw.output_folder or ""))
     assert is_complete_output(Path(imported_recipe.output_folder or ""))
+    assert dish_info.load_dish_info(Path(imported_recipe.output_folder or "")) == introduction
     assert imported_pending.status == "pending"
     assert imported_pending.output_folder is None
     assert str(destination_out.resolve()) in (imported_raw.output_folder or "")

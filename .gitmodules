@@ -1,0 +1,3 @@
+[submodule "external/video-frame-choose"]
+	path = external/video-frame-choose
+	url = git@github.com:swenzhai/video-frame-choose.git

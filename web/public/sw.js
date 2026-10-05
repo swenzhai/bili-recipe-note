@@ -1,4 +1,4 @@
-const CACHE = "chef-zhai-family-kitchen-shell-v12";
+const CACHE = "chef-zhai-family-kitchen-shell-v13";
 const SHELL = ["/", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png", "/apple-touch-icon.png"];
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -11,13 +11,14 @@ self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET" || url.pathname.startsWith("/api/")) return;
   if (event.request.mode === "navigate") {
     event.respondWith(
-      fetch(event.request).then((response) => {
-        if (response.ok) {
-          const copy = response.clone();
-          event.waitUntil(caches.open(CACHE).then((cache) => cache.put("/", copy)));
-        }
-        return response;
-      }).catch(() => caches.match("/").then((cached) => cached || Response.error())),
+      caches.match("/").then((cached) => {
+        const refreshed = fetch(event.request).then(async (response) => {
+          if (response.ok) await (await caches.open(CACHE)).put("/", response.clone());
+          return response;
+        });
+        if (cached) { event.waitUntil(refreshed.catch(() => undefined)); return cached; }
+        return refreshed.catch(() => Response.error());
+      }),
     );
     return;
   }

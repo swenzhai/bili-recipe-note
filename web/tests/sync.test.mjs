@@ -37,6 +37,48 @@ function client(initial = []) {
   };
 }
 
+test("meal-only synchronization preserves the recipe cache reference", () => {
+  const recipes = [{ id: "egg", title: "炒蛋" }];
+  assert.equal(mergeChanges(recipes, [], "recipe", false), recipes);
+  assert.equal(mergeChanges(recipes, [{ entity_type: "meal_order", action: "upsert", payload: { id: "dinner" } }], "recipe", false), recipes);
+  assert.notEqual(mergeChanges(recipes, [], "recipe", true), recipes, "bootstrap must still discard obsolete cached recipes");
+});
+
+test("first-page recipes are available before later pages and bootstrap resets only once", async () => {
+  let recipes = [{ id: "old", title: "旧菜" }];
+  let pageCount = 0;
+  const result = await synchronizeBatch({
+    cursor: 0, queued: async () => [],
+    effects: { queue: async () => {}, dequeue: async () => {}, markPending: () => {}, flash: () => {}, prompt: () => null, newUuid: () => "test" },
+    requestPage: async cursor => {
+      if (cursor === 0) return payload({ bootstrap: true, has_more: true, next_cursor: 1, changes: [{ entity_type: "recipe", action: "upsert", payload: { id: "egg", title: "炒蛋" } }] });
+      assert.deepEqual(recipes.map(recipe => recipe.id), ["egg"], "the first page is usable while requesting the second page");
+      return payload({ bootstrap: true, next_cursor: 2, changes: [{ entity_type: "recipe", action: "upsert", payload: { id: "rice", title: "米饭" } }] });
+    },
+    onPage: page => { pageCount += 1; recipes = mergeChanges(recipes, page.changes, "recipe", page.bootstrap); },
+  });
+  assert.equal(pageCount, 2);
+  assert.equal(result.nextCursor, 2);
+  assert.deepEqual(recipes.map(recipe => recipe.id), ["egg", "rice"]);
+});
+
+test("a failed later page retains visible first-page dishes and permits a clean retry", async () => {
+  let recipes = [{ id: "old", title: "旧菜" }];
+  const options = {
+    cursor: 0, queued: async () => [],
+    effects: { queue: async () => {}, dequeue: async () => {}, markPending: () => {}, flash: () => {}, prompt: () => null, newUuid: () => "test" },
+    onPage: page => { recipes = mergeChanges(recipes, page.changes, "recipe", page.bootstrap); },
+    requestPage: async cursor => {
+      if (cursor) throw new Error("second page unavailable");
+      return payload({ bootstrap: true, has_more: true, next_cursor: 1, changes: [{ entity_type: "recipe", action: "upsert", payload: { id: "egg", title: "炒蛋" } }] });
+    },
+  };
+  await assert.rejects(synchronizeBatch(options), /second page unavailable/);
+  assert.deepEqual(recipes.map(recipe => recipe.id), ["egg"]);
+  await synchronizeBatch({ ...options, requestPage: async () => payload({ bootstrap: true, next_cursor: 2, changes: [{ entity_type: "recipe", action: "upsert", payload: { id: "rice", title: "米饭" } }] }) });
+  assert.deepEqual(recipes.map(recipe => recipe.id), ["rice"]);
+});
+
 test("server hiding and restoring a recipe updates the actual menu selector", async () => {
   const app = client();
   let recipes = [{ id: "egg", title: "炒蛋", published: true }, { id: "rice", title: "米饭", published: true }];

@@ -46,6 +46,7 @@ PORTABLE_FILE_NAMES = {
     "note.md",
     "quality.json",
     "recipe.review.json",
+    "recipe.dish-info.json",
     "extra_analysis.md",
     "extra_analysis.json",
     "sync-meta.json",

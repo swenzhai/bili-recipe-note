@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .mobile_sync import (
@@ -59,8 +59,11 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        next_delay = await indexer.run_once()
-        task = asyncio.create_task(indexer.run_forever(initial_delay=next_delay)) if start_background_indexer else None
+        # Serve the persisted menu immediately while a cold library scan runs.
+        # The indexer records failures and retries without blocking HTTP startup.
+        task = asyncio.create_task(indexer.run_forever()) if start_background_indexer else None
+        if task is None:
+            await indexer.run_once()
         try:
             yield
         finally:
@@ -138,11 +141,13 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/v1/sync")
-    def sync(payload: SyncRequest, device: dict[str, Any] = Depends(authenticated_device)) -> dict[str, Any]:
+    def sync(payload: SyncRequest, device: dict[str, Any] = Depends(authenticated_device)) -> JSONResponse:
         if payload.schema_version != SCHEMA_VERSION:
             raise HTTPException(status_code=400, detail="Unsupported schema_version")
         try:
-            return store.sync(device["id"], payload.cursor, payload.operations, payload.capabilities)
+            # Sync payloads already consist solely of stored JSON values. Skip
+            # FastAPI's second recursive conversion over every recipe and step.
+            return JSONResponse(store.sync(device["id"], payload.cursor, payload.operations, payload.capabilities))
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from .config import load_config
 from .data_paths import state_dir, resolve_stored_path, relocate_value, ensure_data_layout
 from .cover_policy import has_manually_approved_cover
+from .dish_info import DISH_INFO_FILE_NAME, load_dish_info
 from .file_cache import file_fingerprint, file_sha256, fingerprint_is_stable, read_json_cached
 from .review_policy import (
     AI_REVIEW_FILE_NAME,
@@ -40,6 +41,7 @@ MAX_SYNC_OPERATIONS = 100
 MAX_SYNC_CHANGES = 200
 MAX_PRACTICE_PHOTO_BYTES = 5 * 1024 * 1024
 PAIRING_TTL_MINUTES = 10
+DEVICE_SEEN_INTERVAL_SECONDS = 60
 DATABASE_FILE_NAME = "mobile-sync.sqlite3"
 MEDIA_DIR_NAME = "mobile-media"
 SYNC_META_FILE_NAME = "sync-meta.json"
@@ -527,13 +529,34 @@ class MobileSyncStore:
 
     def authenticate(self, access_token: str) -> dict[str, str]:
         candidate = token_hash(access_token)
-        with self._write_connection() as connection:
+        with self._connect() as connection:
             rows = connection.execute("SELECT * FROM devices WHERE revoked_at IS NULL").fetchall()
             row = next((item for item in rows if hmac.compare_digest(str(item["token_hash"]), candidate)), None)
             if row is None:
                 raise AuthenticationError("Invalid or revoked device token")
-            connection.execute("UPDATE devices SET last_seen_at=? WHERE id=?", (utc_now(), row["id"]))
-            return {"id": str(row["id"]), "name": str(row["name"])}
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=DEVICE_SEEN_INTERVAL_SECONDS)).isoformat()
+        if str(row["last_seen_at"]) < cutoff:
+            self._touch_device(str(row["id"]), cutoff)
+        return {"id": str(row["id"]), "name": str(row["name"])}
+
+    def _touch_device(self, device_id: str, cutoff: str) -> None:
+        """Update informational activity time without delaying menu/image reads."""
+        if not self._lock.acquire(blocking=False):
+            return
+        try:
+            with self._connect() as connection:
+                connection.execute("PRAGMA busy_timeout = 0")
+                connection.execute(
+                    "UPDATE devices SET last_seen_at=? WHERE id=? AND revoked_at IS NULL AND last_seen_at<?",
+                    (utc_now(), device_id, cutoff),
+                )
+        except sqlite3.OperationalError as exc:
+            # Another application process may currently be indexing or saving
+            # an order. The next request retries this nonessential timestamp.
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+        finally:
+            self._lock.release()
 
     def list_devices(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -661,7 +684,7 @@ class MobileSyncStore:
         recipe_id = self._recipe_id(folder, recipe, job)
         dependencies = [folder / name for name in (
             "recipe.json", "source.json", "job.json", AI_REVIEW_FILE_NAME,
-            "transcript.json", "note.md", SYNC_META_FILE_NAME,
+            "transcript.json", "note.md", SYNC_META_FILE_NAME, DISH_INFO_FILE_NAME,
         )]
         images = [step.get("screenshot_path") for step in recipe["steps"] if isinstance(step, dict)]
         if has_manually_approved_cover(recipe):
@@ -680,6 +703,15 @@ class MobileSyncStore:
         review_state = get_review_state(folder)
         review = review_state["ai_review"]
         payload = {**recipe, "id": recipe_id, "schema_version": SCHEMA_VERSION}
+        payload.pop("dish_info", None)
+        dish_info = load_dish_info(folder)
+        if dish_info:
+            payload["dish_info"] = {
+                key: dish_info[key] for key in (
+                    "summary", "method", "background", "origin", "sources", "search_status",
+                    "generated_at", "match_status", "citations", "warnings",
+                ) if key in dish_info
+            }
         if review:
             original_tags = recipe.get("tags") if isinstance(recipe.get("tags"), list) else []
             payload["tags"] = list(dict.fromkeys(
@@ -1710,6 +1742,21 @@ class MobileSyncStore:
         )
         return result
 
+    @contextmanager
+    def _sync_connection(self, *, writes: bool, needs_order: bool) -> Iterator[sqlite3.Connection]:
+        if not writes:
+            with self._connect() as connection:
+                # WAL readers see one consistent revision while indexing and
+                # other devices continue writing; a read must never upgrade a
+                # stale snapshot to a write transaction.
+                connection.execute("BEGIN")
+                if not needs_order or self._active_order_row(connection) is not None:
+                    yield connection
+                    return
+        # The first device creates the shared meal using a fresh write snapshot.
+        with self._write_connection() as connection:
+            yield connection
+
     def sync(
         self,
         device_id: str,
@@ -1726,7 +1773,8 @@ class MobileSyncStore:
         unknown = requested - SUPPORTED_CAPABILITIES
         if unknown:
             raise ValidationError(f"Unsupported capabilities: {', '.join(sorted(unknown))}")
-        with self._write_connection() as connection:
+        needs_order = bool(requested & {"meal_order", "meal_selection", "meal_dish_state"})
+        with self._sync_connection(writes=bool(operation_list), needs_order=needs_order) as connection:
             if requested & {"meal_order", "meal_selection", "meal_dish_state"}:
                 if self._active_order_row(connection) is None:
                     self._create_order(connection)

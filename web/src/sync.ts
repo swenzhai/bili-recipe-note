@@ -9,6 +9,21 @@ export type Recipe = {
   published?: boolean;
   recommended?: boolean;
   creator_name?: string;
+  uploader?: string;
+  source_url?: string;
+  cuisine?: string;
+  servings?: string;
+  difficulty?: string;
+  summary?: string;
+  seasonings?: { name?: string; amount?: string }[];
+  tools?: string[];
+  summary_tips?: string[];
+  dish_info?: {
+    summary?: string; method?: string; background?: string | null; origin?: string | null;
+    sources?: { title?: string; url?: string; excerpt?: string; match_status?: string }[];
+    search_status?: string; match_status?: string; generated_at?: string; source_note?: string;
+    warnings?: string[];
+  };
   cover_image_sha256?: string;
   cover_image_status?: string;
   ingredients?: { name?: string; amount?: string }[];
@@ -38,6 +53,7 @@ export type SyncPayload = {
 };
 
 export const CLIENT_SYNC_BATCH = 100;
+const recipeTitleCollator = new Intl.Collator("zh-CN");
 
 export function wireOperation(operation: QueuedOperation): Operation {
   const { sequence: _sequence, queued_at: _queuedAt, ...payload } = operation;
@@ -55,6 +71,7 @@ export function pendingActionKey(operation: Partial<Operation>): string | undefi
 }
 
 export function mergeChanges<T extends { id: string }>(current: T[], changes: Change[], entityType: string, reset: boolean): T[] {
+  if (!reset && !changes.some(change => change.entity_type === entityType)) return current;
   const merged = new Map((reset ? [] : current).map(item => [item.id, item]));
   for (const change of changes) {
     if (change.entity_type !== entityType) continue;
@@ -120,7 +137,7 @@ export function optimisticallySetDishStage(current: Meal | null, operation: Oper
 export function menuRecipes(recipes: Recipe[]): Recipe[] {
   return recipes
     .filter(recipe => recipe.published !== false)
-    .sort((first, second) => Number(Boolean(second.recommended)) - Number(Boolean(first.recommended)) || first.title.localeCompare(second.title, "zh-CN"));
+    .sort((first, second) => Number(Boolean(second.recommended)) - Number(Boolean(first.recommended)) || recipeTitleCollator.compare(first.title, second.title));
 }
 
 export type SyncEffects = {
@@ -138,10 +155,11 @@ export type SyncBatchOptions = {
   uploadPhoto?: (operation: Operation) => Promise<void>;
   requestPage: (cursor: number, operations: Operation[]) => Promise<SyncPayload>;
   effects: SyncEffects;
+  onPage?: (page: { changes: Change[]; bootstrap: boolean; mealSnapshot: Meal | null | undefined; nextCursor: number }) => void;
 };
 
 /** Drain one outbox batch and all change pages; failed transport leaves unacknowledged operations queued. */
-export async function synchronizeBatch({ cursor, queued, uploadPhoto, requestPage, effects }: SyncBatchOptions) {
+export async function synchronizeBatch({ cursor, queued, uploadPhoto, requestPage, effects, onPage }: SyncBatchOptions) {
   const pendingPage = await queued(CLIENT_SYNC_BATCH + 1);
   const pending = pendingPage.slice(0, CLIENT_SYNC_BATCH).map(wireOperation);
   let resync = pendingPage.length > CLIENT_SYNC_BATCH;
@@ -151,6 +169,7 @@ export async function synchronizeBatch({ cursor, queued, uploadPhoto, requestPag
   let bootstrap = false;
   let mealSnapshot: Meal | null | undefined;
   let firstPage = true;
+  let resetPublished = false;
   while (true) {
     const payload = await requestPage(nextCursor, firstPage ? pending : []);
     if (firstPage) {
@@ -183,6 +202,9 @@ export async function synchronizeBatch({ cursor, queued, uploadPhoto, requestPag
     bootstrap ||= payload.bootstrap === true;
     if ("meal" in payload) mealSnapshot = payload.meal;
     nextCursor = payload.next_cursor;
+    const resetPage: boolean = payload.bootstrap === true && !resetPublished;
+    onPage?.({ changes: payload.changes, bootstrap: resetPage, mealSnapshot: payload.meal, nextCursor });
+    resetPublished ||= resetPage;
     firstPage = false;
     if (!payload.has_more) break;
   }

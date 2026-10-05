@@ -353,6 +353,50 @@ def test_incremental_index_detects_image_deletion_and_recreation(tmp_path: Path)
     assert store.list_recipes()[0]["assets"][0]["sha256"] == hashlib.sha256(b"restored-image").hexdigest()
 
 
+def test_dish_info_incrementally_syncs_exports_and_expires_without_rewriting_recipe(tmp_path: Path, monkeypatch) -> None:
+    from bili_recipe_notes import dish_info
+    from bili_recipe_notes.web_export import build_web_library_payload
+
+    folder = _recipe(tmp_path, "介绍菜谱")
+    original = (folder / "recipe.json").read_bytes()
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    device_id, _ = _paired(store)
+    cursor = store.current_revision()
+    monkeypatch.setattr("bili_recipe_notes.mobile_sync.fingerprint_is_stable", lambda _: True)
+    answer = {"summary": "鸡蛋与番茄的家常菜。", "method": "按菜谱将食材翻炒。", "background": None,
+              "origin": None, "source_matches": []}
+    monkeypatch.setattr(dish_info, "complete_markdown_prompt", lambda *_args, **_kwargs: json.dumps(answer))
+    dish_info.generate_dish_info(folder)
+    result = store.index_recipes()
+    assert result["changed"] == result["rebuilt"] == 1
+    indexed = store.list_recipes()[0]["dish_info"]
+    assert indexed["summary"] == answer["summary"]
+    assert indexed["search_status"] == "not_requested"
+    assert "model_config" not in indexed and "input_fingerprint" not in indexed
+    assert store.sync(device_id, cursor, [])["changes"][0]["payload"]["dish_info"] == indexed
+    assert build_web_library_payload(store, image_mode="none")["recipes"][0]["dish_info"] == indexed
+    assert (folder / "recipe.json").read_bytes() == original
+    assert store.index_recipes()["cache_hits"] == 1
+
+    answer["summary"] = "更新的菜品介绍。"
+    dish_info.generate_dish_info(folder, only_pending=False)
+    assert store.index_recipes()["changed"] == 1
+    assert store.list_recipes()[0]["dish_info"]["summary"] == answer["summary"]
+    changed = json.loads(original)
+    changed["steps"][0]["action"] = "修改了菜谱内容"
+    (folder / "recipe.json").write_text(json.dumps(changed), encoding="utf-8")
+    assert store.index_recipes()["changed"] == 1
+    assert "dish_info" not in store.list_recipes()[0]
+    assert dish_info.load_dish_info(folder) is None
+
+    dish_info.generate_dish_info(folder)
+    assert store.index_recipes()["changed"] == 1
+    (folder / dish_info.DISH_INFO_FILE_NAME).unlink()
+    assert store.index_recipes()["changed"] == 1
+    assert "dish_info" not in store.list_recipes()[0]
+
+
 @pytest.mark.parametrize("file_name", ["job.json", "source.json", "transcript.json", "note.md"])
 def test_incremental_index_checks_all_review_and_identity_inputs(tmp_path: Path, file_name: str, monkeypatch) -> None:
     folder = _recipe(tmp_path, "审核输入缓存")
@@ -654,6 +698,43 @@ def test_change_cursor_is_paginated_without_gaps(tmp_path: Path) -> None:
     assert len(second["changes"]) == 5
     assert second["has_more"] is False
     assert second["next_cursor"] == store.current_revision()
+
+
+def test_authentication_and_sync_read_committed_menu_while_another_process_writes(tmp_path: Path, monkeypatch) -> None:
+    _recipe(tmp_path, "正常菜单")
+    store = MobileSyncStore(tmp_path)
+    store.index_recipes()
+    device = store.join_device("测试设备")
+    capabilities = ["recipe", "meal_order", "meal_selection", "meal_dish_state"]
+    original = store.sync(device["device_id"], 0, [], capabilities)
+    with store._write_connection() as connection:
+        connection.execute("UPDATE devices SET last_seen_at='2000-01-01T00:00:00+00:00'")
+    connect = store._connect
+
+    def immediate_connect():
+        connection = connect()
+        connection.execute("PRAGMA busy_timeout=0")
+        return connection
+
+    monkeypatch.setattr(store, "_connect", immediate_connect)
+    with connect() as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("UPDATE recipes SET payload_json='{\"id\":\"dish\",\"title\":\"未提交\"}'")
+        assert store.authenticate(device["access_token"])["id"] == device["device_id"]
+        snapshot = store.sync(device["device_id"], 0, [], capabilities)
+        assert snapshot["changes"] == original["changes"]
+        assert snapshot["next_cursor"] == original["next_cursor"]
+        assert snapshot["meal"] == original["meal"]
+        writer.rollback()
+    # A busy timestamp update is retried, while subsequent requests are reads.
+    store.authenticate(device["access_token"])
+    last_seen = store.list_devices()[0]["last_seen_at"]
+    assert last_seen > "2000"
+    store.authenticate(device["access_token"])
+    assert store.list_devices()[0]["last_seen_at"] == last_seen
+    store.revoke_device(device["device_id"])
+    with pytest.raises(AuthenticationError):
+        store.authenticate(device["access_token"])
 
 
 def test_capable_client_bootstraps_current_snapshot_instead_of_recipe_history(tmp_path: Path) -> None:

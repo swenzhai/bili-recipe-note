@@ -545,6 +545,21 @@ def _validate_required_recipe_outputs(args: argparse.Namespace) -> None:
 
 
 def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "--frame-selection-supervisor":
+        from .frame_selection_service import supervisor_main
+
+        return supervisor_main(sys.argv[2:])
+
+    if len(sys.argv) == 5 and sys.argv[1] == "--frame-selection-worker":
+        from .frame_selection_worker import main as frame_selection_worker_main
+
+        return frame_selection_worker_main(sys.argv[2:])
+
+    if len(sys.argv) == 5 and sys.argv[1] == "--dish-info-worker":
+        from .dish_info_worker import main as dish_info_worker_main
+
+        return dish_info_worker_main(sys.argv[2:])
+
     if len(sys.argv) == 5 and sys.argv[1] == "--ai-review-worker":
         from .ai_review_worker import main as ai_review_worker_main
 

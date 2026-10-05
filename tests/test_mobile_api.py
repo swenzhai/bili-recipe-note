@@ -4,6 +4,8 @@ import hashlib
 import os
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -100,6 +102,55 @@ def test_api_starts_degraded_and_health_remains_available_when_index_fails(tmp_p
         assert state["last_success"] is None
         assert state["consecutive_failures"] == 1
         assert "unavailable disk" in state["last_error"]
+
+
+def test_background_cold_scan_does_not_block_static_page_health_or_existing_menu(tmp_path: Path, monkeypatch) -> None:
+    static = tmp_path / "web"
+    static.mkdir()
+    (static / "index.html").write_text("<h1>菜单</h1>", encoding="utf-8")
+    app = create_app(tmp_path, static_dir=static)
+    store = app.state.store
+    device = store.join_device("已有设备")
+    store.current_meal_order()
+    with store._write_connection() as connection:
+        connection.execute(
+            "INSERT INTO recipes(id,output_folder,payload_json,content_hash,updated_at,revision) "
+            "VALUES ('dish','folder','{\"id\":\"dish\",\"title\":\"已有菜单\",\"steps\":[]}', 'hash', 'now', 1)"
+        )
+    scan_started = threading.Event()
+    scan_release = threading.Event()
+    served = threading.Event()
+    responses = []
+
+    def slow_scan():
+        scan_started.set()
+        assert scan_release.wait(10), "test did not release cold scan"
+        return {"indexed": 1}
+
+    monkeypatch.setattr(store, "index_recipes", slow_scan)
+
+    def request_page():
+        with TestClient(app) as client:
+            responses.extend([
+                client.get("/"), client.get("/api/v1/health"),
+                client.post("/api/v1/sync", headers={"Authorization": f"Bearer {device['access_token']}"},
+                            json={"cursor": 0, "capabilities": ["recipe", "meal_order"]}),
+            ])
+            served.set()
+            assert scan_release.wait(10)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        request = executor.submit(request_page)
+        try:
+            assert scan_started.wait(5)
+            assert served.wait(5), "HTTP waited for the blocked cold index"
+            assert all(response.status_code == 200 for response in responses)
+            assert "菜单" in responses[0].text
+            assert responses[1].json()["indexing"]["status"] == "starting"
+            assert responses[2].json()["changes"][0]["payload"]["title"] == "已有菜单"
+        finally:
+            scan_release.set()
+            request.result(timeout=5)
 
 
 def test_importing_api_factory_does_not_create_a_database(tmp_path: Path) -> None:

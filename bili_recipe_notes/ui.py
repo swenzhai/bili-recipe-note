@@ -26,6 +26,10 @@ from streamlit_cropper import st_cropper
 try:
     from .ai_review_ui import render_ai_review_page
     from .ai_review_dashboard import render_ai_review_dashboard
+    from .dish_info_ui import render_dish_info_dashboard, render_dish_info_page
+    from .frame_selection_ui import render_frame_selection_dashboard, render_frame_selection_page
+    from .frame_selection_runner import start_frame_selection_batch
+    from .frame_selection_service import load_frame_candidate
     from .ui_batch_page import BatchPageHelpers, render_batch_page
     from .ui_edit_page import EditPageHelpers, INGREDIENT_COLUMNS, STEP_COLUMNS, render_edit_page
     from .batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state, selectable_items
@@ -144,6 +148,10 @@ try:
 except ImportError:  # pragma: no cover - supports direct streamlit script execution
     from bili_recipe_notes.ai_review_ui import render_ai_review_page
     from bili_recipe_notes.ai_review_dashboard import render_ai_review_dashboard
+    from bili_recipe_notes.dish_info_ui import render_dish_info_dashboard, render_dish_info_page
+    from bili_recipe_notes.frame_selection_ui import render_frame_selection_dashboard, render_frame_selection_page
+    from bili_recipe_notes.frame_selection_runner import start_frame_selection_batch
+    from bili_recipe_notes.frame_selection_service import load_frame_candidate
     from bili_recipe_notes.ui_batch_page import BatchPageHelpers, render_batch_page
     from bili_recipe_notes.ui_edit_page import EditPageHelpers, INGREDIENT_COLUMNS, STEP_COLUMNS, render_edit_page
     from bili_recipe_notes.batch_queue import create_batch_id, create_batch_state, list_batch_states, save_batch_state, selectable_items
@@ -278,9 +286,11 @@ PAGES = [
     "烹饪技巧",
     "菜谱详情",
     "本餐点菜",
+    "菜品介绍",
     "烹饪模式",
     "草稿与归档",
     "快速审核",
+    "AI 菜品选图",
     "AI 审核归类",
     "审核确认",
     "最终菜谱整理",
@@ -295,8 +305,8 @@ PAGES = [
 ]
 PAGE_GROUPS = {
     "采集与生成": ["任务仪表盘", "单视频生成", "批量处理", "UP 主链接"],
-    "审阅与成稿": ["草稿与归档", "AI 审核归类", "快速审核", "审核确认", "编辑修复", "最终菜谱整理"],
-    "使用与知识": ["菜谱库全览", "烹饪技巧", "菜谱详情", "本餐点菜", "烹饪模式", "知识库", "二次分析", "手机客户端"],
+    "审阅与成稿": ["草稿与归档", "AI 审核归类", "快速审核", "AI 菜品选图", "审核确认", "编辑修复", "最终菜谱整理"],
+    "使用与知识": ["菜谱库全览", "烹饪技巧", "菜谱详情", "本餐点菜", "菜品介绍", "烹饪模式", "知识库", "二次分析", "手机客户端"],
     "系统与迁移": ["工作交接", "环境检查"],
 }
 PAGE_GROUP_BY_PAGE = {
@@ -1458,10 +1468,12 @@ def _render_batch_pause_control(st, batch_id: str, runtime: Any, *, key_prefix: 
 def _render_background_dashboard(st, config: UIConfig | None = None) -> None:
     config = config or load_config()
     st.subheader("后台任务仪表盘")
-    st.caption("集中查看菜谱生成和 AI 审核任务；预计时间会根据本次运行的实际平均速度持续调整。")
+    st.caption("集中查看菜谱生成、AI 审核、菜品介绍和 AI 选图任务；预计时间会根据本次运行的实际平均速度持续调整。")
     render_ai_review_dashboard(
         st, config.out_dir, key_prefix="dashboard_ai_review", refresh_seconds=5, show_open_button=True,
     )
+    render_dish_info_dashboard(st, config.out_dir, key_prefix="dashboard_dish_info")
+    render_frame_selection_dashboard(st, config.out_dir, key_prefix="dashboard_frame_selection", show_open_button=True)
     refresh_seconds = st.selectbox(
         "生成任务自动刷新频率",
         [10, 30, 60, 0],
@@ -2093,23 +2105,23 @@ def _meal_card_image_data_uri(path: Path | None) -> str | None:
 
 
 def _render_meal_planner(st, config: UIConfig) -> None:
-    st.subheader("餐厅式点餐（兼容入口）")
-    st.caption("旧 Streamlit 点餐台仅用于数据迁移期间兼容；多人共享点餐请使用 8765 移动客户端。")
-    selected_count = len(st.session_state.get("meal_recipe_ids", []))
-    try:
-        saved_count = len(load_meal_plans())
-    except Exception:
-        saved_count = 0
+    st.subheader("本餐点菜")
     with st.container(border=True):
-        st.markdown("### 🍽️ 打开点餐台")
-        st.write("像手机 App 一样浏览菜谱并直接加菜，再统一调整份量、备注和采购清单。")
-        summary_columns = st.columns(3)
-        summary_columns[0].metric("本餐已点", f"{selected_count} 道")
-        summary_columns[1].metric("已存套餐", f"{saved_count} 个")
-        summary_columns[2].metric("界面", "独立点餐页")
+        st.markdown("### 🍽️ Chef Zhai 家庭厨房")
+        st.write("浏览菜单，点击菜名或图片查看简介和做法；家人可以一起加菜、调整份量和备注。")
+        base_url = st.text_input("点餐网址", value=f"http://{_lan_ip_address()}:8765", key="meal_client_url")
+        st.link_button("打开家庭点餐界面 →", base_url, type="primary", width="stretch")
+        st.caption("再次进入会先显示本机缓存，后台自动同步最新菜单。首次使用需输入设备名称加入家庭餐桌。")
+    if st.button("AI 补充菜品介绍", key="meal_dish_info", width="stretch"):
+        st.session_state["_next_page"] = "菜品介绍"
+        st.rerun()
+    st.caption("在管理页批量补充简介、做法概览和可选的背景参考，生成后会同步到点餐详情。")
+    if st.button("批量 AI 选菜品特写", key="meal_ai_frames", width="stretch"):
+        _open_frame_selection_page(st)
+    with st.expander("旧版点餐入口"):
+        st.caption("用于读取旧版本机套餐；多人共享点餐请使用上方家庭厨房。")
         if st.button(
             "进入餐厅点餐界面 →",
-            type="primary",
             key="meal_open_restaurant",
             use_container_width=True,
         ):
@@ -2787,6 +2799,17 @@ def _cover_crop_preview(content: bytes) -> tuple[bytes, tuple[int, int], tuple[i
     return output.getvalue(), source_size, preview_size
 
 
+def _open_frame_selection_page(st, *, folder: Path | None = None, batch_id: str | None = None) -> None:
+    if folder is None:
+        st.session_state.pop("_frame_selection_scope_folders", None)
+    else:
+        st.session_state["_frame_selection_scope_folders"] = [str(folder.resolve())]
+    if batch_id:
+        st.session_state["frame_selection_batch_select"] = batch_id
+    st.session_state["_next_page"] = "AI 菜品选图"
+    st.rerun()
+
+
 def _render_recipe_cover_review(
     st,
     store: MobileSyncStore,
@@ -2892,6 +2915,7 @@ def _render_recipe_cover_review(
         source_step_index: int | None = None,
         original_size: dict[str, int] | None = None,
         crop_box: dict[str, int] | None = None,
+        ai_candidate_path: str | None = None,
     ) -> None:
         st.session_state[crop_state_key] = {
             "content": content,
@@ -2903,6 +2927,7 @@ def _render_recipe_cover_review(
             "source_step_index": source_step_index,
             "original_size": original_size,
             "crop_box": crop_box,
+            "ai_candidate_path": ai_candidate_path,
             "token": hashlib.sha256(content).hexdigest()[:12],
         }
 
@@ -3015,6 +3040,10 @@ def _render_recipe_cover_review(
                 width="stretch",
             ):
                 try:
+                    if crop_source.get("ai_candidate_path"):
+                        latest_ai = load_frame_candidate(config.out_dir, folder)
+                        if not latest_ai or latest_ai.get("status") != "ok" or latest_ai.get("image_path") != crop_source["ai_candidate_path"]:
+                            raise ValueError("AI 候选图或菜谱来源已变化，请刷新候选后重新裁剪。")
                     cropped_content = crop_screenshot_box_content(crop_source["content"], crop_box)
                     saved_original_size = source_size
                     saved_crop_box = {
@@ -3077,6 +3106,56 @@ def _render_recipe_cover_review(
                 st.rerun()
 
         show_cover_crop_dialog()
+
+    st.markdown("###### AI 从原视频挑选成品特写")
+    st.caption("本地视觉模型在后台寻找成品画面。选好后在这里裁剪并确认，任务进度可在“AI 菜品选图”查看。")
+    ai_actions = st.columns(3)
+    if ai_actions[0].button("AI 选这道菜的特写", key=f"mobile_cover_ai_start_{selected_id}", width="stretch"):
+        try:
+            batch = start_frame_selection_batch(
+                config.out_dir, folders=[folder], limit=1, only_pending=False,
+                published_only=False, skip_confirmed=False, cookies=_optional_text(config.cookies),
+            )
+        except Exception as exc:
+            st.error(f"AI 选图启动失败：{_clean_error(exc)}")
+        else:
+            if batch.get("already_running"):
+                st.session_state["_frame_selection_warning"] = (
+                    "已有选图任务正在运行，本次点击未创建新任务。"
+                    "请等待或暂停当前任务，再为这道菜开始选图。"
+                )
+                _open_frame_selection_page(st, batch_id=batch["batch_id"])
+            else:
+                _open_frame_selection_page(st, folder=folder, batch_id=batch["batch_id"])
+    if ai_actions[1].button("批量 AI 选图与进度", key=f"mobile_cover_ai_batch_{selected_id}", width="stretch"):
+        _open_frame_selection_page(st)
+    ai_actions[2].button("刷新 AI 候选图", key=f"mobile_cover_ai_refresh_{selected_id}", width="stretch")
+    try:
+        ai_candidate = load_frame_candidate(config.out_dir, folder)
+    except Exception as exc:
+        ai_candidate = None
+        st.warning(f"AI 候选图暂不可用：{_clean_error(exc)}")
+    if ai_candidate and ai_candidate.get("status") == "ok":
+        image_path = Path(ai_candidate["image_path"])
+        ai_timestamp = ai_candidate.get("timestamp")
+        time_label = _format_video_position(ai_timestamp) or "未知时间"
+        try:
+            image_bytes = image_path.read_bytes()
+        except OSError as exc:
+            st.warning(f"候选图片暂不可读：{_clean_error(exc)}")
+        else:
+            st.image(image_bytes, caption=f"AI 候选 · 原视频 {time_label}", width=560)
+            st.caption(str(ai_candidate.get("reason") or "请查看原视频画面并确认是否适合作为封面。"))
+            st.button(
+                "裁剪 AI 候选图", key=f"mobile_cover_ai_crop_{selected_id}", width="stretch",
+                on_click=stage_for_crop,
+                kwargs={"content": image_bytes, "timestamp": ai_timestamp, "status": "manual_video",
+                        "label": f"AI 原视频候选 · {time_label}", "source_kind": "video_frame",
+                        "ai_candidate_path": str(image_path),
+                        "source_url": ai_candidate.get("source_url") or selected.get("source_url")},
+            )
+    elif ai_candidate and ai_candidate.get("status") == "not_found":
+        st.info("本次采样没有找到符合要求的成品画面。可以继续手工选图，或到 AI 菜品选图调整要求与采样数量后重选。")
 
     existing_candidates = []
     for step_index, step in enumerate(selected.get("steps") or [], start=1):
@@ -3281,6 +3360,8 @@ def _render_quick_recipe_review(st, config: UIConfig) -> None:
     if st.button("查看 AI 内容审核", key="quick_review_ai_audit"):
         st.session_state["_next_page"] = "AI 审核归类"
         st.rerun()
+    if st.button("批量 AI 选菜品特写", key="quick_review_ai_frames"):
+        _open_frame_selection_page(st)
     try:
         store = MobileSyncStore(Path.cwd(), out_dir=config.out_dir)
         store.index_recipes()
@@ -3468,6 +3549,11 @@ def _render_quick_recipe_review(st, config: UIConfig) -> None:
 
 def _render_mobile_client_admin(st, config: UIConfig) -> None:
     st.subheader("手机客户端")
+    if st.button("批量 AI 选菜品特写", key="mobile_ai_frames"):
+        _open_frame_selection_page(st)
+    if st.button("AI 补充菜品介绍", key="mobile_dish_info"):
+        st.session_state["_next_page"] = "菜品介绍"
+        st.rerun()
     try:
         store = MobileSyncStore(Path.cwd(), out_dir=config.out_dir)
         index_result = store.index_recipes()
@@ -4563,6 +4649,12 @@ def main() -> None:
 
     if active_page == "本餐点菜":
         _render_meal_planner(st, config)
+
+    if active_page == "菜品介绍":
+        render_dish_info_page(st, config)
+
+    if active_page == "AI 菜品选图":
+        render_frame_selection_page(st, config)
 
     if active_page == "烹饪模式":
         _render_cooking_mode(st, config)
