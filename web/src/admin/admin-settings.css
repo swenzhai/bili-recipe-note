@@ -1,4 +1,7 @@
 .adm-settings-grid { grid-template-columns: repeat(2,minmax(0,1fr)); align-items: start; }
+.adm-access-form { display: grid; gap: 1rem; margin-top: 1.25rem; }
+.adm-access-form > p { margin: 0; }
+.adm-access-form > button { justify-self: start; }
 .adm-span-all { grid-column: 1 / -1; }
 .adm-check { display: inline-flex; gap: .65rem; align-items: center; line-height: 1.5; }
 .adm-check input { width: 1rem; height: 1rem; flex-shrink: 0; accent-color: #176653; }

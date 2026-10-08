@@ -322,3 +322,106 @@ def test_condense_recipe_steps_limits_fragments_and_removes_post_completion_chat
     assert result.steps[-1].action.endswith("出锅")
     assert "试吃聊天" not in result.steps[-1].action
     assert [step.start_time for step in result.steps] == sorted(step.start_time for step in result.steps)
+
+
+def test_intermediate_plating_preserves_refrying_and_final_sauce():
+    recipe = Recipe(
+        title="糖醋鱼", source_url="test", ingredients=[], seasonings=[], tools=[],
+        steps=[
+            RecipeStep(title="初炸", start_time=0, end_time=10, action="鱼出锅后晾凉"),
+            RecipeStep(title="复炸", start_time=20, end_time=30, action="然后下锅复炸"),
+            RecipeStep(title="调汁", start_time=40, end_time=50, action="熬糖醋汁"),
+            RecipeStep(title="完成", start_time=60, end_time=70, action="装盘后浇上糖醋汁，后面是试吃聊天"),
+            RecipeStep(title="试吃", start_time=80, end_time=90, action="尝一口，太好吃了"),
+        ], summary_tips=[], uncertain_points=[],
+    )
+    result = condense_recipe_steps(recipe)
+    assert [step.action for step in result.steps] == ["鱼出锅后晾凉", "然后下锅复炸", "熬糖醋汁", "装盘后浇上糖醋汁"]
+
+
+@pytest.fixture
+def scoped_recipe_response():
+    return {
+        "title": "另一道菜", "dish_id": "model-forged-identity", "source_time_ranges": [{"start": 0, "end": 999}],
+        "ingredients": [{"name": "鸡蛋", "amount": "2个", "source_time": 10, "evidence": "打散两个鸡蛋"}],
+        "seasonings": [], "tools": [],
+        "steps": [
+            {"title": "准备", "start_time": 10, "end_time": 18, "action": "打散两个鸡蛋", "evidence": "打散两个鸡蛋"},
+            {"title": "烹饪", "start_time": 40, "end_time": 48, "action": "下锅炒熟", "evidence": "下锅炒熟"},
+        ], "summary_tips": [], "uncertain_points": [],
+    }
+
+
+def scoped_extract(response, **kwargs):
+    return extract_recipe_with_llm(
+        [TranscriptSegment(start=10, end=18, text="打散两个鸡蛋"),
+         TranscriptSegment(start=40, end=48, text="下锅炒熟")],
+        {"source_url": "test", "video_title": "炒鸡蛋与烧豆腐", "dish_id": "dish-valid",
+         "dish_index": 1, "dish_count": 2, "source_segment_ranges": [{"start_index": 1, "end_index": 1}, {"start_index": 4, "end_index": 4}]},
+        completion=lambda _: json.dumps(response, ensure_ascii=False),
+        target_dish_title="炒鸡蛋", source_time_ranges=[{"start": 10, "end": 18}, {"start": 40, "end": 48}],
+        **kwargs,
+    )
+
+
+def test_scoped_extraction_preserves_verified_dish_identity_and_original_times(scoped_recipe_response):
+    recipe = scoped_extract(scoped_recipe_response)
+    assert recipe.title == "炒鸡蛋"
+    assert recipe.dish_id == "dish-valid"
+    assert recipe.dish_count == 2
+    assert recipe.dish_index == 1
+    assert recipe.source_time_ranges == [{"start": 10, "end": 18}, {"start": 40, "end": 48}]
+    assert recipe.source_segment_ranges == [{"start_index": 1, "end_index": 1}, {"start_index": 4, "end_index": 4}]
+    assert [step.start_time for step in recipe.steps] == [10, 40]
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda data: data["ingredients"][0].update(source_time=25),
+    lambda data: data["ingredients"][0].update(evidence="另一道菜的豆腐"),
+    lambda data: data["ingredients"][0].update(source_time=None),
+    lambda data: data["steps"][0].update(start_time=0),
+    lambda data: data["steps"][0].update(end_time=48),
+    lambda data: data["steps"][0].update(evidence="凭常识补出的动作"),
+    lambda data: data["steps"][0].update(start_time=None),
+    lambda data: data["steps"][0].update(start_time=float("nan")),
+    lambda data: data["steps"][0].update(end_time=9),
+])
+def test_scoped_extraction_rejects_foreign_or_missing_evidence_and_gaps(scoped_recipe_response, mutation):
+    mutation(scoped_recipe_response)
+    with pytest.raises(ValueError):
+        scoped_extract(scoped_recipe_response)
+
+
+def test_scoped_extraction_rejects_unfiltered_input_before_model_call():
+    with pytest.raises(ValueError, match="输入字幕"):
+        extract_recipe_with_llm(
+            [TranscriptSegment(start=25, end=30, text="不属于本菜的豆腐")], {},
+            source_time_ranges=[{"start": 10, "end": 18}, {"start": 40, "end": 48}],
+            completion=lambda _: pytest.fail("foreign transcript must not reach model"),
+        )
+
+
+def test_condense_scoped_steps_never_merges_across_another_dish():
+    spans = [{"start": 10, "end": 18}, {"start": 40, "end": 48}]
+    recipe = Recipe(
+        title="交错制作", source_url="test", source_time_ranges=spans,
+        ingredients=[], seasonings=[], tools=[], summary_tips=[], uncertain_points=[],
+        steps=[RecipeStep(title=f"步骤{index}", start_time=start + index, end_time=start + index + 1,
+                          action=f"动作{index}") for start in (10, 40) for index in range(8)],
+    )
+    condensed = condense_recipe_steps(recipe, max_steps=4)
+    assert len(condensed.steps) == 4
+    for step in condensed.steps:
+        assert any(span["start"] <= step.start_time <= step.end_time <= span["end"] for span in spans)
+
+
+def test_rule_scoped_recipe_does_not_append_later_span_to_previous_step():
+    recipe = extract_recipe_rule_based(
+        [TranscriptSegment(start=10, end=18, text="先打散鸡蛋"),
+         TranscriptSegment(start=40, end=48, text="这是本菜后续的操作")],
+        {"target_dish_title": "炒鸡蛋", "video_title": "两道菜",
+         "source_time_ranges": [{"start": 10, "end": 18}, {"start": 40, "end": 48}], "dish_id": "dish-valid"},
+    )
+    assert recipe.title == "炒鸡蛋"
+    assert recipe.dish_id == "dish-valid"
+    assert [(step.start_time, step.end_time) for step in recipe.steps] == [(10, 18), (40, 48)]

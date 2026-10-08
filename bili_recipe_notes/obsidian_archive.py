@@ -131,6 +131,15 @@ def _normalized_recipe_data(data: Mapping[str, Any]) -> tuple[Recipe, dict[str, 
 
 
 def _source_id(recipe: Mapping[str, Any], output_folder: Path) -> str:
+    identity = _video_source_id(recipe, output_folder)
+    job = _read_object(output_folder / "job.json") if (output_folder / "job.json").is_file() else {}
+    dish_id = recipe.get("dish_id") or job.get("dish_id")
+    if dish_id:
+        return f"{identity}-dish-{hashlib.sha256(str(dish_id).encode()).hexdigest()[:12]}"
+    return identity
+
+
+def _video_source_id(recipe: Mapping[str, Any], output_folder: Path) -> str:
     job_path = output_folder / "job.json"
     if job_path.is_file():
         job = _read_object(job_path)

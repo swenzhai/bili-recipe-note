@@ -24,7 +24,13 @@ export type TaskSummary = {
   completed: number;
   failed: number;
   skipped: number;
+  pending?: number;
+  run_limit?: number | null;
+  run_processed?: number;
+  pause_reason?: string | null;
   not_found?: number;
+  needs_review?: number;
+  run_scope?: string;
   progress: number;
   current?: string;
   elapsed_seconds: number;
@@ -33,10 +39,12 @@ export type TaskSummary = {
   can_pause: boolean;
   can_resume: boolean;
   can_retry: boolean;
+  can_retry_not_found?: boolean;
   items?: Record<string, unknown>[];
   log?: string;
   options?: Record<string, unknown>;
   already_running?: boolean;
+  reused?: boolean;
   error?: string;
   current_progress?: Record<string, unknown>;
 };

@@ -6,12 +6,16 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from conftest import authenticate_streamlit_app
+
 from bili_recipe_notes import dish_info, dish_info_ui
 
 
 @pytest.fixture(autouse=True)
-def isolated_ui(tmp_path, monkeypatch):
+def isolated_ui(tmp_path, tmp_path_factory, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    # Keep login state outside the recipe fixture whose bytes are read-only.
+    monkeypatch.setenv("BILI_RECIPE_DATA_DIR", str(tmp_path_factory.mktemp("dish-ui-state")))
     monkeypatch.setattr(dish_info, "complete_markdown_prompt", lambda *_a, **_k: pytest.fail("UI browsing must not invoke a model"))
     monkeypatch.setattr(dish_info, "search_dish_sources", lambda *_a, **_k: pytest.fail("UI browsing must not search"))
     for name in ("start_dish_info_batch", "stop_dish_info_batch", "resume_dish_info_batch"):
@@ -26,6 +30,7 @@ def open_page(root: Path, **config) -> AppTest:
         "render_dish_info_page(st, UIConfig(**st.session_state['config']))\n",
         default_timeout=15,
     )
+    authenticate_streamlit_app(app)
     app.session_state["config"] = {"out_dir": str(root), "llm_provider": "codex", "codex_model": "demo-model", "codex_profile": "demo-profile", **config}
     return app.run()
 
@@ -187,6 +192,7 @@ def test_dashboard_without_config_prefers_running_task_and_opens_management(tmp_
         "from bili_recipe_notes.dish_info_ui import render_dish_info_dashboard\n"
         "render_dish_info_dashboard(st, st.session_state['root'], key_prefix='home_intro')\n"
     )
+    authenticate_streamlit_app(app)
     app.session_state["root"] = str(tmp_path)
     app.run()
     assert not app.exception

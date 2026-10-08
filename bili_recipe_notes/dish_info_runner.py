@@ -110,7 +110,7 @@ def _finish_run(state: dict, status: str, **updates) -> None:
     state.update(status=status, current_folder=None, finished_at=finished_at, **updates)
     for run in state.get("runs", []):
         if run.get("run_token") == state.get("run_token"):
-            run.update(status=status, finished_at=finished_at)
+            run.update(status=status, finished_at=finished_at, run_processed=state.get("run_processed", 0))
 
 
 def list_dish_info_batches(out_dir: str | Path) -> list[dict]:
@@ -133,8 +133,11 @@ def list_dish_info_batches(out_dir: str | Path) -> list[dict]:
 def _launch(root: Path, state: dict) -> dict:
     token = uuid.uuid4().hex
     state.update(status="queued", run_token=token, pid=os.getpid(), process_start_id=_identity(os.getpid()),
-                 stop_requested=False, current_folder=None, error=None, pause_reason=None, finished_at=None, consecutive_failures=0)
-    state.setdefault("runs", []).append({"run_token": token, "started_at": _now(), "llm_options": dict(state["options"])})
+                 stop_requested=False, current_folder=None, error=None, pause_reason=None, finished_at=None,
+                 consecutive_failures=0, run_processed=0)
+    state.setdefault("run_limit", 0)
+    state.setdefault("runs", []).append({"run_token": token, "started_at": _now(), "llm_options": dict(state["options"]),
+                                       "run_limit": state["run_limit"]})
     _write(root, state)
     args = [str(root), state["batch_id"], token]
     command = ([sys.executable, "--dish-info-worker", *args] if getattr(sys, "frozen", False)
@@ -159,14 +162,19 @@ def _launch(root: Path, state: dict) -> dict:
 
 
 def start_dish_info_batch(out_dir: str | Path, *, limit: int | None = 10, only_pending: bool = True,
-                          web_search: bool = False, folders: list[str | Path] | None = None, **options) -> dict:
+                          web_search: bool = False, folders: list[str | Path] | None = None,
+                          create_only: bool = False, run_limit: int = 0, **options) -> dict:
     root = _root(out_dir)
     _validate_options(options)
     if limit is not None and (type(limit) is not int or limit <= 0):
         raise ValueError("本轮数量必须为正整数")
+    if type(create_only) is not bool:
+        raise ValueError("仅创建队列设置必须为布尔值")
+    if type(run_limit) is not int or run_limit < 0:
+        raise ValueError("每次执行数量必须为非负整数，0 表示不限")
     with file_lock(root / ".dish-info" / "control", timeout=15):
         active = next((state for state in list_dish_info_batches(root) if state["active"]), None)
-        if active:
+        if active and not create_only:
             return active
         selected = [_folder(root, value) for value in folders] if folders is not None else None
         visibility = recipe_visibility_states(root, folders=selected)
@@ -182,16 +190,26 @@ def start_dish_info_batch(out_dir: str | Path, *, limit: int | None = 10, only_p
             candidates = candidates[:limit]
         state = {"schema_version": 1, "batch_id": "intro-" + uuid.uuid4().hex[:16], "out_dir": str(root),
                  "created_at": _now(), "status": "completed", "options": options, "web_search": web_search,
+                 "run_limit": run_limit, "run_processed": 0,
                  "only_pending": only_pending, "items": [{"folder": folder.relative_to(root).as_posix(), "status": "pending"} for folder in candidates]}
-        return _launch(root, state) if candidates else _write(root, state)
+        if candidates and not create_only:
+            return _launch(root, state)
+        if candidates:
+            state["status"] = "pending"
+        else:
+            _finish_run(state, "completed")
+        return {**_write(root, state), "active": False}
 
 
 def stop_dish_info_batch(out_dir: str | Path, batch_id: str) -> dict:
     return _update(_root(out_dir), batch_id, lambda state: state.update(stop_requested=True))
 
 
-def resume_dish_info_batch(out_dir: str | Path, batch_id: str, *, retry_failed: bool = False, **options) -> dict:
+def resume_dish_info_batch(out_dir: str | Path, batch_id: str, *, retry_failed: bool = False,
+                           run_limit: int | None = None, **options) -> dict:
     root = _root(out_dir)
+    if run_limit is not None and (type(run_limit) is not int or run_limit < 0):
+        raise ValueError("每次执行数量必须为非负整数，0 表示不限")
     with file_lock(root / ".dish-info" / "control", timeout=15):
         active = next((state for state in list_dish_info_batches(root) if state["active"]), None)
         if active:
@@ -199,6 +217,7 @@ def resume_dish_info_batch(out_dir: str | Path, batch_id: str, *, retry_failed: 
         state = _read(root, batch_id)
         state["options"] = {**state["options"], **options}
         _validate_options(state["options"])
+        state["run_limit"] = state.get("run_limit", 0) if run_limit is None else run_limit
         for item in state["items"]:
             if item["status"] == "running" or (retry_failed and item["status"] == "failed"):
                 for attempt in item.get("attempts", []):
@@ -222,10 +241,11 @@ def run_dish_info_batch(out_dir: str | Path, batch_id: str, token: str) -> dict:
         if state.get("run_token") != token:
             return state
         index = next((index for index, item in enumerate(state["items"]) if item["status"] == "pending"), None)
-        if index is None or state.get("stop_requested"):
+        limit_reached = bool(state.get("run_limit") and state.get("run_processed", 0) >= state["run_limit"])
+        if index is None or state.get("stop_requested") or limit_reached:
             return _update(root, batch_id, lambda current: _finish_run(current,
                 "paused" if index is not None else "completed_with_errors" if current["failed"] else "completed",
-                pause_reason="requested" if index is not None else None), token=token)
+                pause_reason=("requested" if current.get("stop_requested") else "batch_limit") if index is not None else None), token=token)
         name = state["items"][index]["folder"]
 
         def starting(current):
@@ -263,10 +283,15 @@ def run_dish_info_batch(out_dir: str | Path, batch_id: str, token: str) -> dict:
         def finished(current):
             current["items"][index].update(result, finished_at=_now())
             current["current_folder"] = None
+            current["run_processed"] = current.get("run_processed", 0) + 1
             current["consecutive_failures"] = current.get("consecutive_failures", 0) + 1 if result["status"] == "failed" else 0
             if result.get("error_kind") == "configuration" or current["consecutive_failures"] >= 5:
                 _finish_run(current, "paused", error="连续失败或模型配置有误，请检查后重试",
                             pause_reason="configuration" if result.get("error_kind") == "configuration" else "consecutive_failures")
+            elif (current.get("run_limit") and current["run_processed"] >= current["run_limit"]
+                  and not current.get("stop_requested")
+                  and any(item["status"] == "pending" for item in current["items"])):
+                _finish_run(current, "paused", pause_reason="batch_limit")
         state = _update(root, batch_id, finished, token=token)
         print(f"{_now()} {name}: {result['status']}", flush=True)
         if state["status"] == "paused":

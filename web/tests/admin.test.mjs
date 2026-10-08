@@ -11,6 +11,7 @@ async function compiledModule(name) {
   if (modules.has(name)) return modules.get(name);
   const source = await readFile(new URL(`../src/admin/${name}`, import.meta.url), "utf8");
   let compiled = ts.transpileModule(source, { compilerOptions: { jsx: ts.JsxEmit.ReactJSX, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText;
+  compiled = compiled.replace(/^import\s+["'][^"']+\.css["'];?\s*$/gm, '');
   const dependencies = [...compiled.matchAll(/from\s+["']([^"']+)["']/g)];
   for (const [, path] of dependencies) {
     const resolved = path.startsWith(".") ? await compiledModule(`${path.slice(2)}${path === "./api" ? ".ts" : ".tsx"}`) : import.meta.resolve(path);
@@ -24,6 +25,105 @@ async function compiledModule(name) {
 const { RecipeContents, scaledAmount } = await import(await compiledModule("RecipePage.tsx"));
 const { libraryQuery } = await import(await compiledModule("LibraryPage.tsx"));
 const { RecipeCard } = await import(await compiledModule("HomePage.tsx"));
+const { default: TasksPage, GenerationDishes, queueOptions, controlOptions, matchesTaskFilter, taskExecutionLabels } = await import(await compiledModule("TasksPage.tsx"));
+const { aiFrameCandidates } = await import(await compiledModule("ReviewPage.tsx"));
+
+test("a video shows completed and failed dishes independently", () => {
+  const html = renderToStaticMarkup(React.createElement(GenerationDishes, { item: {
+    completed_dish_count: 1, dishes: [
+      { dish_id: "first", title: "炒蛋", status: "done" },
+      { dish_id: "second", title: "炒青菜", status: "failed", error: "模型超时" },
+    ],
+  } }));
+  assert.match(html, /本视频 2 道菜，已完成 1 道/);
+  assert.match(html, /炒蛋 · 已完成/);
+  assert.match(html, /炒青菜 · 失败/);
+  assert.match(html, /模型超时/);
+  assert.equal(renderToStaticMarkup(React.createElement(GenerationDishes, { item: {} })), "");
+});
+
+test("uncertain original frames remain labeled for manual approval", () => {
+  const source = { status: "needs_review", url: "/api/admin/v1/media/ai", timestamp: 187.5, candidate_revision: "review-frame" };
+  assert.deepEqual(aiFrameCandidates(source), [{ id: "ai", url: source.url, label: "AI 候选 · 待确认", timestamp: 187.5, candidate_revision: "review-frame" }]);
+  assert.equal(aiFrameCandidates({ ...source, status: "ok" })[0].label, "AI 成品特写");
+  for (const status of ["not_found", "stale", "fallback"]) assert.deepEqual(aiFrameCandidates({ ...source, status }), []);
+  assert.deepEqual(aiFrameCandidates({ ...source, url: null }), []);
+  assert.equal(source.status, "needs_review");
+});
+
+test("no-match retry carries the quota only for frame selection", () => {
+  assert.deepEqual(controlOptions("frames", "retry-not-found", 3, false), { use_current_config: false, run_limit: 3 });
+  for (const kind of ["review", "dish-info", "generation"]) {
+    assert.deepEqual(controlOptions(kind, "retry-not-found", 3, false), { use_current_config: false });
+  }
+  assert.equal(matchesTaskFilter({ status: "completed", failed: 0, not_found: 1 }, "attention"), true);
+  assert.equal(matchesTaskFilter({ status: "completed", failed: 0, needs_review: 1 }, "attention"), true);
+});
+
+test("AI task creation separates the full queue from the first execution batch", () => {
+  for (const kind of ["frames", "review", "dish-info"]) {
+    assert.deepEqual(queueOptions(kind, 0, 10, false), { limit: 0, run_limit: 10, create_only: false });
+    assert.deepEqual(queueOptions(kind, 45, 6, true), { limit: 45, run_limit: 6, create_only: true });
+    assert.deepEqual(queueOptions(kind, 0, 0, false), { limit: 0, run_limit: 0, create_only: false });
+  }
+  assert.deepEqual(queueOptions("generation", 10, 5, false), { limit: 10 });
+});
+
+test("only AI resume and retry requests include the chosen next batch size", () => {
+  for (const kind of ["frames", "review", "dish-info"]) {
+    assert.deepEqual(controlOptions(kind, "resume", 3, false), { use_current_config: false, run_limit: 3 });
+    assert.deepEqual(controlOptions(kind, "retry", 0, true), { use_current_config: true, run_limit: 0 });
+    assert.deepEqual(controlOptions(kind, "pause", 10, false), { use_current_config: false });
+  }
+  for (const kind of ["generation", "creators", "settings"]) {
+    assert.deepEqual(controlOptions(kind, "resume", 5, false), { use_current_config: false });
+  }
+});
+
+test("pending task filter retains later batches after an automatic pause", () => {
+  const task = { kind: "frames", status: "paused", pause_reason: "batch_limit", pending: 32, failed: 0 };
+  assert.equal(matchesTaskFilter(task, "pending"), true);
+  assert.equal(matchesTaskFilter(task, "active"), false);
+  assert.equal(matchesTaskFilter({ ...task, status: "running" }, "pending"), true);
+  assert.equal(matchesTaskFilter({ ...task, status: "pending", pending: 0 }, "pending"), true);
+  assert.equal(matchesTaskFilter({ ...task, status: "completed", pending: 0 }, "pending"), false);
+});
+
+test("AI batch estimates and retry labels describe pending work accurately", () => {
+  for (const kind of ["frames", "review", "dish-info"]) {
+    const task = { kind, run_limit: 10, pending: 24, failed: 2 };
+    const labels = taskExecutionLabels(task);
+    assert.equal(labels.eta, "预计本批剩余");
+    assert.equal(labels.retry, "加入失败项并执行下一批（2）");
+    assert.match(labels.retryHint, /与原待办共同计入本批执行数量/);
+    assert.equal(taskExecutionLabels({ ...task, pending: 0 }).retry, "重试失败项（2）");
+    assert.equal(taskExecutionLabels({ ...task, pending: 0 }).retryHint, "");
+    assert.equal(taskExecutionLabels({ ...task, run_limit: null }).eta, "预计剩余");
+  }
+  assert.deepEqual(taskExecutionLabels({ kind: "generation", pending: 24, failed: 2, run_limit: 10 }), {
+    eta: "预计剩余", retry: "重试失败项（2）", retryHint: "",
+  });
+});
+
+test("task form defaults to queueing all recipes and offers separate queue and run actions", t => {
+  globalThis.window = { location: { search: "?create=frames" } };
+  t.after(() => { delete globalThis.window; });
+  const html = renderToStaticMarkup(React.createElement(TasksPage, { navigate() {} }));
+  assert.match(html, /加入列表数量（0 表示全部）<input[^>]*value="0"/);
+  assert.match(html, /本批执行数量（0 表示全部）<input[^>]*value="10"/);
+  assert.match(html, /仅加入待执行列表/);
+  assert.match(html, /加入并执行首批/);
+  assert.match(html, /达到本批数量后自动暂停/);
+});
+
+test("selected recipe scope keeps all selected recipes queued and bounds the first batch", t => {
+  globalThis.window = { location: { search: "?create=review&recipe_ids=a,b,c" } };
+  t.after(() => { delete globalThis.window; });
+  const html = renderToStaticMarkup(React.createElement(TasksPage, { navigate() {} }));
+  assert.match(html, /已选择 3 道菜谱/);
+  assert.match(html, /加入列表数量（0 表示全部）<input[^>]*value="0"/);
+  assert.match(html, /本批执行数量（0 表示全部）<input[^>]*value="3"/);
+});
 
 test("admin API sends request protection and uses uncached same-origin requests", async t => {
   const calls = [];

@@ -4,10 +4,10 @@ import json
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from bili_recipe_notes.admin_common import AdminContext
+from bili_recipe_notes.admin_common import AdminContext, require_admin_request
 from bili_recipe_notes.admin_curation import create_router
 from bili_recipe_notes.mobile_api import create_app
 
@@ -26,7 +26,7 @@ def recipe_fixture(root: Path, name: str, *, title="番茄炒蛋", ingredient="�
 
 
 @pytest.fixture
-def workspace(tmp_path):
+def workspace(tmp_path, authorize_client):
     root = tmp_path / "data" / "recipes"
     folders = [recipe_fixture(root, "BV1aaa"), recipe_fixture(root, "BV1bbb", ingredient="番茄")]
     application = create_app(tmp_path, out_dir=root, start_background_indexer=False)
@@ -34,8 +34,9 @@ def workspace(tmp_path):
     context = AdminContext(application.state.store, application.state.indexer)
     # Exercise this focused router independently of composition being developed.
     app = FastAPI()
-    app.include_router(create_router(context))
+    app.include_router(create_router(context), dependencies=[Depends(require_admin_request)])
     with TestClient(app) as client:
+        authorize_client(client, tmp_path)
         yield tmp_path, root, folders, context, client
 
 

@@ -30,6 +30,9 @@ from .storage import atomic_write_json
 
 
 SCHEMA_VERSION = 1
+# Bump when sampling or judging changes can improve an earlier selection.
+# Kept separate from the storage schema so usable old images remain available.
+SELECTION_STRATEGY_VERSION = 4
 MODEL_TIMEOUT_SECONDS = 6 * 60 * 60
 DEFAULT_OPTIONS = {
     "requirement": frame_selection.DEFAULT_REQUIREMENT,
@@ -122,6 +125,40 @@ def _fingerprint(folder: Path) -> tuple[str, dict]:
     return fingerprint_review_content(inputs), inputs
 
 
+def _time_ranges(value: object) -> list[dict] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise ValueError("菜品视频时间范围不能为空")
+    ranges = []
+    for span in value:
+        if not isinstance(span, dict):
+            raise ValueError("菜品视频时间范围无效")
+        start, end = span.get("start"), span.get("end")
+        if (any(type(number) not in (int, float) or not math.isfinite(number) for number in (start, end))
+                or start < 0 or end <= start):
+            raise ValueError("菜品视频时间范围必须为有限非负数，且 end 大于 start")
+        ranges.append({"start": float(start), "end": float(end)})
+    merged = []
+    for span in sorted(ranges, key=lambda item: item["start"]):
+        if merged and span["start"] <= merged[-1]["end"]:
+            merged[-1]["end"] = max(merged[-1]["end"], span["end"])
+        else:
+            merged.append(span)
+    return merged
+
+
+def _recipe_time_ranges(recipe: dict) -> list[dict] | None:
+    value = recipe.get("source_time_ranges")
+    if recipe.get("dish_id") and not value:
+        raise ValueError("子菜谱缺少视频时间范围，不能搜索全片")
+    return _time_ranges(value)
+
+
+def _in_ranges(timestamp: float, ranges: list[dict] | None) -> bool:
+    return ranges is None or any(span["start"] <= timestamp < span["end"] for span in ranges)
+
+
 def _read_object(path: Path) -> dict:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -165,12 +202,14 @@ def _manifest_view(manifest: dict, selection: Path) -> dict:
         if not isinstance(relative, str) or Path(relative).is_absolute():
             raise ValueError("选图日志路径无效")
         result[field] = str(_inside(selection / relative, selection))
-    if result["status"] == "ok":
+    if result["status"] in {"ok", "needs_review"}:
         relative = result.get("image_path")
         if not isinstance(relative, str) or Path(relative).is_absolute():
             raise ValueError("选图图片路径无效")
         result["image_path"] = str(_image(selection / relative, selection, result.get("dimensions")))
         result["timestamp"] = _timestamp(result.get("timestamp"))
+        if not _in_ranges(result["timestamp"], _time_ranges(result.get("time_ranges"))):
+            raise ValueError("候选图片时间超出菜品视频范围")
     elif any(result.get(key) is not None for key in ("image_path", "timestamp", "dimensions")):
         raise ValueError("没有匹配画面的记录不能包含图片")
     return result
@@ -182,15 +221,19 @@ def load_frame_candidate(out_dir: str | Path, folder: str | Path, *, include_sta
         root, folder, selection, key = _locations(out_dir, folder)
         path = _inside(selection / "candidates" / f"{key}.json", selection)
         manifest = _read_object(path)
-        fingerprint, _ = _fingerprint(folder)
+        fingerprint, inputs = _fingerprint(folder)
+        time_ranges = _recipe_time_ranges(inputs["recipe"])
         if (manifest.get("schema_version") != SCHEMA_VERSION
                 or manifest.get("folder") != folder.relative_to(root).as_posix()
-                or manifest.get("status") not in ("ok", "not_found")):
+                or manifest.get("status") not in ("ok", "not_found", "needs_review")):
             return None
         for field in ("title", "source_url", "reason", "generated_at"):
             if not isinstance(manifest.get(field), str):
                 return None
-        if manifest.get("fingerprint") != fingerprint:
+        outdated_search = (manifest["status"] in {"not_found", "needs_review"}
+                           and manifest.get("selection_strategy_version") != SELECTION_STRATEGY_VERSION)
+        if (manifest.get("fingerprint") != fingerprint or outdated_search
+                or _time_ranges(manifest.get("time_ranges")) != time_ranges):
             if include_stale:
                 return {**manifest, "original_status": manifest["status"], "status": "stale",
                         "image_path": None, "timestamp": None, "valid": False,
@@ -227,6 +270,30 @@ def _command(video: Path, output: Path, options: dict) -> list[str]:
     for key in ("device", "threads", "interval", "coarse_limit", "fine_fps", "top_k", "fine_limit"):
         result.extend(("--" + key.replace("_", "-"), str(options[key])))
     return result
+
+
+def _dish_context(inputs: dict) -> dict:
+    ranges = _recipe_time_ranges(inputs["recipe"])
+    segments = []
+    for row in inputs["transcript"]:
+        text = row.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        start = row.get("start", row.get("start_time"))
+        end = row.get("end", row.get("end_time", start))
+        if (type(start) not in (int, float) or type(end) not in (int, float)
+                or not math.isfinite(start) or not math.isfinite(end) or start < 0 or end < start):
+            continue
+        if ranges is None:
+            segments.append({"start": start, "end": end, "text": text})
+        else:
+            for span in ranges:
+                lo, hi = max(start, span["start"]), min(end, span["end"])
+                if lo < hi or (start == end and span["start"] <= start < span["end"]):
+                    segments.append({"start": lo, "end": hi, "text": text})
+    title = str(inputs["recipe"].get("title") or "").strip() or "当前菜品"
+    return {"schema_version": 1, "dish_title": title,
+            "segments": segments}
 
 
 def _existing_video(folder: Path) -> Path | None:
@@ -401,20 +468,52 @@ def _run_selector(command: list[str], run: Path, progress: _Progress) -> int:
                 process.stderr.close()
 
 
-def _validate_result(output: Path, video: Path, options: dict, exit_code: int) -> dict:
+def _validate_dish_judgment(judgment: dict, status: str) -> None:
+    """Recheck the selector's structured decision without importing ML code."""
+    assessment = judgment.get("dish_assessment")
+    if not isinstance(assessment, dict):
+        raise ValueError("菜品候选缺少独立条件判断")
+    if any(type(assessment.get(key)) is not bool for key in ("food_visible", "constraints_satisfied")):
+        raise ValueError("菜品候选的布尔条件无效")
+    for key, choices in (
+        ("completion", {"finished", "raw", "cooking", "uncertain"}),
+        ("identity", {"compatible", "conflict", "uncertain"}),
+        ("presentation", {"serving", "demonstration", "process", "uncertain"}),
+    ):
+        if not isinstance(assessment.get(key), str) or assessment[key] not in choices:
+            raise ValueError("菜品候选的分类条件无效：" + key)
+    rejected = (not assessment["food_visible"] or not assessment["constraints_satisfied"]
+                or assessment["completion"] in {"raw", "cooking"}
+                or assessment["identity"] == "conflict" or assessment["presentation"] == "process")
+    accepted = (not rejected and assessment["completion"] == "finished"
+                and assessment["identity"] == "compatible"
+                and assessment["presentation"] in {"serving", "demonstration"})
+    decision = "reject" if rejected else "accept" if accepted else "needs_review"
+    if (judgment.get("decision") != decision
+            or judgment.get("matches_requirement") is not accepted
+            or (status == "ok" and decision != "accept")
+            or (status == "needs_review" and decision != "needs_review")):
+        raise ValueError("菜品候选状态与独立条件判断不一致")
+
+
+def _validate_result(output: Path, video: Path, options: dict, exit_code: int,
+                     *, require_dish_assessment: bool = False, time_ranges: list[dict] | None = None) -> dict:
     path = _inside(output / "result.json", output)
     result = _read_object(path)
     status = result.get("status")
     if (result.get("schema_version") != SCHEMA_VERSION
             or result.get("fallback") is not False
-            or status not in ("ok", "not_found")
-            or exit_code != (0 if status == "ok" else 2)):
+            or status not in ("ok", "not_found", "needs_review")
+            or exit_code != (2 if status == "not_found" else 0)):
         raise ValueError(f"选图退出码或结果状态异常：exit={exit_code}, status={status}")
     if result.get("input") != str(video) or result.get("requirement") != options["requirement"]:
         raise ValueError("选图结果的输入视频或要求不一致")
     if result.get("metadata") != str(path) or not isinstance(result.get("reason"), str):
         raise ValueError("选图结果的记录路径或理由无效")
-    if status == "ok":
+    parameters = result.get("parameters") or {}
+    if not isinstance(parameters, dict) or _time_ranges(parameters.get("time_ranges")) != time_ranges:
+        raise ValueError("选图结果的视频时间范围与本次菜品不一致")
+    if status in {"ok", "needs_review"}:
         if not isinstance(result.get("image"), str) or not isinstance(result.get("selected"), dict):
             raise ValueError("选图结果缺少图片或所选帧")
         image = Path(result["image"])
@@ -423,12 +522,20 @@ def _validate_result(output: Path, video: Path, options: dict, exit_code: int) -
         result["image"] = str(_image(image, output, result.get("dimensions")))
         selected = result["selected"]
         result["timestamp"] = _timestamp(selected.get("relative_timestamp_seconds"))
+        if not _in_ranges(result["timestamp"], time_ranges):
+            raise ValueError("所选帧超出菜品视频时间范围")
         if (type(selected.get("frame_index")) is not int or selected["frame_index"] < 0
                 or type(selected.get("pts")) is not int
                 or not isinstance(selected.get("time_base"), str)
-                or not isinstance(selected.get("judgment"), dict)
-                or selected["judgment"].get("matches_requirement") is not True):
+                or not isinstance(selected.get("judgment"), dict)):
             raise ValueError("所选帧的定位或匹配信息无效")
+        judgment = selected["judgment"]
+        if status == "ok" and judgment.get("matches_requirement") is not True:
+            raise ValueError("所选帧的定位或匹配信息无效")
+        if status == "needs_review" and not require_dish_assessment:
+            raise ValueError("自定义选图要求未启用菜品待确认候选")
+        if require_dish_assessment or "dish_assessment" in judgment or "decision" in judgment:
+            _validate_dish_judgment(judgment, status)
         time_base = Fraction(selected["time_base"])
         timestamp = selected.get("timestamp_seconds")
         if (time_base <= 0 or type(timestamp) not in (int, float) or not math.isfinite(timestamp)
@@ -449,6 +556,7 @@ def generate_frame_candidate(folder: str | Path, *, out_dir: str | Path, options
     root, folder, selection, key = _locations(out_dir, folder)
     fingerprint, inputs = _fingerprint(folder)
     recipe, source = inputs["recipe"], inputs["source"]
+    time_ranges = _recipe_time_ranges(recipe)
     source_url = str(recipe.get("source_url") or source.get("webpage_url") or source.get("source_url") or source.get("url") or "")
     run = _inside(selection / "runs" / key / uuid.uuid4().hex, selection)
     run.mkdir(parents=True, exist_ok=False)
@@ -456,8 +564,13 @@ def generate_frame_candidate(folder: str | Path, *, out_dir: str | Path, options
     output = run / "result"
     reporter = _Progress(progress, options)
     public_options = {key: value for key, value in options.items() if key != "cookies"}
-    attempt = {"schema_version": SCHEMA_VERSION, "folder": folder.relative_to(root).as_posix(),
-               "fingerprint": fingerprint, "started_at": _now(), "options": public_options}
+    # Dish identity belongs to the separate context. Repeating it as a mandatory
+    # phrase in the request makes generic visual names look like mismatches.
+    effective_requirement = options["requirement"]
+    attempt = {"schema_version": SCHEMA_VERSION, "selection_strategy_version": SELECTION_STRATEGY_VERSION,
+               "folder": folder.relative_to(root).as_posix(),
+               "fingerprint": fingerprint, "started_at": _now(), "options": public_options,
+               "effective_requirement": effective_requirement, "time_ranges": time_ranges}
     atomic_write_json(run / "run.json", attempt, backup=False)
     try:
         reporter.emit()
@@ -466,7 +579,16 @@ def generate_frame_candidate(folder: str | Path, *, out_dir: str | Path, options
         public_options = {key: value for key, value in options.items() if key != "cookies"}
         attempt["options"] = public_options
         atomic_write_json(run / "run.json", attempt, backup=False)
-        command = _command(Path("/unused"), output, options)
+        effective_options = {**options, "requirement": effective_requirement}
+        command = _command(Path("/unused"), output, effective_options)
+        if time_ranges is not None:
+            ranges_path = run / "time-ranges.json"
+            atomic_write_json(ranges_path, {"schema_version": 1, "ranges": time_ranges}, backup=False)
+            command.extend(("--time-ranges", str(ranges_path)))
+        if options["requirement"] == frame_selection.DEFAULT_REQUIREMENT:
+            context_path = run / "dish-context.json"
+            atomic_write_json(context_path, _dish_context(inputs), backup=False)
+            command.extend(("--dish-context", str(context_path), "--review-uncertain"))
         video = _existing_video(folder)
         if video is None:
             if not source_url:
@@ -488,11 +610,15 @@ def generate_frame_candidate(folder: str | Path, *, out_dir: str | Path, options
             )) else FrameSelectionError
             raise error_class(f"选图进程失败（退出码 {exit_code}）。日志：{run / 'stderr.log'}\n{details.strip()}")
         reporter.emit("validating", "校验独立候选图片")
-        result = _validate_result(output, video, options, exit_code)
+        result = _validate_result(output, video, effective_options, exit_code,
+                                  require_dish_assessment=options["requirement"] == frame_selection.DEFAULT_REQUIREMENT,
+                                  time_ranges=time_ranges)
         current, _ = _fingerprint(folder)
         if current != fingerprint:
             raise FrameSelectionError("选图期间菜谱、字幕或来源已改变，结果未应用")
         manifest = {"schema_version": SCHEMA_VERSION, "status": result["status"],
+                    "selection_strategy_version": SELECTION_STRATEGY_VERSION,
+                    "time_ranges": time_ranges,
                     "folder": folder.relative_to(root).as_posix(), "fingerprint": fingerprint,
                     "title": str(recipe.get("title") or folder.name), "source_url": source_url,
                     "image_path": Path(result["image"]).relative_to(selection).as_posix() if result.get("image") else None,

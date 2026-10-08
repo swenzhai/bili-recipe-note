@@ -29,6 +29,22 @@ from bili_recipe_notes.pipeline import BatchJobItemResult, BatchJobOptions, Reci
 from bili_recipe_notes.recipe_extractor import TranscriptSegment
 
 
+@pytest.fixture(autouse=True)
+def _single_dish_discovery_stub(monkeypatch):
+    # Legacy extraction tests isolate the new discovery call; recognition and
+    # multi-dish orchestration have their own evidence/boundary tests.
+    def identify(transcript, metadata, **kwargs):
+        from bili_recipe_notes.dish_recognition import identify_dishes
+        payload = {"status": "identified", "reason": "test fixture", "dishes": [{
+            "independent_dish": True, "title": "鸡蛋", "confidence": 0.99,
+            "segment_ranges": [{"start_index": 0, "end_index": len(transcript) - 1}],
+            "evidence": [{"kind": kind, "segment_index": 0, "quote": transcript[0].text}
+                         for kind in ("identity", "cooking")],
+        }]}
+        return identify_dishes(transcript, metadata, completion=lambda _: json.dumps(payload))
+    monkeypatch.setattr(pipeline, "identify_dishes", identify)
+
+
 def test_generate_recipe_note_falls_back_when_subtitle_download_fails(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(pipeline, "fetch_video_info", lambda url, cookies=None: {"title": "demo", "uploader": "up"})
 
@@ -276,7 +292,7 @@ def test_generate_recipe_note_keeps_image_inline_on_deterministic_fallback(monke
         video.write_text("fake video", encoding="utf-8")
         return video
 
-    def _capture_steps(video_path, steps, images_dir, max_images=4):
+    def _capture_steps(video_path, steps, images_dir, max_images=4, **kwargs):
         images_dir.mkdir(parents=True, exist_ok=True)
         image = images_dir / "step_01.jpg"
         image.write_text("image", encoding="utf-8")
@@ -485,7 +501,7 @@ def test_batch_skip_requires_done_job_and_complete_artifacts(monkeypatch, tmp_pa
     (folder / "job.json").write_text(json.dumps({"status": "done", "source_url": url}), encoding="utf-8")
     generated = []
 
-    def _generate(options, log=None):
+    def _generate(options, log=None, **kwargs):
         generated.append(options.url)
         return RecipeJobResult(
             output_folder=folder,
@@ -660,7 +676,7 @@ def test_cli_reads_advanced_prompt_file(monkeypatch, tmp_path) -> None:
     prompt_file.write_text("重点提取温度和成熟判断", encoding="utf-8")
     captured = {}
 
-    def _generate(options, log=None):
+    def _generate(options, log=None, **kwargs):
         captured["options"] = options
         return RecipeJobResult(
             tmp_path,

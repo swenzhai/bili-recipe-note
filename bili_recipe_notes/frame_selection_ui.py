@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .ai_review_dashboard import _duration, _timestamp, preferred_review_batch, review_batch_summary
 from .config import UIConfig
+from .legacy_access import require_legacy_admin_session
 from .frame_selection import DEFAULT_REQUIREMENT
 from .frame_selection_runner import (
     list_frame_selection_batches,
@@ -19,7 +20,7 @@ PAGE_NAME = "AI 菜品选图"
 _STATUS = {
     "queued": "等待启动", "running": "选图中", "paused": "已暂停", "interrupted": "任务中断，可继续",
     "completed": "已完成", "completed_with_errors": "已结束，部分失败", "failed": "启动失败",
-    "pending": "待处理", "skipped": "已跳过", "not_found": "未找到匹配画面",
+    "pending": "待处理", "skipped": "已跳过", "not_found": "未找到匹配画面", "needs_review": "候选待人工确认",
 }
 _PHASE = {
     "preparing": "准备原视频", "waiting_model": "等待本地视觉模型", "downloading": "下载原视频", "loading_model": "加载本地视觉模型",
@@ -74,19 +75,21 @@ def _render_frame_progress(st, batch: dict) -> None:
 
 
 def _render_batch_status(st, batch: dict) -> dict:
-    # A no-match result is completed work and contributes to the time estimate.
-    summary = review_batch_summary({**batch, "items": [
-        {**item, "status": "completed"} if item.get("status") == "not_found" else item
-        for item in batch.get("items", [])
+    # Derive counts from entries so both historical and current count schemas
+    # display no-match and uncertain work without reporting it as an approved image.
+    items = batch.get("items", [])
+    counts = {status: sum(item.get("status") == status for item in items)
+              for status in ("completed", "not_found", "needs_review", "failed", "skipped")}
+    summary = review_batch_summary({**batch, **counts, "completed": counts["completed"] + counts["not_found"] + counts["needs_review"], "items": [
+        {**item, "status": "completed"} if item.get("status") in {"not_found", "needs_review"} else item for item in items
     ]})
-    not_found = max(0, int(batch.get("not_found") or 0))
-    found = max(0, summary["completed"] - not_found)
+    not_found, found, needs_review = counts["not_found"], counts["completed"], counts["needs_review"]
     st.caption(f"任务 {batch['batch_id']} · {_STATUS.get(batch.get('status'), batch.get('status'))}")
-    values = (summary["total"], found, not_found, summary["failed"], summary["skipped"], summary["remaining"])
-    for column, label, value in zip(st.columns(6), ("菜品总数", "找到候选", "无匹配", "失败", "跳过", "剩余"), values):
+    values = (summary["total"], found, needs_review, not_found, summary["failed"], summary["skipped"], summary["remaining"])
+    for column, label, value in zip(st.columns(7), ("菜品总数", "找到候选", "待人工确认", "无匹配", "失败", "跳过", "剩余"), values):
         column.metric(label, value)
     overall = summary["progress"] if summary["total"] else float(batch.get("status") == "completed")
-    st.progress(overall, text=f"已处理 {summary['processed']}/{summary['total']} 道菜（含无匹配、失败和跳过）")
+    st.progress(overall, text=f"已处理 {summary['processed']}/{summary['total']} 道菜（含待确认、无匹配、失败和跳过）")
     timing = st.columns(2)
     timing[0].metric("本轮已运行", _duration(summary["elapsed"]))
     timing[1].metric("预计剩余", _duration(summary["eta"]) if batch.get("active") else "—")
@@ -140,7 +143,7 @@ def _render_results(st, out_dir: str | Path, batch: dict, key_prefix: str) -> No
             st.warning("本条选图失败：" + str(item.get("error") or "请查看任务日志"))
         elif item.get("status") == "skipped":
             st.caption("本条已跳过，可能已有人工确认封面或有效选图结果。")
-        elif item.get("status") in {"completed", "not_found"}:
+        elif item.get("status") in {"completed", "not_found", "needs_review"}:
             st.warning("此前的选图结果已过期或缺失，请重新选图后再确认。")
         else:
             st.caption("当前尚无可预览的选图结果。")
@@ -157,10 +160,15 @@ def _render_results(st, out_dir: str | Path, batch: dict, key_prefix: str) -> No
             st.write(str(candidate["reason"]))
         return
     image_path = candidate.get("image_path")
+    if status not in {"ok", "needs_review"}:
+        st.warning("候选状态不可用，请重新选图。")
+        return
     if not image_path:
         st.warning("候选图片缺失，请重新选图。")
         return
     st.image(str(image_path), width="stretch")
+    if status == "needs_review":
+        st.warning("此原帧尚未通过 AI 确认，请核对菜品和完成状态后，再人工确认是否裁剪为封面。")
     timestamp = candidate.get("timestamp")
     if timestamp is not None:
         st.caption(f"原视频 {float(timestamp):.2f} 秒 · PNG 原帧候选")
@@ -178,6 +186,7 @@ def render_frame_selection_dashboard(st, out_dir: str | Path, *, key_prefix: str
 
     @st.fragment(run_every=f"{refresh_seconds}s" if refresh_seconds else None)
     def live() -> None:
+        require_legacy_admin_session(st)
         st.button("刷新选图进度", key=f"{key_prefix}_refresh")
         if refresh_seconds:
             st.caption(f"每 {refresh_seconds} 秒自动刷新；关闭浏览器后后台任务继续运行。")

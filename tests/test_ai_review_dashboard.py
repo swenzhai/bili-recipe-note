@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from conftest import authenticate_streamlit_app
+
 from bili_recipe_notes import ai_review_dashboard as dashboard, ai_review_ui
 
 
@@ -49,6 +51,7 @@ def test_paused_duration_is_frozen_and_no_eta_is_invented_without_samples():
 
 
 def test_dashboard_discovers_active_old_task_and_refreshes_counts(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     active = _batch()
     newer = {"batch_id": "newer-finished", "active": False, "status": "completed", "total": 1, "completed": 1}
     batches = [newer, active]
@@ -57,6 +60,7 @@ def test_dashboard_discovers_active_old_task_and_refreshes_counts(tmp_path, monk
         "import streamlit as st\nfrom bili_recipe_notes.ai_review_dashboard import render_ai_review_dashboard\n"
         "render_ai_review_dashboard(st, st.session_state['root'])\n"
     )
+    authenticate_streamlit_app(at)
     at.session_state["root"] = str(tmp_path)
     at.run()
     assert not at.exception
@@ -87,6 +91,7 @@ def test_progress_remains_visible_when_library_scan_fails(tmp_path, monkeypatch)
         "from bili_recipe_notes.config import UIConfig\n"
         "render_ai_review_page(st, UIConfig(out_dir=st.session_state['root']))\n"
     )
+    authenticate_streamlit_app(at)
     at.session_state["root"] = str(tmp_path)
     at.run()
     assert not at.exception

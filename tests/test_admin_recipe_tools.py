@@ -6,20 +6,20 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image
 import pytest
 
 from bili_recipe_notes import admin_recipe_tools as tools
-from bili_recipe_notes.admin_common import AdminContext
+from bili_recipe_notes.admin_common import AdminContext, require_admin_request
 from bili_recipe_notes.config import UIConfig, save_config
 from bili_recipe_notes.mobile_sync import MobileSyncStore
 from bili_recipe_notes.storage import atomic_write_json, atomic_write_text
 
 
 @pytest.fixture
-def setup(tmp_path, monkeypatch):
+def setup(tmp_path, monkeypatch, authorize_client):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("BILI_RECIPE_DATA_DIR", str(tmp_path / "data"))
     root = tmp_path / "recipes"
@@ -42,7 +42,7 @@ def setup(tmp_path, monkeypatch):
     ctx = AdminContext(store, SimpleNamespace())
     recipe_id = ctx.rows()[0]["id"]
     app = FastAPI()
-    app.include_router(tools.create_router(ctx), prefix="/api/admin/v1")
+    app.include_router(tools.create_router(ctx), prefix="/api/admin/v1", dependencies=[Depends(require_admin_request)])
     calls = []
     def enqueue(context, kind, arguments):
         calls.append((kind, arguments))
@@ -52,7 +52,7 @@ def setup(tmp_path, monkeypatch):
     monkeypatch.setattr(tools.optimizer, "optimize_existing_note", never)
     monkeypatch.setattr(tools.content_analysis, "analyze_video_content", never)
     monkeypatch.setattr(tools.pipeline, "recapture_step_screenshot", never)
-    return SimpleNamespace(ctx=ctx, folder=folder, root=root, id=recipe_id, client=TestClient(app), calls=calls)
+    return SimpleNamespace(ctx=ctx, folder=folder, root=root, id=recipe_id, client=authorize_client(TestClient(app), tmp_path), calls=calls)
 
 
 def run(setup, action, **arguments):

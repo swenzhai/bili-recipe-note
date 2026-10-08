@@ -1,4 +1,4 @@
-"""Shared, Streamlit-free context for the trusted LAN management API."""
+"""Shared context for the authenticated management API."""
 from __future__ import annotations
 
 import hashlib
@@ -15,8 +15,11 @@ from .file_cache import read_json_cached
 
 
 def require_admin_request(request: Request) -> None:
-    # This preserves the existing trusted-LAN administration boundary. The
-    # custom header + absent CORS permission prevent drive-by form/fetch writes.
+    # The custom header is only a CSRF guard; it never grants admin access.
+    access = getattr(request.app.state, "access_control", None)
+    if access is None:
+        raise HTTPException(401, "请先登录管理员")
+    access.require_admin(request)
     origin = request.headers.get("origin")
     if origin:
         supplied = urlsplit(origin)

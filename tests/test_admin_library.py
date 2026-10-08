@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -10,7 +11,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from bili_recipe_notes.mobile_api import create_app
-from bili_recipe_notes.review_policy import set_ai_review_visibility
+from bili_recipe_notes.review_policy import review_content_fingerprint, set_ai_review_visibility
 
 HEADERS = {"X-Admin-Request": "1"}
 ROOT = "/api/admin/v1"
@@ -35,11 +36,12 @@ def make_recipe(root: Path, name: str = "番茄炒蛋", bvid: str = "BV13p411d7o
 
 
 @pytest.fixture
-def library(tmp_path):
+def library(tmp_path, authorize_client):
     recipes = tmp_path / "data" / "recipes"
     folder = make_recipe(recipes)
     app = create_app(tmp_path, out_dir=recipes, start_background_indexer=False)
     with TestClient(app) as client:
+        authorize_client(client)
         client.headers.update(HEADERS)
         recipe_id = client.get(ROOT + "/recipes").json()["items"][0]["id"]
         yield app, client, folder, recipe_id
@@ -72,12 +74,13 @@ def test_browse_is_readonly_uses_index_and_renders_safe_media(library, monkeypat
     assert {path.relative_to(folder): path.read_bytes() for path in folder.rglob("*") if path.is_file()} == before
 
 
-def test_hidden_on_first_scan_can_be_found_and_restored_without_publishing(tmp_path):
+def test_hidden_on_first_scan_can_be_found_and_restored_without_publishing(tmp_path, authorize_client):
     root = tmp_path / "data" / "recipes"
     folder = make_recipe(root)
     set_ai_review_visibility(folder, "hidden")
     app = create_app(tmp_path, out_dir=root, start_background_indexer=False)
     with TestClient(app) as client:
+        authorize_client(client)
         client.headers.update(HEADERS)
         assert not client.get(ROOT + "/recipes").json()["items"]
         hidden = client.get(ROOT + "/recipes?visibility=hidden").json()["items"]
@@ -235,14 +238,100 @@ def test_archive_rejects_unseen_edits(library, monkeypatch):
     assert client.post(ROOT + f"/recipes/{recipe_id}/archive", json={"revision": version}).status_code == 409
 
 
-def test_ai_candidate_replacement_requires_refresh_even_with_same_pixels(library, monkeypatch):
+def synthetic_uncertain_frame(app, folder):
+    from bili_recipe_notes.frame_selection_service import SCHEMA_VERSION, SELECTION_STRATEGY_VERSION
+
+    root = app.state.store.out_dir
+    selection = root / ".frame-selection"
+    run = selection / "runs" / "synthetic-needs-review"
+    run.mkdir(parents=True)
+    image = run / "original.png"
+    Image.new("RGB", (1000, 800), "red").save(image)
+    relative = folder.relative_to(root).as_posix()
+    manifest = {
+        "schema_version": SCHEMA_VERSION, "selection_strategy_version": SELECTION_STRATEGY_VERSION,
+        "status": "needs_review", "folder": relative, "fingerprint": review_content_fingerprint(folder),
+        "title": "番茄炒蛋", "source_url": "https://www.bilibili.com/video/BV13p411d7oQ",
+        "reason": "完成状态尚需人工核对", "generated_at": "2026-10-07T00:00:00Z", "run_id": "synthetic-needs-review",
+        "image_path": image.relative_to(selection).as_posix(), "timestamp": 188.4, "dimensions": [1000, 800],
+        "result_path": "runs/synthetic-needs-review/result.json", "stdout_path": "runs/synthetic-needs-review/stdout.log",
+        "stderr_path": "runs/synthetic-needs-review/stderr.log",
+    }
+    candidates = selection / "candidates"
+    candidates.mkdir()
+    path = candidates / (hashlib.sha256(relative.encode()).hexdigest()[:32] + ".json")
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    return path, image
+
+
+def test_uncertain_ai_frame_is_readable_but_only_explicit_crop_changes_cover(library):
+    app, client, folder, recipe_id = library
+    manifest_path, image_path = synthetic_uncertain_frame(app, folder)
+    candidate_bytes = manifest_path.read_bytes()
+    image_bytes = image_path.read_bytes()
+    assert client.post(ROOT + "/recipes/publication", json={"ids": [recipe_id], "published": False}).status_code == 200
+    set_ai_review_visibility(folder, "visible")
+    originals = {path.relative_to(folder): path.read_bytes() for path in folder.rglob("*") if path.is_file()}
+    detail = client.get(ROOT + f"/recipes/{recipe_id}").json()
+    candidate = detail["frame_candidate"]
+    assert candidate["status"] == "needs_review" and candidate["timestamp"] == 188.4
+    assert candidate["candidate_revision"] and candidate["dimensions"] == [1000, 800]
+    response = client.get(candidate["url"])
+    assert response.status_code == 200 and response.content == image_bytes
+    assert response.headers["content-type"] == "image/png"
+    assert {path.relative_to(folder): path.read_bytes() for path in folder.rglob("*") if path.is_file()} == originals
+    endpoint = ROOT + f"/recipes/{recipe_id}/cover"
+    request = {"revision": detail["revision"], "source": "ai", "crop": {"left": 100, "top": 100, "width": 800, "height": 600}}
+    assert client.post(endpoint, json=request).status_code == 409
+    assert (folder / "recipe.json").read_bytes() == originals[Path("recipe.json")]
+
+    saved = client.post(endpoint, json={**request, "candidate_revision": candidate["candidate_revision"]})
+    assert saved.status_code == 200, saved.text
+    value = saved.json()
+    assert value["recipe"]["cover_image_status"] == "manual_crop"
+    assert value["recipe"]["cover_image_time"] == 188.4
+    assert value["recipe"]["cover_crop_box"] == {"left": 100, "top": 100, "width": 800, "height": 600}
+    assert Image.open(folder / "images" / "cover.jpg").size == (800, 600)
+    assert value["visibility"]["published"] is False and value["visibility"]["content_visible"] is True
+    for relative, contents in originals.items():
+        if relative != Path("recipe.json"):
+            assert (folder / relative).read_bytes() == contents
+    assert manifest_path.read_bytes() == candidate_bytes and image_path.read_bytes() == image_bytes
+
+
+@pytest.mark.parametrize("expire", ["transcript", "strategy"])
+def test_expired_uncertain_frame_cannot_be_viewed_or_confirmed(library, expire):
+    app, client, folder, recipe_id = library
+    manifest_path, image_path = synthetic_uncertain_frame(app, folder)
+    detail = client.get(ROOT + f"/recipes/{recipe_id}").json()
+    if expire == "transcript":
+        (folder / "transcript.json").write_text('[{"start":0,"text":"来源字幕已修改"}]', encoding="utf-8")
+    else:
+        manifest = json.loads(manifest_path.read_text())
+        manifest["selection_strategy_version"] -= 1
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    originals = {path.relative_to(folder): path.read_bytes() for path in folder.rglob("*") if path.is_file()}
+    fresh = client.get(ROOT + f"/recipes/{recipe_id}").json()
+    assert fresh["frame_candidate"]["status"] == "stale"
+    assert "url" not in fresh["frame_candidate"] and "candidate_revision" not in fresh["frame_candidate"]
+    assert client.get(detail["frame_candidate"]["url"]).status_code == 404
+    response = client.post(ROOT + f"/recipes/{recipe_id}/cover", json={
+        "revision": fresh["revision"], "source": "ai", "candidate_revision": detail["frame_candidate"]["candidate_revision"],
+    })
+    assert response.status_code == 409 and "已失效" in response.json()["detail"]
+    assert {path.relative_to(folder): path.read_bytes() for path in folder.rglob("*") if path.is_file()} == originals
+    assert image_path.is_file()
+
+
+@pytest.mark.parametrize("status", ["ok", "needs_review"])
+def test_ai_candidate_replacement_requires_refresh_even_with_same_pixels(library, monkeypatch, status):
     from bili_recipe_notes import admin_library
     app, client, folder, recipe_id = library
     directory = app.state.store.out_dir / ".frame-selection" / "synthetic"
     directory.mkdir(parents=True)
     image = directory / "one.png"
     Image.new("RGB", (800, 600), "red").save(image)
-    current = {"status": "ok", "image_path": str(image), "run_id": "one", "timestamp": 2, "reason": "fake"}
+    current = {"status": status, "image_path": str(image), "run_id": "one", "timestamp": 2, "reason": "fake"}
     monkeypatch.setattr(admin_library, "load_frame_candidate", lambda *args, **kwargs: dict(current))
     detail = client.get(ROOT + f"/recipes/{recipe_id}").json()
     original = (folder / "recipe.json").read_bytes()

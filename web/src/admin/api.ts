@@ -16,6 +16,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
     throw new ApiError("暂时无法连接厨房服务，请检查连接后重试。", 0);
   }
   if (!response.ok) {
+    if (response.status === 401 && typeof window !== "undefined") window.dispatchEvent(new Event("access:admin-denied"));
     let message = `操作未完成（${response.status}），请重试。`;
     try {
       const body = await response.json();

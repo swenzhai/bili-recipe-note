@@ -7,7 +7,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -195,20 +195,33 @@ def _legacy_worker_matches(status: BackgroundBatchStatus, root: Path) -> bool:
 def _batch_control_lock(batch_id: str, root: Path) -> Iterator[None]:
     """Serialize UI controls across threads and separate UI processes."""
 
+    with _batch_group_control_lock([batch_id], root):
+        yield
+
+
+@contextmanager
+def _batch_group_control_lock(batch_ids: list[str], root: Path) -> Iterator[None]:
+    """Lock a set of batches in a stable order without nesting the thread lock."""
+
     with _RUNS_LOCK:
         if os.name == "nt":
             yield
             return
         import fcntl
 
-        path = background_runtime_dir(root) / f"{batch_id}.control.lock"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as file:
-            fcntl.flock(file, fcntl.LOCK_EX)
+        with ExitStack() as stack:
+            handles = []
+            for batch_id in sorted(set(batch_ids)):
+                path = background_runtime_dir(root) / f"{batch_id}.control.lock"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                handle = stack.enter_context(path.open("a"))
+                fcntl.flock(handle, fcntl.LOCK_EX)
+                handles.append(handle)
             try:
                 yield
             finally:
-                fcntl.flock(file, fcntl.LOCK_UN)
+                for handle in reversed(handles):
+                    fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def _worker_is_alive(worker: threading.Thread | subprocess.Popen) -> bool:

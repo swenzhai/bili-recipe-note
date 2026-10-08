@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 FRAME_PYTHON_ENV = "BILI_RECIPE_FRAME_PYTHON"
-DEFAULT_REQUIREMENT = "找到一张制作完成的菜品特写，主体清晰，尽量没有手和锅铲遮挡"
+DEFAULT_REQUIREMENT = "找到一张制作完成的菜品特写，主体清晰；优先选择无遮挡、构图完整的画面，手、餐具或字幕仅在遮挡菜品主体时影响评价。"
 TOOL_ROOT = Path(__file__).resolve().parent.parent / "external" / "video-frame-choose"
 
 

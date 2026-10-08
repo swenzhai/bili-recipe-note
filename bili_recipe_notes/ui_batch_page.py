@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 from .config import UIConfig
 from . import batch_queue, batch_runner, mobile_sync, obsidian_archive, pipeline
+from .history import completed_recipe_folders
 from . import config as app_config
 
 
@@ -248,9 +249,8 @@ def render_batch_page(st, config: UIConfig, helpers: BatchPageHelpers) -> None:
             def post_process(result) -> None:
                 if not config.auto_archive_after_generation:
                     return
-                completed_folders = [
-                    item.output_folder for item in result.items if item.output_folder and item.status == "done"
-                ]
+                completed_folders = [folder for item in result.items if item.output_folder
+                                     for folder in completed_recipe_folders(item.output_folder)]
                 if completed_folders:
                     obsidian_archive.archive_recipe_batch(completed_folders, helpers.vault_path(config))
                     if config.archive_knowledge_with_recipe:
@@ -363,13 +363,16 @@ def render_batch_page(st, config: UIConfig, helpers: BatchPageHelpers) -> None:
             batch_log = batch_runner.read_batch_log(selected_batch_id)
             if batch_log:
                 st.text_area("后台运行日志（最新）", value=batch_log, height=220, disabled=True)
-            completed_batch_items = [
-                item
-                for item in selected_state.items
-                if item.status in {"done", "skipped"}
-                and item.output_folder
-                and (Path(item.output_folder) / "recipe.json").is_file()
-            ]
+            from dataclasses import replace
+            completed_batch_items = [replace(item, output_folder=str(folder), status="done")
+                                     for item in selected_state.items if item.output_folder
+                                     for folder in (
+                                         completed_recipe_folders(item.output_folder)
+                                         if (Path(item.output_folder) / "dishes").is_dir()
+                                         else [Path(item.output_folder)]
+                                         if item.status in {"done", "skipped"} and (Path(item.output_folder) / "recipe.json").is_file()
+                                         else []
+                                     )]
             if completed_batch_items:
                 st.markdown("#### 批量结果后处理")
                 st.caption("每条结果都是独立草稿，可以逐条编辑、审核或归档；批量生成不会锁死后续修改。")
@@ -483,4 +486,3 @@ def render_batch_page(st, config: UIConfig, helpers: BatchPageHelpers) -> None:
                     batch_source_store.set_video_classifications(restore_urls, "recipe")
                     batch_source_store.index_recipes()
                     helpers.rerun_with_notice(st, f"已恢复 {len(restore_urls)} 条来源，可重新加入批处理。")
-

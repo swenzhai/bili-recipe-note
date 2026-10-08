@@ -187,7 +187,7 @@ def create_router(ctx: AdminContext) -> APIRouter:
         candidate = load_frame_candidate(ctx.root, folder, include_stale=True)
         if candidate:
             candidate = {key: candidate.get(key) for key in ("status", "timestamp", "reason", "dimensions", "run_id", "fingerprint")}
-            if candidate["status"] == "ok":
+            if candidate["status"] in {"ok", "needs_review"}:
                 image = load_frame_candidate(ctx.root, folder)
                 candidate["url"] = media_url(recipe_id, "ai", str(image.get("run_id", "")))
                 image_path = inside(Path(image["image_path"]), ctx.root / ".frame-selection")
@@ -219,7 +219,7 @@ def create_router(ctx: AdminContext) -> APIRouter:
                 path = _image_path(folder, steps[index].get("screenshot_path"))
         elif kind == "ai":
             candidate = load_frame_candidate(ctx.root, folder)
-            if candidate and candidate["status"] == "ok":
+            if candidate and candidate["status"] in {"ok", "needs_review"}:
                 path = inside(Path(candidate["image_path"]), ctx.root / ".frame-selection")
         elif kind.startswith("candidate-") and len(kind) == 42 and all(ch in "0123456789abcdef" for ch in kind[10:]):
             path = _candidate_root(ctx, folder) / f"{kind[10:]}.jpg"
@@ -303,7 +303,7 @@ def create_router(ctx: AdminContext) -> APIRouter:
                 source_kind, label = "video", "人工确认的菜品特写"
                 if body.source == "ai":
                     candidate = load_frame_candidate(ctx.root, folder)
-                    if not candidate or candidate["status"] != "ok":
+                    if not candidate or candidate["status"] not in {"ok", "needs_review"}:
                         raise HTTPException(409, "AI 候选已失效，请重新选图")
                     content = inside(Path(candidate["image_path"]), ctx.root / ".frame-selection").read_bytes()
                     if _frame_revision(candidate, content) != body.candidate_revision:

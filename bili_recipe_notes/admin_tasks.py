@@ -32,6 +32,7 @@ class StartTask(BaseModel):
     kind: Literal["generation", "review", "frames", "dish-info"]
     recipe_ids: list[str] | None = Field(default=None, max_length=10000)
     limit: int = Field(default=10, ge=0, le=10000)
+    run_limit: int = Field(default=0, ge=0, le=10000, strict=True)
     only_pending: StrictBool = True
     options: dict = Field(default_factory=dict)
     urls: list[str] = Field(default_factory=list, max_length=10000)
@@ -45,6 +46,7 @@ class TaskAction(BaseModel):
     use_current_config: StrictBool = False
     options: dict = Field(default_factory=dict)
     target_stage: Literal["raw", "recipe"] | None = None
+    run_limit: int | None = Field(default=None, ge=0, le=10000, strict=True)
 
 
 class RefreshCreator(BaseModel):
@@ -123,27 +125,47 @@ def _public_options(options: dict) -> dict:
 
 def summarize(kind: str, state: dict, *, detail: bool = False, log: str = "") -> dict:
     items = state.get("items") or []
-    completed = sum(item.get("status") in {"completed", "not_found"} for item in items)
+    completed = sum(item.get("status") == "completed" for item in items)
+    not_found = sum(item.get("status") == "not_found" for item in items)
+    needs_review = sum(item.get("status") == "needs_review" for item in items)
     failed = sum(item.get("status") == "failed" for item in items)
     skipped = sum(item.get("status") == "skipped" for item in items)
-    total, processed = len(items), completed + failed + skipped
+    total, processed = len(items), completed + not_found + needs_review + failed + skipped
+    pending = sum(item.get("status") == "pending" for item in items)
+    run_limit = state.get("run_limit", 0)
+    run_processed = state.get("run_processed", 0)
     active = bool(state.get("active"))
     status = str(state.get("status") or "pending")
     if active and state.get("stop_requested"):
         status = "pausing"
     elapsed = _duration(state)
+    eta = elapsed / processed * (total - processed) if active and elapsed and processed else None
+    scoped_retry = kind == "frames" and state.get("run_scope") == "not_found"
+    if kind in {"review", "frames", "dish-info"} and (run_limit or scoped_retry):
+        run = (state.get("runs") or [{}])[-1]
+        start = _stamp(run.get("started_at"))
+        run_elapsed = max(0, (datetime.now(timezone.utc) - start).total_seconds()) if start else None
+        remaining = len(state.get("run_targets", [])) if scoped_retry else total - processed
+        if run_limit:
+            remaining = min(remaining, max(0, run_limit - run_processed))
+        eta = run_elapsed / run_processed * remaining if active and run_elapsed and run_processed else None
     options = state.get("options") or {"provider": state.get("provider"), **state.get("llm_options", {})}
+    resumable = any(item.get("status") in {"pending", "running"}
+                    and not (scoped_retry and item.get("folder") in state.get("run_targets", [])) for item in items)
     result = {"id": state["batch_id"], "kind": kind, "title": KINDS[kind], "status": status,
               "total": total, "processed": processed, "completed": completed, "failed": failed,
-              "skipped": skipped, "not_found": sum(item.get("status") == "not_found" for item in items),
+              "skipped": skipped, "not_found": not_found, "needs_review": needs_review,
+              "pending": pending, "run_limit": run_limit, "run_processed": run_processed,
+              "run_scope": state.get("run_scope", "pending"),
               "progress": processed / total if total else 1.0,
               "current": state.get("current_folder") or state.get("current"),
               "current_progress": state.get("current_progress"), "elapsed_seconds": elapsed,
-              "eta_seconds": elapsed / processed * (total - processed) if active and elapsed and processed else None,
+              "eta_seconds": eta,
               "updated_at": state.get("updated_at") or state.get("created_at"),
               "can_pause": active and kind != "creators" and status != "pausing",
-              "can_resume": (not active and any(i.get("status") in {"pending", "running"} for i in items)) or status == "paused",
+              "can_resume": not active and (resumable or (status == "paused" and kind != "frames")),
               "can_retry": not active and failed > 0,
+              "can_retry_not_found": kind == "frames" and not active and (not_found > 0 or (scoped_retry and bool(state.get("run_targets")))),
               "error": state.get("error"), "pause_reason": state.get("pause_reason"),
               "already_running": bool(state.get("already_running"))}
     if detail:
@@ -164,6 +186,7 @@ def _saved_generation_options(ctx, state):
 
 
 def _generation_state(ctx, state, *, detail=False) -> dict:
+    from .output_layout import load_dish_plan, source_output_folder
     runtime = generation.get_background_batch_status(state.batch_id, ctx.store.project_root)
     options = _saved_generation_options(ctx, state)
     stage = options.get("target_stage", "recipe")
@@ -178,6 +201,18 @@ def _generation_state(ctx, state, *, detail=False) -> dict:
             value["status"] = "failed"
         else:
             value["status"] = "running" if item.status in {"running", "raw_running", "recipe_running"} else "pending"
+        if detail and item.output_folder:
+            folder = source_output_folder(resolve_stored_path(item.output_folder, ctx.store.project_root))
+            if folder.is_relative_to(ctx.root):
+                try:
+                    plan = load_dish_plan(folder)
+                    if plan and len(plan["dishes"]) > 1:
+                        value["dish_count"] = len(plan["dishes"])
+                        value["completed_dish_count"] = sum(dish.get("status") == "done" for dish in plan["dishes"])
+                        value["dishes"] = [{key: dish.get(key) for key in ("dish_id", "title", "status", "error")}
+                                           for dish in plan["dishes"]]
+                except (OSError, ValueError, UnicodeError) as exc:
+                    value["dish_plan_error"] = f"菜品列表暂不可读：{exc}"
         items.append(value)
     status = runtime.status if runtime else "pending"
     status = {"done": "completed", "done_with_errors": "completed_with_errors"}.get(status, status)
@@ -376,23 +411,65 @@ def _generation_action(ctx, task_id, action, body):
 def _start(ctx, body: StartTask):
     config = ctx.config()
     if body.kind == "generation":
+        if body.run_limit:
+            raise ValueError("本批执行数量目前适用于 AI 选图、审核和菜品介绍任务")
         urls = canonical_video_urls(body.urls)
         options = _generation_options(ctx, {**body.options, "target_stage": body.target_stage, "creator_name": body.creator_name})
         stored = {key: value for key, value in asdict(options).items() if key not in {"urls", "cookies"}}
         with nullcontext() if body.create_only else _generation_control(ctx):
             if not body.create_only:
                 _check_generation_overlaps(ctx, urls)
-            state = create_batch_state(urls, stored, project_root=ctx.store.project_root)
+                from .batch_consolidation import consolidate_batches, effective_options, group_key, item_has_result
+                wanted = group_key(urls, stored, config.out_dir)
+                matches = [state for state in _generation_batches(ctx)
+                           if wanted is not None and group_key(
+                               [item.url for item in state.items],
+                               effective_options(state, ctx.store.project_root, config.out_dir), config.out_dir,
+                           ) == wanted]
+                if matches:
+                    consolidate_batches(ctx.store.project_root, config.out_dir,
+                                        batch_ids=[state.batch_id for state in matches])
+                    matches = [state for state in _generation_batches(ctx)
+                               if group_key([item.url for item in state.items],
+                                            effective_options(state, ctx.store.project_root, config.out_dir),
+                                            config.out_dir) == wanted]
+                state = max(matches, key=lambda value: (value.updated_at, value.batch_id)) if matches else None
+            else:
+                state = None
+            reused = state is not None
+            if state is None:
+                state = create_batch_state(urls, stored, project_root=ctx.store.project_root)
+            else:
+                # Reusing a queue must not turn an old success marker into a
+                # promise about files that were subsequently removed or damaged.
+                from .history import is_raw_output
+                for item in state.items:
+                    if item.status in {"non_recipe", "technique"} or item_has_result(item, stored, config.out_dir):
+                        continue
+                    if item.stages[body.target_stage].status == "done" or item.status in {"done", "skipped"}:
+                        item.stages[body.target_stage].status = "pending"
+                        item.stages[body.target_stage].error = None
+                        if not item.output_folder or not is_raw_output(item.output_folder):
+                            item.stages["raw"].status = "pending"
+                            item.output_folder = None
+                        item.status = "pending"
+                        item.note_path = None
+                        item.error = None
+                if not selectable_items(state, "resume-unfinished", body.target_stage):
+                    return {**_find(ctx, "generation", state.batch_id), "reused": True}
+                state.options.update(stored)
+                save_batch_state(state, ctx.store.project_root)
             if not body.create_only:
                 options.batch_id = state.batch_id
                 options.resume_mode = "resume-unfinished"
                 generation.start_background_batch(options, project_root=ctx.store.project_root)
-        return _find(ctx, "generation", state.batch_id)
+        return {**_find(ctx, "generation", state.batch_id), "reused": reused}
     folders = list(dict.fromkeys(ctx.folder(recipe_id) for recipe_id in body.recipe_ids)) if body.recipe_ids is not None else None
     active = next((state for state in _ai_states(body.kind, config.out_dir) if state.get("active")), None)
-    if active:
+    if active and not body.create_only:
         return summarize(body.kind, {**active, "already_running": True}, detail=True)
-    common = {"limit": body.limit or None, "only_pending": body.only_pending, "folders": folders}
+    common = {"limit": body.limit or None, "only_pending": body.only_pending, "folders": folders,
+              "run_limit": body.run_limit, "create_only": body.create_only}
     options = dict(body.options)
     if body.kind == "frames":
         state = frames.start_frame_selection_batch(config.out_dir, **common, cookies=config.cookies, **options)
@@ -408,8 +485,15 @@ def _start(ctx, body: StartTask):
 
 def _action(ctx, kind: str, task_id: str, action: str, body: TaskAction):
     current = _find(ctx, kind, task_id)
-    if action not in {"pause", "resume", "retry"}:
+    if action not in {"pause", "resume", "retry", "retry-not-found"}:
         raise HTTPException(404, "任务操作不存在")
+    if action == "retry-not-found":
+        if kind != "frames":
+            raise HTTPException(400, "仅 AI 选图任务支持重试无匹配项")
+        if not current.get("can_retry_not_found"):
+            raise HTTPException(409, "请等待任务暂停，且存在无匹配项后再重试")
+    if body.run_limit is not None and (kind not in {"review", "frames", "dish-info"} or action == "pause"):
+        raise ValueError("本批执行数量只能在继续或重试 AI 选图、审核和菜品介绍任务时设置")
     config = ctx.config()
     if kind == "settings":
         from .admin_settings import resume_settings_operation
@@ -438,7 +522,10 @@ def _action(ctx, kind: str, task_id: str, action: str, body: TaskAction):
         options["cookies"] = config.cookies
     function = {"review": reviews.resume_ai_review_batch, "frames": frames.resume_frame_selection_batch,
                 "dish-info": introductions.resume_dish_info_batch}[kind]
-    state = function(config.out_dir, task_id, retry_failed=action == "retry", **options)
+    execution = {"run_limit": body.run_limit} if body.run_limit is not None else {}
+    if action == "retry-not-found":
+        execution["retry_not_found"] = True
+    state = function(config.out_dir, task_id, retry_failed=action == "retry", **execution, **options)
     return summarize(kind, {**state, "already_running": state["batch_id"] != task_id}, detail=True)
 
 
@@ -459,6 +546,12 @@ def create_router(ctx) -> APIRouter:
     @router.get("/tasks")
     def tasks():
         return {"items": _call(list_tasks, ctx)}
+
+    @router.post("/tasks/consolidate")
+    def consolidate():
+        from .batch_consolidation import consolidate_batches
+        with _generation_control(ctx):
+            return _call(consolidate_batches, ctx.store.project_root, ctx.config().out_dir)
 
     @router.get("/tasks/{kind}/{task_id}")
     def task(kind: str, task_id: str):

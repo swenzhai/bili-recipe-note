@@ -140,7 +140,7 @@ def test_run_batch_skips_existing_and_continues_after_failure(monkeypatch, tmp_p
 
     generated_options = []
 
-    def _generate(options, log=None):
+    def _generate(options, log=None, **kwargs):
         generated_options.append(options)
         if options.url.endswith("fail"):
             raise RuntimeError("boom")

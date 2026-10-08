@@ -7,6 +7,10 @@ from pathlib import Path
 
 import pytest
 from streamlit.testing.v1 import AppTest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from conftest import authenticate_business_client
 
 from bili_recipe_notes import ui
 from bili_recipe_notes.batch_queue import BatchQueueItem, BatchQueueState, create_batch_state
@@ -20,6 +24,17 @@ def isolate_ui_data(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("BILI_RECIPE_DATA_DIR", raising=False)
 
+
+
+def _authenticated_app() -> AppTest:
+    # Obtain the same persisted session through HTTP setup/login that the
+    # React administrator uses, then supply it to this isolated browser.
+    with TestClient(FastAPI()) as client:
+        authenticate_business_client(client, Path.cwd())
+        token = client.cookies.get("chef_admin_session")
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20)
+    at.session_state["_legacy_admin_session"] = token
+    return at
 
 def _recipe(title: str, *, ingredients: list[dict] | None = None, seasonings: list[dict] | None = None) -> dict:
     return {
@@ -55,8 +70,7 @@ def _write_record(root: Path, folder_name: str, recipe: dict | str) -> Path:
 
 
 def _open_edit_page(out_dir: Path) -> AppTest:
-    app_path = Path(ui.__file__)
-    at = AppTest.from_file(str(app_path), default_timeout=20).run()
+    at = _authenticated_app().run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(out_dir))
     at.selectbox(key="main_page").set_value("编辑修复")
     return at.run()
@@ -178,7 +192,7 @@ def test_backups_are_timestamped_and_navigation_is_conditional(tmp_path: Path) -
     assert backups[0].read_text(encoding="utf-8") == "old"
     assert backups[0].name.startswith("note.before-test-edit-")
 
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     assert not at.exception
     assert not at.tabs
     assert at.selectbox(key="main_page").value == "单视频生成"
@@ -215,7 +229,7 @@ def test_curation_page_compares_sources_and_saves_decision(tmp_path: Path) -> No
     _write_record(tmp_path, "宫保鸡丁--BV1quick", second_recipe)
     build_curation_review(tmp_path, tmp_path / "curation-review")
 
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
     at.selectbox(key="main_page").set_value("最终菜谱整理")
     at.run()
@@ -250,7 +264,7 @@ def test_mobile_cooking_mode_scales_ingredients_and_navigates_steps(tmp_path: Pa
     ]
     folder = _write_record(tmp_path, "cook", recipe)
     record_key = ui._record_key(folder)
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
     at.selectbox(key="main_page").set_value("烹饪模式")
     at.run()
@@ -306,7 +320,7 @@ def test_recipe_detail_shows_complete_recipe_and_opens_same_cooking_record(tmp_p
     )
     folder = _write_record(tmp_path, "detail", recipe)
     record_key = ui._record_key(folder)
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
     at.selectbox(key="main_page").set_value("菜谱详情")
     at.run()
@@ -339,7 +353,7 @@ def test_recipe_detail_picker_searches_and_switches_with_quick_buttons(tmp_path:
     second_recipe = _recipe("清炒时蔬")
     second_recipe.update({"category": "素菜", "cuisine": "中式", "tags": ["清淡"]})
     second_folder = _write_record(tmp_path, "vegetables", second_recipe)
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
     at.selectbox(key="main_page").set_value("菜谱详情")
     at.run()
@@ -364,7 +378,7 @@ def test_recipe_detail_picker_searches_and_switches_with_quick_buttons(tmp_path:
 
 def test_main_meal_page_is_a_launcher_for_the_restaurant_interface(tmp_path: Path) -> None:
     _write_record(tmp_path, "meal-launcher", _recipe("番茄炒蛋"))
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
     at.selectbox(key="main_page").set_value("本餐点菜")
     at.run()
@@ -403,7 +417,7 @@ def test_restaurant_meal_ui_mounts_custom_component_and_builds_shopping_list(tmp
         )
         folders[title] = _write_record(tmp_path, f"meal-{index}", recipe)
 
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20)
+    at = _authenticated_app()
     at.query_params["mode"] = "meal"
     at.session_state["_meal_out_dir"] = str(tmp_path)
     selected = [
@@ -501,7 +515,7 @@ def test_library_overview_renders_charts_counts_and_filters(tmp_path: Path) -> N
         recipe.update({"category": category, "cuisine": cuisine, "tags": tags})
         _write_record(tmp_path, f"overview-{index}", recipe)
 
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
     at.selectbox(key="main_page").set_value("菜谱库全览")
     at.run()
@@ -524,7 +538,7 @@ def test_library_overview_renders_charts_counts_and_filters(tmp_path: Path) -> N
 
 def test_history_zip_export_stays_available_for_download(tmp_path: Path) -> None:
     folder = _write_record(tmp_path, "bundle", _recipe("打包菜谱"))
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
     at.selectbox(key="main_page").set_value("草稿与归档")
     at.run()
@@ -573,7 +587,7 @@ def test_note_preview_resolves_local_images_without_changing_markdown(tmp_path: 
 
 
 def test_cli_advanced_prompt_is_available_and_propagated() -> None:
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
 
     assert not at.exception
     assert at.selectbox(key="llm_cli_prompt_preset").value == "空白 / 自定义"
@@ -589,7 +603,7 @@ def test_cli_advanced_prompt_is_available_and_propagated() -> None:
 
 
 def test_mobile_web_export_exposes_image_size_options() -> None:
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     at.selectbox(key="main_page").set_value("手机客户端")
     at.run()
 
@@ -608,7 +622,7 @@ def test_review_page_can_create_item_by_item_review(tmp_path: Path) -> None:
         {"title": "翻炒", "start_time": 10, "action": "中火翻炒", "evidence": "中火翻炒", "confidence": 0.7}
     ]
     folder = _write_record(tmp_path, "review", recipe)
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
     at.selectbox(key="main_page").set_value("审核确认")
     at.run()
@@ -628,7 +642,7 @@ def test_draft_can_be_archived_directly_to_obsidian(tmp_path: Path) -> None:
     folder = _write_record(tmp_path / "outputs", "archive", _recipe("直接归档菜谱"))
     record_key = ui._record_key(folder)
     vault = tmp_path / "vault"
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path / "outputs"))
     next(widget for widget in at.text_input if widget.label == "笔记本目录").set_value(str(vault))
     at.selectbox(key="main_page").set_value("草稿与归档")
@@ -689,7 +703,7 @@ def test_batch_results_keep_per_item_edit_review_and_archive_actions(monkeypatch
         ],
     )
     monkeypatch.setattr("bili_recipe_notes.batch_queue.list_batch_states", lambda: [state])
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     at.selectbox(key="main_page").set_value("批量处理")
     at.run()
     assert at.selectbox(key="batch_select").value == "ui-batch"
@@ -719,7 +733,7 @@ def test_batch_refresh_uses_cached_state_after_transient_read_failure(monkeypatc
         return [state]
 
     monkeypatch.setattr("bili_recipe_notes.batch_queue.list_batch_states", flaky_list)
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     at.selectbox(key="main_page").set_value("批量处理")
     at.run()
     assert at.selectbox(key="batch_select").value == "cached-batch"
@@ -818,7 +832,7 @@ def test_background_dashboard_renders_running_batch(monkeypatch) -> None:
     )()
     monkeypatch.setattr("bili_recipe_notes.batch_queue.list_batch_states", lambda: [state])
     monkeypatch.setattr("bili_recipe_notes.batch_runner.get_background_batch_status", lambda _batch_id: runtime)
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     at.selectbox(key="main_page").set_value("任务仪表盘")
     at.run()
 
@@ -863,7 +877,7 @@ def test_background_dashboard_shows_ai_progress_without_generation_batches_and_o
     monkeypatch.setattr(ai_review_dashboard, "list_ai_review_batches", review_batches)
     monkeypatch.setattr(ai_review_ui, "list_ai_review_batches", lambda *_args: [batch])
     monkeypatch.setattr(ai_review_ui, "get_ai_review_batch", lambda *_args: batch)
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(out_dir))
     at.selectbox(key="main_page").set_value("任务仪表盘").run()
 
@@ -911,7 +925,7 @@ def test_batch_pause_and_resume_buttons_survive_page_reload(monkeypatch, tmp_pat
     monkeypatch.setattr(batch_runner, "get_background_batch_status", lambda _: runtime)
     monkeypatch.setattr(batch_runner, "pause_background_batch", pause)
     monkeypatch.setattr(batch_runner, "resume_background_batch", resume)
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     at.selectbox(key="main_page").set_value(page).run()
     at.button(key=f"{prefix}_pause_pause-ui").click().run()
     assert not at.exception
@@ -922,7 +936,7 @@ def test_batch_pause_and_resume_buttons_survive_page_reload(monkeypatch, tmp_pat
         assert next(button for button in at.button if button.label == "只重试失败").disabled
 
     # A fresh browser session must get the control from persisted runtime state.
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     at.selectbox(key="main_page").set_value(page).run()
     assert at.button(key=f"{prefix}_resume_pause-ui").label == "继续任务"
     at.button(key=f"{prefix}_resume_pause-ui").click().run()
@@ -968,7 +982,7 @@ def test_pause_button_reports_error_without_claiming_success(monkeypatch, tmp_pa
         raise PermissionError("permission denied")
 
     monkeypatch.setattr(batch_runner, "pause_background_batch", fail)
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     at.selectbox(key="main_page").set_value("批量处理").run()
     at.button(key="batch_pause_pause-error").click().run()
     assert not at.exception
@@ -986,7 +1000,7 @@ def test_new_batch_cannot_duplicate_paused_batch(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(batch_runner, "get_background_batch_status", lambda _: runtime)
     calls = []
     monkeypatch.setattr(batch_runner, "start_background_batch", lambda *args, **kwargs: calls.append(args))
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     at.selectbox(key="main_page").set_value("批量处理").run()
     next(widget for widget in at.text_area if widget.label == "视频 URL，每行一个").set_value("https://example.com/a")
     next(button for button in at.button if button.label == "创建新批次并运行").click().run()
@@ -1003,7 +1017,7 @@ def test_large_batch_remains_paged_while_switching_pages(monkeypatch, tmp_path: 
         batch_id="large-ui-batch",
         project_root=tmp_path,
     )
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    at = _authenticated_app().run()
     at.selectbox(key="main_page").set_value("批量处理")
     at.run()
     at.selectbox(key="batch_select").set_value("large-ui-batch")

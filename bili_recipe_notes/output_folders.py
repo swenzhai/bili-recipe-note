@@ -11,7 +11,7 @@ from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
 from .data_paths import state_dir
-from .output_layout import iter_output_folders
+from .output_layout import iter_output_folders, load_dish_plan, source_output_folder
 from .storage import atomic_write_bytes, atomic_write_json
 from .utils import build_output_folder_name
 
@@ -83,6 +83,10 @@ def _source_identity(metadata: dict[str, Any], source_url: str) -> tuple[str | N
 
 def desired_output_folder(folder: str | Path) -> Path:
     source = Path(folder)
+    if source_output_folder(source) != source or (source / "dishes").is_dir():
+        return source
+    if len((load_dish_plan(source) or {}).get("dishes", [])) > 1:
+        return source
     recipe = _read_object(source / "recipe.json")
     metadata = {**_read_object(source / "job.json"), **_read_object(source / "source.json")}
     title = str(recipe.get("title") or "").strip() or "待整理"

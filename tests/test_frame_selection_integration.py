@@ -5,8 +5,12 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from PIL import Image
 from streamlit.testing.v1 import AppTest
+
+from conftest import authenticate_business_client
 
 from bili_recipe_notes import frame_selection_runner, frame_selection_service, ui
 from bili_recipe_notes.mobile_sync import MobileSyncStore
@@ -37,7 +41,12 @@ def _recipe(root: Path) -> Path:
 
 
 def _open(root: Path, page="快速审核") -> AppTest:
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    with TestClient(FastAPI()) as client:
+        authenticate_business_client(client, Path.cwd())
+        token = client.cookies.get("chef_admin_session")
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20)
+    at.session_state["_legacy_admin_session"] = token
+    at.run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(root))
     at.selectbox(key="main_page").set_value(page)
     at.run()

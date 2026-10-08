@@ -1483,6 +1483,8 @@ def _render_background_dashboard(st, config: UIConfig | None = None) -> None:
 
     @st.fragment(run_every=f"{refresh_seconds}s" if refresh_seconds else None)
     def render_live_dashboard() -> None:
+        from bili_recipe_notes.legacy_access import require_legacy_admin_session
+        require_legacy_admin_session(st)
         st.button("立即刷新", key="dashboard_refresh_now")
         st.caption(f"最近刷新：{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
         try:
@@ -2996,6 +2998,8 @@ def _render_recipe_cover_review(
 
         @st.dialog("裁剪成品封面", width="large")
         def show_cover_crop_dialog() -> None:
+            from bili_recipe_notes.legacy_access import require_legacy_admin_session
+            require_legacy_admin_session(st)
             st.caption(
                 f"{crop_source.get('label') or '候选图'} · 直接拖动矩形框移动位置，拖动边角缩放；"
                 "裁剪框锁定为手机菜单的 4:3 比例。"
@@ -3042,7 +3046,7 @@ def _render_recipe_cover_review(
                 try:
                     if crop_source.get("ai_candidate_path"):
                         latest_ai = load_frame_candidate(config.out_dir, folder)
-                        if not latest_ai or latest_ai.get("status") != "ok" or latest_ai.get("image_path") != crop_source["ai_candidate_path"]:
+                        if not latest_ai or latest_ai.get("status") not in {"ok", "needs_review"} or latest_ai.get("image_path") != crop_source["ai_candidate_path"]:
                             raise ValueError("AI 候选图或菜谱来源已变化，请刷新候选后重新裁剪。")
                     cropped_content = crop_screenshot_box_content(crop_source["content"], crop_box)
                     saved_original_size = source_size
@@ -3135,7 +3139,7 @@ def _render_recipe_cover_review(
     except Exception as exc:
         ai_candidate = None
         st.warning(f"AI 候选图暂不可用：{_clean_error(exc)}")
-    if ai_candidate and ai_candidate.get("status") == "ok":
+    if ai_candidate and ai_candidate.get("status") in {"ok", "needs_review"}:
         image_path = Path(ai_candidate["image_path"])
         ai_timestamp = ai_candidate.get("timestamp")
         time_label = _format_video_position(ai_timestamp) or "未知时间"
@@ -3145,6 +3149,8 @@ def _render_recipe_cover_review(
             st.warning(f"候选图片暂不可读：{_clean_error(exc)}")
         else:
             st.image(image_bytes, caption=f"AI 候选 · 原视频 {time_label}", width=560)
+            if ai_candidate.get("status") == "needs_review":
+                st.warning("此原帧待人工确认，请核对菜品和完成状态；只有确认裁剪后才会更新封面。")
             st.caption(str(ai_candidate.get("reason") or "请查看原视频画面并确认是否适合作为封面。"))
             st.button(
                 "裁剪 AI 候选图", key=f"mobile_cover_ai_crop_{selected_id}", width="stretch",
@@ -4549,11 +4555,48 @@ def _render_recipe_review(st, config: UIConfig) -> None:
                     )
 
 
+def _legacy_admin_gate(st) -> None:
+    """The optional Streamlit port must not bypass the React admin login."""
+    from bili_recipe_notes.access_control import AccessControl
+    from fastapi import HTTPException
+
+    access = AccessControl(Path.cwd())
+    token = st.session_state.get("_legacy_admin_session", "")
+    if access.session_valid(token, "admin"):
+        if _meal_mode_requested(st):
+            from starlette.requests import Request
+            request = Request({"type": "http", "headers": [(b"cookie", f"chef_admin_session={token}".encode())]})
+            if not access.ordering_access_allowed(request):
+                st.title("点餐页面已关闭")
+                st.info("管理员可在新版管理页面的“设置与数据 → 访问与密码”中重新开启。")
+                st.stop()
+        if st.sidebar.button("退出管理员登录", key="legacy-admin-logout"):
+            access.revoke_session(token, "admin")
+            st.session_state.clear()
+            st.rerun()
+        return
+    st.session_state.pop("_legacy_admin_session", None)
+    st.title("管理员登录")
+    st.caption("首次使用请在新版管理页面完成管理员密码设置。")
+    with st.form("legacy-admin-login", clear_on_submit=True):
+        password = st.text_input("管理员密码", type="password", max_chars=128)
+        submitted = st.form_submit_button("登录")
+    if submitted:
+        try:
+            st.session_state["_legacy_admin_session"] = access.authenticate_password("admin", password, "legacy-ui")
+        except (HTTPException, ValueError) as exc:
+            st.error(getattr(exc, "detail", "登录失败，请检查密码"))
+        else:
+            st.rerun()
+    st.stop()
+
+
 def main() -> None:
     import streamlit as st
 
     _stabilize_arrow_memory_pool()
     st.set_page_config(page_title="Bili Recipe Notes", layout="wide")
+    _legacy_admin_gate(st)
     if _meal_mode_requested(st):
         _inject_workspace_styles(st)
         _show_pending_notice(st)
@@ -4589,29 +4632,34 @@ def main() -> None:
                 log(error_message)
                 st.error(f"生成失败：{error_message}")
             else:
-                st.session_state["last_generated_output_folder"] = str(result.output_folder.resolve())
-                st.success(f"生成完成：{result.output_folder}")
+                generated_recipes = result.recipes or [result]
+                st.session_state["last_generated_output_folder"] = str(generated_recipes[0].output_folder.resolve())
+                st.success(f"生成完成：{len(generated_recipes)} 道菜谱，{result.output_folder}")
                 if config.auto_archive_after_generation:
-                    try:
-                        archived, archived_knowledge, knowledge_error = _archive_output(result.output_folder, config)
-                    except Exception as exc:  # generation remains successful
-                        st.warning(f"菜谱已生成，但自动归档失败：{_clean_error(exc)}")
-                    else:
-                        st.success(f"已自动归档：{archived.note_path}")
-                        if archived_knowledge:
-                            st.caption(f"同时同步 {len(archived_knowledge)} 条已确认通用技巧。")
-                        if knowledge_error:
-                            st.warning(f"菜谱归档成功，但技巧同步失败：{_clean_error(knowledge_error)}")
+                    for generated_recipe in generated_recipes:
+                        try:
+                            archived, archived_knowledge, knowledge_error = _archive_output(generated_recipe.output_folder, config)
+                        except Exception as exc:  # generation remains successful
+                            st.warning(f"菜谱已生成，但自动归档失败：{_clean_error(exc)}")
+                        else:
+                            st.success(f"已自动归档：{archived.note_path}")
+                            if archived_knowledge:
+                                st.caption(f"同时同步 {len(archived_knowledge)} 条已确认通用技巧。")
+                            if knowledge_error:
+                                st.warning(f"菜谱归档成功，但技巧同步失败：{_clean_error(knowledge_error)}")
                 if result.stage_errors:
                     st.warning("\n".join(result.stage_errors))
                 st.markdown("#### 笔记预览")
-                _render_note_preview(st, result.final_note, result.output_folder)
+                for generated_recipe in generated_recipes:
+                    _render_note_preview(st, generated_recipe.final_note, generated_recipe.output_folder)
                 st.markdown("#### 输出文件")
                 st.code(
-                    _render_paths([result.output_folder, result.note_path, result.recipe_path, result.transcript_path]),
+                    _render_paths([result.output_folder, *(entry.note_path for entry in generated_recipes)]),
                     language="text",
                 )
-                st.download_button("下载 note.md", data=result.final_note, file_name="note.md", mime="text/markdown")
+                for recipe_index, generated_recipe in enumerate(generated_recipes, start=1):
+                    st.download_button(f"下载菜谱 {recipe_index}", data=generated_recipe.final_note,
+                                       file_name=f"recipe-{recipe_index}.md", mime="text/markdown", key=f"generated-note-{recipe_index}")
         last_generated_value = st.session_state.get("last_generated_output_folder")
         last_generated = Path(last_generated_value) if isinstance(last_generated_value, str) else None
         if last_generated and (last_generated / "recipe.json").is_file():

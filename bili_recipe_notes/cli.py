@@ -532,6 +532,10 @@ def run(args: argparse.Namespace) -> int:
     options = _single_options(args, str(url), _extra_instructions(args))
     result = generate_recipe_note(options, log=_log)
     console.print(f"[green]Done. Output saved to {result.output_folder}[/green]")
+    if result.recipes:
+        console.print(f"已生成 {len(result.recipes)} 道独立菜谱：")
+        for recipe_result in result.recipes:
+            console.print(str(recipe_result.note_path))
     return 0
 
 

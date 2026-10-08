@@ -10,8 +10,9 @@ from types import SimpleNamespace
 import pytest
 
 from bili_recipe_notes import cli, frame_selection_runner as runner, frame_selection_worker, ui_launcher
+from bili_recipe_notes.frame_selection_service import SELECTION_STRATEGY_VERSION
 from bili_recipe_notes.mobile_sync import MobileSyncStore
-from bili_recipe_notes.review_policy import set_ai_review_visibility
+from bili_recipe_notes.review_policy import set_ai_review_classification, set_ai_review_visibility
 from test_dish_info_runner import original_bytes, recipe
 
 
@@ -31,7 +32,7 @@ def prepare(monkeypatch, root, **options):
     def launch(out_dir, state):
         token = f"test-{len(state.get('runs', [])) + 1}"
         state.update(status="paused", run_token=token, pid=None, process_start_id=None, stop_requested=False,
-                     pause_reason=None, error=None, consecutive_failures=0)
+                     pause_reason=None, error=None, consecutive_failures=0, run_processed=0)
         state.setdefault("runs", []).append({"run_token": token, "started_at": runner._now(), "options": dict(state["options"])})
         return runner._write(out_dir, state)
     monkeypatch.setattr(runner, "_launch", launch)
@@ -46,6 +47,89 @@ def confirmed(folder):
     value = json.loads((folder / "recipe.json").read_text())
     value["cover_image_status"] = "uploaded"
     (folder / "recipe.json").write_text(json.dumps(value))
+
+
+def test_all_items_are_queued_and_execution_limit_resets_on_resume(monkeypatch, tmp_path):
+    for name in "abcdef":
+        recipe(tmp_path, name)
+    state = prepare(monkeypatch, tmp_path, limit=None, run_limit=2, create_only=True)
+    before = original_bytes(tmp_path)
+    calls = []
+    monkeypatch.setattr(runner, "generate_frame_candidate", lambda folder, **kwargs: calls.append(folder.name) or {"status": "ok"})
+    assert state["total"] == 6 and state["pending"] == 6
+    assert state["status"] == "pending" and not state.get("run_token")
+    state = runner.resume_frame_selection_batch(tmp_path, state["batch_id"])
+    paused = run(tmp_path, state)
+    assert (paused["status"], paused["pause_reason"], paused["run_processed"], paused["pending"]) == ("paused", "batch_limit", 2, 4)
+    assert paused["runs"][-1]["run_processed"] == 2
+    resumed = runner.resume_frame_selection_batch(tmp_path, state["batch_id"])
+    assert resumed["run_limit"] == 2 and resumed["run_processed"] == 0
+    paused = run(tmp_path, resumed)
+    assert paused["completed"] == 4 and paused["pending"] == 2
+    final = run(tmp_path, runner.resume_frame_selection_batch(tmp_path, state["batch_id"], run_limit=0))
+    assert final["status"] == "completed" and final["run_limit"] == 0 and final["run_processed"] == 2
+    assert calls == list("abcdef")
+    assert original_bytes(tmp_path) == before
+
+
+def test_execution_limit_counts_failures_not_found_and_skips_once(monkeypatch, tmp_path):
+    for name in "abcd":
+        recipe(tmp_path, name)
+    state = prepare(monkeypatch, tmp_path, run_limit=3)
+    set_ai_review_visibility(tmp_path / "c", "hidden")
+    calls = []
+    def generate(folder, **kwargs):
+        calls.append(folder.name)
+        if folder.name == "a":
+            raise TimeoutError("timed out")
+        return {"status": "not_found"}
+    monkeypatch.setattr(runner, "generate_frame_candidate", generate)
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+    paused = run(tmp_path, state)
+    assert calls == ["a", "a", "a", "b"]
+    assert (paused["run_processed"], paused["failed"], paused["not_found"], paused["skipped"], paused["pending"]) == (3, 1, 1, 1, 1)
+    assert paused["pause_reason"] == "batch_limit"
+
+
+def test_exact_execution_limit_completes_the_queue(monkeypatch, tmp_path):
+    recipe(tmp_path, "a")
+    recipe(tmp_path, "b")
+    state = prepare(monkeypatch, tmp_path, run_limit=2)
+    monkeypatch.setattr(runner, "generate_frame_candidate", lambda *args, **kwargs: {"status": "ok"})
+    final = run(tmp_path, state)
+    assert final["status"] == "completed" and final["pause_reason"] is None and final["run_processed"] == 2
+
+
+def test_create_only_queues_while_another_task_is_active_without_preflight(monkeypatch, tmp_path):
+    recipe(tmp_path)
+    active = prepare(monkeypatch, tmp_path)
+    active.update(status="running", pid=os.getpid(), process_start_id=runner._identity(os.getpid()))
+    runner._write(tmp_path, active)
+    original = runner._path(tmp_path, active["batch_id"]).read_bytes()
+    monkeypatch.setattr(runner, "_launch", lambda *args: pytest.fail("create-only must not launch"))
+    monkeypatch.setattr(runner, "_preflight_options", lambda *args: pytest.fail("create-only must not preflight"))
+    created = runner.start_frame_selection_batch(tmp_path, create_only=True, limit=None, run_limit=2,
+                                                 python_executable="not-installed")
+    assert created["batch_id"] != active["batch_id"]
+    assert created["status"] == "pending" and created["pending"] == 1 and created["run_processed"] == 0
+    assert not created["active"] and not created.get("run_token")
+    assert runner._path(tmp_path, active["batch_id"]).read_bytes() == original
+    assert runner.start_frame_selection_batch(tmp_path)["batch_id"] == active["batch_id"]
+    empty = runner.start_frame_selection_batch(tmp_path, create_only=True, folders=[])
+    assert empty["status"] == "completed" and empty["total"] == 0
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, "2"])
+def test_invalid_execution_limit_does_not_create_or_change_tasks(monkeypatch, tmp_path, value):
+    recipe(tmp_path)
+    state = prepare(monkeypatch, tmp_path, create_only=True)
+    path = runner._path(tmp_path, state["batch_id"])
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="每次执行"):
+        runner.start_frame_selection_batch(tmp_path, run_limit=value)
+    with pytest.raises(ValueError, match="每次执行"):
+        runner.resume_frame_selection_batch(tmp_path, state["batch_id"], run_limit=value)
+    assert path.read_bytes() == before
 
 
 def test_selection_keeps_visibility_publication_and_manual_decisions(monkeypatch, tmp_path):
@@ -71,7 +155,8 @@ def test_selection_keeps_visibility_publication_and_manual_decisions(monkeypatch
 @pytest.mark.parametrize("status", ["ok", "not_found"])
 def test_valid_candidate_and_not_found_skipped_but_force_can_regenerate(monkeypatch, tmp_path, status):
     recipe(tmp_path)
-    monkeypatch.setattr(runner, "load_frame_candidate", lambda *args: {"status": status, "options": runner._normalize_options({})})
+    monkeypatch.setattr(runner, "load_frame_candidate", lambda *args: {
+        "status": status, "options": runner._normalize_options({}), "selection_strategy_version": SELECTION_STRATEGY_VERSION})
     state = prepare(monkeypatch, tmp_path)
     assert state["total"] == 0 and state["status"] == "completed"
     forced = runner.start_frame_selection_batch(tmp_path, only_pending=False)
@@ -86,7 +171,8 @@ def test_valid_candidate_and_not_found_skipped_but_force_can_regenerate(monkeypa
 def test_pending_selection_accounts_for_changed_model_and_sampling_options(monkeypatch, tmp_path, updates, expected):
     recipe(tmp_path)
     previous = runner._normalize_options({})
-    monkeypatch.setattr(runner, "load_frame_candidate", lambda *args: {"status": "not_found", "options": previous})
+    monkeypatch.setattr(runner, "load_frame_candidate", lambda *args: {
+        "status": "not_found", "options": previous, "selection_strategy_version": SELECTION_STRATEGY_VERSION})
     state = prepare(monkeypatch, tmp_path, **updates)
     assert state["total"] == expected
 
@@ -95,6 +181,16 @@ def test_candidate_without_recorded_options_is_eligible_for_refresh(monkeypatch,
     recipe(tmp_path)
     monkeypatch.setattr(runner, "load_frame_candidate", lambda *args: {"status": "ok"})
     assert prepare(monkeypatch, tmp_path)["total"] == 1
+
+
+@pytest.mark.parametrize("status", ["ok", "not_found"])
+def test_candidate_from_old_strategy_is_eligible_even_when_options_match(monkeypatch, tmp_path, status):
+    recipe(tmp_path)
+    monkeypatch.setattr(runner, "load_frame_candidate", lambda *args: {
+        "status": status, "options": runner._normalize_options({}), "selection_strategy_version": 1})
+    before = original_bytes(tmp_path)
+    assert prepare(monkeypatch, tmp_path)["total"] == 1
+    assert original_bytes(tmp_path) == before
 
 
 def test_invalid_environment_is_detected_before_creating_any_task(monkeypatch, tmp_path, isolated_workspace):
@@ -118,7 +214,9 @@ def test_runtime_rechecks_hidden_manual_and_new_valid_candidate(monkeypatch, tmp
     state = prepare(monkeypatch, tmp_path)
     set_ai_review_visibility(tmp_path / "a", "hidden")
     confirmed(tmp_path / "b")
-    monkeypatch.setattr(runner, "load_frame_candidate", lambda _, folder: {"status": "not_found", "options": state["options"]} if folder.name == "c" else None)
+    monkeypatch.setattr(runner, "load_frame_candidate", lambda _, folder: {
+        "status": "not_found", "options": state["options"],
+        "selection_strategy_version": SELECTION_STRATEGY_VERSION} if folder.name == "c" else None)
     final = run(tmp_path, state)
     assert final["status"] == "completed" and final["skipped"] == 3
     assert [item["skip_reason"] for item in final["items"]] == ["not_visible_or_published", "manually_confirmed", "valid_candidate"]
@@ -140,13 +238,129 @@ def test_progress_history_result_counts_and_original_bytes(monkeypatch, tmp_path
     monkeypatch.setattr(runner, "generate_frame_candidate", generate)
     final = run(tmp_path, state)
     assert final["status"] == "completed"
-    assert (final["total"], final["completed"], final["not_found"], final["failed"], final["pending"]) == (2, 2, 1, 0, 0)
+    assert (final["total"], final["completed"], final["not_found"], final["failed"], final["pending"]) == (2, 1, 1, 0, 0)
     assert final["current_progress"] is None
     assert [item["status"] for item in final["items"]] == ["completed", "not_found"]
     history = final["items"][0]["attempts"][0]
     assert [event["phase"] for event in history["progress"]] == ["loading_model", "coarse"]
     assert history["options"]["threads"] == 2 and history["finished_at"]
     assert original_bytes(tmp_path) == originals
+
+
+def test_no_match_retry_is_scoped_respects_quota_and_keeps_original_pending(monkeypatch, tmp_path):
+    for name in "abcde":
+        recipe(tmp_path, name)
+    state = prepare(monkeypatch, tmp_path, limit=None)
+    for index, status in enumerate(("pending", "not_found", "not_found", "needs_review", "completed")):
+        state["items"][index].update(status=status, reason="original", attempts=[{"status": status, "finished_at": "before"}])
+    runner._write(tmp_path, state)
+    before = original_bytes(tmp_path)
+    untouched = json.loads(json.dumps([state["items"][index] for index in (0, 3, 4)]))
+    monkeypatch.setattr(runner, "_has_matching_candidate", lambda *args: pytest.fail("targeted retry must bypass cached no-match"))
+    calls = []
+    monkeypatch.setattr(runner, "generate_frame_candidate", lambda folder, **kwargs: calls.append(folder.name) or {
+        "status": "not_found" if folder.name == "b" else "needs_review", "image_path": "candidate.png" if folder.name == "c" else None})
+    first = runner.resume_frame_selection_batch(tmp_path, state["batch_id"], retry_not_found=True, run_limit=1)
+    assert first["run_scope"] == "not_found" and first["run_targets"] == ["b", "c"]
+    assert first["items"][1]["reason"] == "original"
+    paused = run(tmp_path, first)
+    assert paused["pause_reason"] == "batch_limit" and calls == ["b"]
+    assert paused["run_targets"] == ["c"]
+    # A second targeted round finishes the unprocessed target, not b again.
+    second = runner.resume_frame_selection_batch(tmp_path, state["batch_id"], retry_not_found=True, run_limit=0)
+    paused = run(tmp_path, second)
+    assert calls == ["b", "c"]
+    assert paused["status"] == "paused" and paused["pause_reason"] == "retry_scope_completed"
+    assert paused["run_targets"] == [] and paused["pending"] == 1
+    assert (paused["completed"], paused["not_found"], paused["needs_review"], paused["processed"]) == (1, 1, 2, 4)
+    assert [paused["items"][index] for index in (0, 3, 4)] == untouched
+    assert len(paused["items"][1]["attempts"]) == len(paused["items"][2]["attempts"]) == 2
+    monkeypatch.setattr(runner, "_has_matching_candidate", lambda *args: False)
+    monkeypatch.setattr(runner, "generate_frame_candidate", lambda folder, **kwargs: calls.append(folder.name) or {"status": "ok"})
+    ordinary = runner.resume_frame_selection_batch(tmp_path, state["batch_id"])
+    assert ordinary["run_scope"] == "pending"
+    assert run(tmp_path, ordinary)["status"] == "completed"
+    assert calls == ["b", "c", "a"] and original_bytes(tmp_path) == before
+
+
+def test_no_match_retry_does_not_loop_and_will_not_launch_without_targets(monkeypatch, tmp_path):
+    recipe(tmp_path)
+    state = prepare(monkeypatch, tmp_path)
+    state["items"][0]["status"] = "not_found"
+    runner._write(tmp_path, state)
+    calls = []
+    monkeypatch.setattr(runner, "generate_frame_candidate", lambda folder, **kwargs: calls.append(folder.name) or {"status": "not_found"})
+    final = run(tmp_path, runner.resume_frame_selection_batch(tmp_path, state["batch_id"], retry_not_found=True))
+    assert len(calls) == 1 and final["status"] == "completed" and final["run_targets"] == []
+    final["items"][0]["status"] = "pending"
+    runner._write(tmp_path, final)
+    monkeypatch.setattr(runner, "_launch", lambda *args: pytest.fail("no targets must not start original pending items"))
+    unchanged = runner.resume_frame_selection_batch(tmp_path, state["batch_id"], retry_not_found=True)
+    assert unchanged["items"][0]["status"] == "pending"
+
+
+def test_no_match_retry_refuses_active_worker_and_recovers_interrupted_target(monkeypatch, tmp_path):
+    recipe(tmp_path, "a")
+    recipe(tmp_path, "b")
+    state = prepare(monkeypatch, tmp_path)
+    state.update(status="running", pid=os.getpid(), process_start_id=runner._identity(os.getpid()),
+                 run_scope="not_found", run_targets=["a"])
+    state["items"][0].update(status="running", attempts=[{"status": "running"}])
+    runner._write(tmp_path, state)
+    path = runner._path(tmp_path, state["batch_id"])
+    before = path.read_bytes()
+    with pytest.raises(RuntimeError, match="正在运行"):
+        runner.resume_frame_selection_batch(tmp_path, state["batch_id"], retry_not_found=True)
+    assert path.read_bytes() == before
+    state.update(status="interrupted", pid=None, process_start_id=None)
+    runner._write(tmp_path, state)
+    resumed = runner.resume_frame_selection_batch(tmp_path, state["batch_id"], retry_not_found=True)
+    assert resumed["items"][0]["status"] == "not_found"
+    assert resumed["items"][0]["attempts"][0]["status"] == "interrupted"
+    assert resumed["items"][1]["status"] == "pending"
+
+
+def test_no_match_retry_still_respects_manual_cover_and_visibility(monkeypatch, tmp_path):
+    for name in "abc":
+        recipe(tmp_path, name)
+    state = prepare(monkeypatch, tmp_path)
+    for item in state["items"]:
+        item["status"] = "not_found"
+    runner._write(tmp_path, state)
+    confirmed(tmp_path / "a")
+    set_ai_review_visibility(tmp_path / "b", "hidden")
+    before = original_bytes(tmp_path)
+    calls = []
+    monkeypatch.setattr(runner, "generate_frame_candidate", lambda folder, **kwargs: calls.append(folder.name) or {"status": "needs_review"})
+    final = run(tmp_path, runner.resume_frame_selection_batch(tmp_path, state["batch_id"], retry_not_found=True))
+    assert calls == ["c"]
+    assert [item.get("skip_reason") for item in final["items"][:2]] == ["manually_confirmed", "not_visible_or_published"]
+    assert (final["completed"], final["skipped"], final["needs_review"], final["processed"]) == (0, 2, 1, 3)
+    assert original_bytes(tmp_path) == before
+
+
+def test_default_selection_skips_visible_technique_without_changing_visibility(monkeypatch, tmp_path):
+    folder = recipe(tmp_path)
+    set_ai_review_classification(folder, "technique")
+    set_ai_review_visibility(folder, "visible")
+    before = original_bytes(tmp_path)
+    assert prepare(monkeypatch, tmp_path)["total"] == 0
+    custom = runner.start_frame_selection_batch(tmp_path, requirement="找锅具保养完成后的锅面", create_only=True)
+    assert custom["total"] == 1
+    assert original_bytes(tmp_path) == before
+
+
+def test_no_match_retry_rechecks_technique_classification_for_existing_queue(monkeypatch, tmp_path):
+    folder = recipe(tmp_path)
+    state = prepare(monkeypatch, tmp_path)
+    state["items"][0]["status"] = "not_found"
+    runner._write(tmp_path, state)
+    set_ai_review_classification(folder, "technique")
+    set_ai_review_visibility(folder, "visible")
+    before = original_bytes(tmp_path)
+    final = run(tmp_path, runner.resume_frame_selection_batch(tmp_path, state["batch_id"], retry_not_found=True))
+    assert final["items"][0]["status"] == "skipped" and final["items"][0]["skip_reason"] == "not_a_dish"
+    assert original_bytes(tmp_path) == before
 
 
 def test_transient_retry_bound_and_options_are_recorded(monkeypatch, tmp_path):
@@ -204,13 +418,13 @@ def test_failure_continues_and_manual_pause_finishes_current_item(monkeypatch, t
     monkeypatch.setattr(runner, "generate_frame_candidate", generate)
     paused = run(tmp_path, state)
     assert paused["status"] == "paused" and paused["pause_reason"] == "requested"
-    assert (paused["failed"], paused["completed"], paused["not_found"], paused["pending"]) == (1, 1, 1, 1)
+    assert (paused["failed"], paused["completed"], paused["not_found"], paused["pending"]) == (1, 0, 1, 1)
     final = run(tmp_path, runner.resume_frame_selection_batch(tmp_path, state["batch_id"]))
     assert final["status"] == "completed_with_errors" and calls == ["a", "b", "c"]
     monkeypatch.setattr(runner, "generate_frame_candidate", lambda folder, **k: calls.append(folder.name) or {"status": "ok"})
     final = run(tmp_path, runner.resume_frame_selection_batch(tmp_path, state["batch_id"], retry_failed=True))
     assert final["status"] == "completed" and calls == ["a", "b", "c", "a"]
-    assert final["completed"] == 3 and final["not_found"] == 2
+    assert final["completed"] == 1 and final["not_found"] == 2
 
 
 def test_pause_during_transient_failure_does_not_start_another_attempt(monkeypatch, tmp_path):
@@ -272,7 +486,7 @@ def test_crashed_worker_resumes_running_item_without_repeating_complete(monkeypa
     calls = []
     monkeypatch.setattr(runner, "generate_frame_candidate", lambda folder, **k: calls.append(folder.name) or {"status": "ok"})
     final = run(tmp_path, resumed)
-    assert final["completed"] == 2 and final["not_found"] == 1 and calls == ["b"]
+    assert final["completed"] == 1 and final["not_found"] == 1 and final["processed"] == 2 and calls == ["b"]
 
 
 def test_stale_worker_cannot_write_progress_or_failure_to_new_task(monkeypatch, tmp_path):
@@ -430,6 +644,7 @@ def test_frozen_launch_persists_pid_and_absolute_data_root(monkeypatch, tmp_path
     recipe(tmp_path)
     launch = runner._launch
     state = prepare(monkeypatch, tmp_path)
+    state.update(run_limit=3, run_processed=3)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     seen = {}
     def popen(command, **options):
@@ -440,6 +655,7 @@ def test_frozen_launch_persists_pid_and_absolute_data_root(monkeypatch, tmp_path
     assert seen["command"] == [sys.executable, "--frame-selection-worker", str(tmp_path), state["batch_id"], launched["run_token"]]
     assert seen["options"]["env"]["BILI_RECIPE_DATA_DIR"] == str(tmp_path / "data")
     assert launched["pid"] == os.getpid() and launched["active"]
+    assert launched["run_processed"] == 0 and launched["runs"][-1]["run_limit"] == 3
 
 
 def test_worker_handles_bad_arguments_and_marks_matching_run_interrupted(monkeypatch, tmp_path):
@@ -495,7 +711,11 @@ def fake_selector(monkeypatch, tmp_path, *, delayed_first=False):
         "          'requirement':args.requirement,'image':str(image),'dimensions':[12,8],\n"
         "          'selected':{'frame_index':25,'pts':1250,'time_base':'1/1000',\n"
         "                      'timestamp_seconds':1.25,'relative_timestamp_seconds':1.25,\n"
-        "                      'judgment':{'matches_requirement':True,'reason':'synthetic frame'}},\n"
+        "                      'judgment':{'matches_requirement':True,'reason':'synthetic frame',\n"
+        "                                  'decision':'accept','relevance':5,'occlusion':0,'composition':3,\n"
+        "                                  'dish_assessment':{'food_visible':True,'completion':'finished',\n"
+        "                                                     'identity':'compatible','presentation':'serving',\n"
+        "                                                     'constraints_satisfied':True}}},\n"
         "          'reason':'synthetic frame',\n"
         "          'metadata':str(out/'result.json')}\n"
         "(out/'result.json').write_text(json.dumps(result))\n"
@@ -554,6 +774,54 @@ def test_real_worker_and_fake_selector_survive_ui_restart_and_reject_duplicates(
     finally:
         for process in processes:
             process.wait(timeout=15)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="terminate/EOF process identity test uses POSIX process semantics")
+def test_sigterm_while_holding_task_lock_releases_it_and_records_interruption(tmp_path):
+    import subprocess
+    from bili_recipe_notes.storage import file_lock
+
+    root = tmp_path / "outputs"
+    recipe(root, "one")
+    state = runner.start_frame_selection_batch(root, create_only=True)
+    state.update(run_token="terminate-with-lock", status="queued")
+    state["runs"] = [{"run_token": state["run_token"], "started_at": runner._now()}]
+    runner._write(root, state)
+    ready = tmp_path / "lock-held"
+    harness = tmp_path / "locked-worker.py"
+    harness.write_text(
+        "import sys,time\nfrom pathlib import Path\n"
+        "from bili_recipe_notes import frame_selection_worker as worker, frame_selection_runner as runner\n"
+        "from bili_recipe_notes.storage import file_lock\n"
+        "def holding_lock(root, batch_id, token):\n"
+        "    with file_lock(runner._path(Path(root), batch_id)):\n"
+        "        Path(sys.argv[4]).write_text('ready')\n"
+        "        time.sleep(30)\n"
+        "worker.run_frame_selection_batch=holding_lock\n"
+        "raise SystemExit(worker.main(sys.argv[1:4]))\n"
+    )
+    package = str(Path(runner.__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (package, os.environ.get("PYTHONPATH"))))}
+    process = subprocess.Popen([sys.executable, str(harness), str(root), state["batch_id"],
+                                state["run_token"], str(ready)], env=env)
+    lock_path = runner._path(root, state["batch_id"]).with_suffix(".json.lock")
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists() and lock_path.exists()
+        process.terminate()
+        assert process.wait(timeout=5) == 1
+        assert not lock_path.exists()
+        interrupted = runner._read(root, state["batch_id"])
+        assert interrupted["status"] == "interrupted" and "终止信号" in interrupted["error"]
+        assert interrupted["runs"][0]["finished_at"]
+        with file_lock(runner._path(root, state["batch_id"]), timeout=0.1):
+            assert lock_path.exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="terminate/EOF process identity test uses POSIX process semantics")

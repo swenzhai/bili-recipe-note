@@ -8,14 +8,17 @@ import pytest
 from PIL import Image
 from streamlit.testing.v1 import AppTest
 
+from conftest import authenticate_streamlit_app
+
 from bili_recipe_notes import frame_selection_ui
 from bili_recipe_notes.frame_selection import DEFAULT_REQUIREMENT
 
 
 @pytest.fixture(autouse=True)
-def isolated_ui(tmp_path, monkeypatch):
+def isolated_ui(tmp_path, tmp_path_factory, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("BILI_RECIPE_DATA_DIR", raising=False)
+    # Keep login state outside the recipe fixture whose bytes are read-only.
+    monkeypatch.setenv("BILI_RECIPE_DATA_DIR", str(tmp_path_factory.mktemp("frame-ui-state")))
     for name in ("start_frame_selection_batch", "stop_frame_selection_batch", "resume_frame_selection_batch"):
         monkeypatch.setattr(frame_selection_ui, name, lambda *_a, **_k: pytest.fail("unexpected real task operation"))
     monkeypatch.setattr(frame_selection_ui, "load_frame_candidate", lambda *_a, **_k: None)
@@ -29,6 +32,7 @@ def open_page(root: Path, *, scope=None, **config) -> AppTest:
         "render_frame_selection_page(st, UIConfig(**st.session_state['config']))\n",
         default_timeout=15,
     )
+    authenticate_streamlit_app(app)
     app.session_state["config"] = {"out_dir": str(root), "llm_provider": "none", **config}
     if scope is not None:
         app.session_state["_frame_selection_scope_folders"] = scope
@@ -168,6 +172,7 @@ def test_returning_to_page_restores_library_filter_defaults(tmp_path, monkeypatc
         "page = st.selectbox('页面', ['选图', '其他'], key='page')\n"
         "if page == '选图': render_frame_selection_page(st, UIConfig(out_dir=st.session_state['root']))\n",
     )
+    authenticate_streamlit_app(app)
     app.session_state["root"] = str(tmp_path)
     app.run()
     app.selectbox(key="page").set_value("其他").run()
@@ -256,8 +261,11 @@ def test_resume_defaults_to_original_options_and_allows_current(tmp_path, monkey
     assert calls[-1][1].get("retry_failed", False) is retry
 
 
-def test_candidate_preview_navigates_to_manual_review_without_applying(tmp_path, monkeypatch):
+@pytest.mark.parametrize("status", ["ok", "needs_review"])
+def test_candidate_preview_navigates_to_manual_review_without_applying(tmp_path, monkeypatch, status):
     state = batch()
+    if status == "needs_review":
+        state["items"][0].update(status="needs_review", result_status=status)
     monkeypatch.setattr(frame_selection_ui, "list_frame_selection_batches", lambda *_: [state])
     folder = tmp_path / "厨师" / "炒蛋"
     folder.mkdir(parents=True)
@@ -268,7 +276,7 @@ def test_candidate_preview_navigates_to_manual_review_without_applying(tmp_path,
     calls = []
     def candidate(*args, **kwargs):
         calls.append((args, kwargs))
-        return {"status": "ok", "image_path": str(image), "timestamp": 126.0, "reason": "成品清晰"}
+        return {"status": status, "image_path": str(image), "timestamp": 126.0, "reason": "成品清晰"}
     monkeypatch.setattr(frame_selection_ui, "load_frame_candidate", candidate)
     before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
     app = open_page(tmp_path)
@@ -276,6 +284,12 @@ def test_candidate_preview_navigates_to_manual_review_without_applying(tmp_path,
     assert calls[0] == ((tmp_path, folder), {"include_stale": True})
     assert any("126.00 秒" in item.value for item in app.caption)
     assert any("成品清晰" in item.value for item in app.markdown)
+    metrics = {metric.label: metric.value for metric in app.metric}
+    assert metrics["待人工确认"] == ("1" if status == "needs_review" else "0")
+    assert metrics["找到候选"] == ("0" if status == "needs_review" else "1")
+    assert metrics["剩余"] == "2"
+    if status == "needs_review":
+        assert any("尚未通过 AI 确认" in item.value for item in app.warning)
     app.button(key="frame_selection_confirm_candidate").click().run()
     assert not app.exception
     assert app.session_state["_quick_review_preferred_folder"] == str(folder)
@@ -326,6 +340,7 @@ def test_dashboard_without_config_prefers_active_task(tmp_path, monkeypatch):
         "from bili_recipe_notes.frame_selection_ui import render_frame_selection_dashboard\n"
         "render_frame_selection_dashboard(st, st.session_state['root'], key_prefix='home_frames', show_open_button=True)\n"
     )
+    authenticate_streamlit_app(app)
     app.session_state["root"] = str(tmp_path)
     app.run()
     assert not app.exception

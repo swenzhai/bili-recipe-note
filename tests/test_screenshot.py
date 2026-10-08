@@ -15,6 +15,8 @@ from bili_recipe_notes.screenshot import (
     MAX_SCREENSHOT_DIMENSION,
     MAX_SCREENSHOT_BYTES,
     MIN_AUTOMATIC_SCREENSHOT_SCORE,
+    ScreenshotCandidate,
+    capture_finished_dish_cover,
     capture_screenshot_at,
     crop_screenshot_content,
     crop_screenshot_box_content,
@@ -234,3 +236,92 @@ def test_low_quality_candidates_are_not_persisted(monkeypatch, tmp_path: Path) -
     assert steps[0].screenshot_path is None
     assert steps[0].screenshot_status == "needs_review"
     assert not list((tmp_path / "images").glob("*.jpg"))
+
+
+@pytest.mark.parametrize("end_time,next_start", [(None, 40), (48, 40), (None, None)])
+def test_scoped_step_candidates_stop_before_another_dish(end_time, next_start):
+    step = RecipeStep(title="炒制", start_time=16, end_time=end_time, action="翻炒")
+    timestamps = step_candidate_timestamps(step, next_start, time_ranges=[{"start": 10, "end": 18}, {"start": 40, "end": 48}])
+    assert timestamps
+    assert all(16 <= time < 18 for time in timestamps)
+
+
+def test_scoped_step_in_another_dish_does_not_seek_nearest_allowed_frame():
+    step = RecipeStep(title="别的菜", start_time=25, end_time=30, action="切菜")
+    assert step_candidate_timestamps(step, time_ranges=[{"start": 10, "end": 18}, {"start": 40, "end": 48}]) == []
+
+
+@pytest.mark.parametrize("start,end", [(10.004, 10.006), (10.001, 10.002), (0, 0.0001)])
+def test_scoped_short_window_never_rounds_across_exclusive_end(start, end):
+    step = RecipeStep(title="快速成品展示", start_time=start, end_time=end, action="装盘")
+    values = step_candidate_timestamps(step, time_ranges=[{"start": start, "end": end}])
+    assert values
+    assert all(start <= value < end for value in values)
+
+
+def test_finished_dish_candidates_use_own_final_range_instead_of_video_tail():
+    ranges = [{"start": 10, "end": 18}, {"start": 60, "end": 70}]
+    steps = [RecipeStep(title="初炸", start_time=10, end_time=18, action="出锅"),
+             RecipeStep(title="复炸", start_time=60, end_time=70, action="再次下锅复炸后装盘")]
+    values = finished_dish_candidate_timestamps(steps, 100, time_ranges=ranges)
+    assert values
+    assert any(10 <= value < 18 for value in values)
+    assert any(60 <= value < 70 for value in values)
+    assert all(any(span["start"] <= value < span["end"] for span in ranges) for value in values)
+    assert not set(values) & {72, 82, 90, 95}
+    assert 69.5 in values
+
+
+@pytest.mark.parametrize("ranges", [
+    [], {}, [{"start": 1}], [{"start": True, "end": 10}], [{"start": -1, "end": 10}],
+    [{"start": 10, "end": 10}], [{"start": 10, "end": 5}], [{"start": 0, "end": float("inf")}],
+    [{"start": float("nan"), "end": 5}], [{"start": "0", "end": 5}],
+    [{"start": 0, "end": 10}, {"start": 9, "end": 15}],
+    [{"start": 10, "end": 15}, {"start": 0, "end": 5}],
+])
+def test_invalid_scope_is_rejected_before_existing_images_are_removed(tmp_path, ranges):
+    images = tmp_path / "images"
+    images.mkdir()
+    (images / "cover.jpg").write_bytes(b"manual cover")
+    (images / "step_01.jpg").write_bytes(b"manual step")
+    step = RecipeStep(title="步骤", start_time=0, end_time=5, action="炒", screenshot_path="images/step_01.jpg")
+    with pytest.raises(ValueError):
+        step_candidate_timestamps(step, time_ranges=ranges)
+    with pytest.raises(ValueError):
+        finished_dish_candidate_timestamps([step], 100, time_ranges=ranges)
+    with pytest.raises(ValueError):
+        capture_finished_dish_cover(tmp_path / "video.mp4", [step], images, time_ranges=ranges)
+    with pytest.raises(ValueError):
+        capture_step_screenshots(tmp_path / "video.mp4", [step], images, time_ranges=ranges)
+    assert (images / "cover.jpg").read_bytes() == b"manual cover"
+    assert (images / "step_01.jpg").read_bytes() == b"manual step"
+    assert step.screenshot_path == "images/step_01.jpg"
+
+
+def test_scoped_capture_keeps_original_video_seconds_for_steps_and_cover(monkeypatch, tmp_path):
+    ranges = [{"start": 100, "end": 108}, {"start": 200, "end": 210}]
+    steps = [RecipeStep(title="初炸", start_time=100, action="炸后出锅"),
+             RecipeStep(title="复炸", start_time=200, end_time=210, action="复炸出锅")]
+    captures = []
+
+    def generate(video, timestamps, **kwargs):
+        captures.append(list(timestamps))
+        return [ScreenshotCandidate(time, 0.8, b"test jpeg") for time in timestamps]
+
+    monkeypatch.setattr("bili_recipe_notes.screenshot.generate_screenshot_candidates", generate)
+    capture_step_screenshots(tmp_path / "video.mp4", steps, tmp_path / "images", max_images=2, time_ranges=ranges)
+    cover = capture_finished_dish_cover(tmp_path / "video.mp4", steps, tmp_path / "images",
+                                       video_duration=300, time_ranges=ranges)
+    assert len(captures) == 3
+    assert all(100 <= time < 108 for time in captures[0])
+    assert all(200 <= time < 210 for time in captures[1])
+    assert all(any(span["start"] <= time < span["end"] for span in ranges) for time in captures[2])
+    assert cover is not None and 100 <= cover.timestamp < 210
+    assert 100 <= steps[0].screenshot_time < 108
+    assert 200 <= steps[1].screenshot_time < 210
+
+
+def test_adjacent_scope_boundary_belongs_to_later_span():
+    step = RecipeStep(title="下一阶段", start_time=10, end_time=15, action="拌匀")
+    values = step_candidate_timestamps(step, time_ranges=[{"start": 0, "end": 10}, {"start": 10, "end": 20}])
+    assert values and all(10 <= time < 15 for time in values)

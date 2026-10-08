@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any, Callable, Iterable
 
@@ -61,6 +62,11 @@ class Recipe(BaseModel):
     video_title: str | None = None
     uploader: str | None = None
     creator_name: str | None = None
+    dish_id: str = ""
+    source_time_ranges: list[dict] | None = None
+    source_segment_ranges: list[dict] | None = None
+    dish_index: int | None = None
+    dish_count: int | None = None
     cover_image_path: str | None = None
     cover_image_time: float | None = None
     cover_image_status: str | None = None
@@ -470,6 +476,9 @@ def extract_recipe_rule_based(
     metadata: dict,
     max_steps: int = DEFAULT_MAX_RECIPE_STEPS,
 ) -> Recipe:
+    scope = _validated_source_ranges(metadata.get("source_time_ranges"))
+    if scope is not None:
+        _validate_scoped_transcript(transcript, scope)
     ingredients = _extract_named_items(transcript, INGREDIENT_KEYWORDS)
     seasonings = _extract_named_items(transcript, SEASONING_KEYWORDS)
     tools_set = {k for k in TOOL_KEYWORDS if any(k in s.text for s in transcript)}
@@ -491,9 +500,12 @@ def extract_recipe_rule_based(
                     confidence=0.4,
                 )
             )
-        elif steps:
+        elif steps and (scope is None or _inside_one_range(steps[-1].start_time, seg.end, scope)):
             steps[-1].action = f"{steps[-1].action} {seg.text.strip()}".strip()
             steps[-1].end_time = seg.end
+        elif scope is not None:
+            steps.append(RecipeStep(title=f"步骤{len(steps) + 1}", start_time=seg.start, end_time=seg.end,
+                                    action=text, evidence=text, confidence=0.2))
 
     if not steps and transcript:
         meaningful = [segment for segment in transcript if segment.text.strip()]
@@ -511,10 +523,11 @@ def extract_recipe_rule_based(
             )
 
     recipe = Recipe(
-        title=metadata.get("recipe_title") or metadata.get("video_title") or "未命名菜谱",
+        title=metadata.get("target_dish_title") or metadata.get("recipe_title") or metadata.get("video_title") or "未命名菜谱",
         source_url=metadata.get("source_url", ""),
         video_title=metadata.get("video_title"),
         uploader=metadata.get("uploader"),
+        **_source_dish_metadata(metadata),
         ingredients=ingredients,
         seasonings=seasonings,
         tools=sorted(tools_set),
@@ -531,7 +544,7 @@ def extract_recipe_rule_based(
 
 def build_recipe_extraction_prompt(transcript: list[TranscriptSegment], metadata: dict) -> str:
     transcript_lines = [
-        f"[{segment.start:.1f}-{segment.end:.1f}] {segment.text.strip()}"
+        f"[{segment.start}-{segment.end}] {segment.text.strip()}"
         for segment in transcript
         if segment.text.strip()
     ]
@@ -561,7 +574,16 @@ def build_recipe_extraction_prompt(transcript: list[TranscriptSegment], metadata
         "- summary_tips/uncertain_points: 字符串数组；\n"
         "- confidence 必须是 0 到 1；无法确认的用量、火候、时长必须写 null 并加入 uncertain_points；\n"
         "- 不得伪造 source_url、video_title 或 uploader。\n\n"
-        f"元数据：\n{metadata_json}\n\n"
+        + (
+            "本次仅抽取 target_dish_title 指定的一道菜，视频标题可能包含其他菜，不得把它们带入。"
+            "所给字幕已按菜分配，只采用这些字幕；不得读取或假设未提供的其他片段。"
+            "每项食材/调料和步骤都必须提供所给字幕中的连续原文evidence。食材必须有原字幕绝对source_time，"
+            "步骤必须有原字幕绝对start_time/end_time；不得重置到0、使用其他菜时间或跨越source_time_ranges空档。"
+            "每个步骤仅限一个连续时间范围；不同片段中的继续制作应分别列步骤。"
+            "首次出锅、装盘后仍可能有复炸、浇汁等本菜后续阶段，必须保留。\n\n"
+            if metadata.get("source_time_ranges") is not None else ""
+        )
+        + f"元数据：\n{metadata_json}\n\n"
         "<untrusted_transcript>\n"
         f"{transcript_text}\n"
         "</untrusted_transcript>\n"
@@ -569,19 +591,34 @@ def build_recipe_extraction_prompt(transcript: list[TranscriptSegment], metadata
 
 
 def _trim_after_completion(steps: list[RecipeStep]) -> list[RecipeStep]:
-    """Discard tasting/chat segments after the first explicit plating/completion action."""
+    """Remove explicit tasting chatter, preserving cooking after an intermediate plating.
 
-    for index, step in enumerate(steps):
+    A first removal from the pan can precede cooling, a second frying, or sauce
+    preparation. Completion words therefore never establish a cutoff time.
+    """
+    chat_words = ("试吃", "尝一口", "尝一下", "尝尝", "口感", "点赞", "关注", "下期", "聊天", "太香", "好吃", "谢谢", "订阅")
+    cooking_words = ("放入", "倒入", "加入", "下锅", "炒", "煮", "蒸", "煎", "炸", "烤", "焖", "炖", "浇", "拌", "切", "腌", "调味", "晾凉", "放凉", "装盘", "出锅", "关火")
+
+    def is_chat(text: str) -> bool:
+        return any(word in text for word in chat_words) and not any(word in text for word in cooking_words)
+
+    retained: list[RecipeStep] = []
+    completion_seen = False
+    for step in steps:
         action = step.action or ""
-        matches = [(action.find(keyword), keyword) for keyword in COMPLETION_KEYWORDS if keyword in action]
-        if not matches:
+        completed = any(keyword in action for keyword in COMPLETION_KEYWORDS)
+        if completion_seen and is_chat(action):
             continue
-        position, keyword = min(matches, key=lambda item: item[0])
-        # ASR often appends several minutes of tasting chatter to the same segment.
-        step.action = action[: position + len(keyword)].strip(" ，。；")
-        step.end_time = max(step.start_time, step.end_time or step.start_time)
-        return steps[: index + 1]
-    return steps
+        if completed:
+            # Remove only unmistakable trailing chatter, never a cooking clause.
+            clauses = re.split(r"[，,。；;！？!?\n]", action)
+            while clauses and (not clauses[-1].strip() or is_chat(clauses[-1])):
+                clauses.pop()
+            if clauses:
+                step.action = "，".join(clauses).strip(" ，。；")
+        retained.append(step)
+        completion_seen = completion_seen or completed
+    return retained
 
 
 def _merge_step_group(group: list[RecipeStep], index: int) -> RecipeStep:
@@ -612,6 +649,22 @@ def condense_recipe_steps(recipe: Recipe, max_steps: int = DEFAULT_MAX_RECIPE_ST
     steps = _trim_after_completion(list(recipe.steps))
     if len(steps) <= max_steps:
         recipe.steps = steps
+        return recipe
+
+    if recipe.source_time_ranges is not None:
+        # A combined step may not span another dish's intervening footage.
+        groups = [[step for step in steps if _inside_one_range(step.start_time, step.end_time or step.start_time, [span])]
+                  for span in recipe.source_time_ranges]
+        groups = [group for group in groups if group]
+        if sum(map(len, groups)) != len(steps):
+            raise ValueError("菜谱步骤越过所属菜品的字幕时间范围")
+        while len(groups) < max_steps and any(len(group) > 1 for group in groups):
+            index = max(range(len(groups)), key=lambda item: len(groups[item]))
+            group = groups[index]
+            midpoint = len(group) // 2
+            groups[index:index + 1] = [group[:midpoint], group[midpoint:]]
+        recipe.steps = [_merge_step_group(group, index + 1) if len(group) > 1 else group[0]
+                        for index, group in enumerate(groups)]
         return recipe
 
     condensed: list[RecipeStep] = []
@@ -682,12 +735,91 @@ def _normalize_optional_text(value: Any) -> str | None:
     return "；".join(cleaned) or None
 
 
+def _source_dish_metadata(metadata: dict) -> dict:
+    """Source identity and boundaries come from validated callers, never the LLM."""
+    return {
+        "dish_id": str(metadata.get("dish_id") or ""),
+        "source_time_ranges": metadata.get("source_time_ranges"),
+        "source_segment_ranges": metadata.get("source_segment_ranges"),
+        "dish_index": metadata.get("dish_index"),
+        "dish_count": metadata.get("dish_count"),
+    }
+
+
+def _validated_source_ranges(raw: Any) -> list[dict] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("所属菜品的字幕时间范围不能为空")
+    result = []
+    for span in raw:
+        if not isinstance(span, dict):
+            raise ValueError("所属菜品的字幕时间范围无效")
+        start, end = span.get("start"), span.get("end")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+               for value in (start, end)) or start < 0 or end < start:
+            raise ValueError("所属菜品的字幕时间范围无效")
+        if result and start < result[-1]["end"]:
+            raise ValueError("所属菜品的字幕时间范围重叠或乱序")
+        result.append({"start": float(start), "end": float(end)})
+    return result
+
+
+def _inside_one_range(start: Any, end: Any, ranges: list[dict]) -> bool:
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+           for value in (start, end)) or end < start:
+        return False
+    return any(span["start"] <= start <= end <= span["end"] for span in ranges)
+
+
+def _validate_scoped_transcript(transcript: list[TranscriptSegment], ranges: list[dict]) -> None:
+    if not transcript or any(not _inside_one_range(segment.start, segment.end, ranges) for segment in transcript):
+        raise ValueError("输入字幕包含所属菜品时间范围外的内容")
+
+
+def _validate_scoped_payload(payload: dict, transcript: list[TranscriptSegment], ranges: list[dict]) -> None:
+    def evidence_supported(evidence: Any, start: float, end: float) -> bool:
+        if not isinstance(evidence, str) or not evidence.strip():
+            return False
+        text = "".join(segment.text for segment in transcript if segment.start <= end and segment.end >= start)
+        return re.sub(r"\s+", "", evidence) in re.sub(r"\s+", "", text)
+
+    for key in ("ingredients", "seasonings"):
+        for item in payload[key]:
+            time = item.get("source_time")
+            if not _inside_one_range(time, time, ranges) or not evidence_supported(item.get("evidence"), time, time):
+                raise ValueError(f"{key}中的食材缺少所属菜品字幕范围内的时间与原文证据")
+    for step in payload["steps"]:
+        start, end = step.get("start_time"), step.get("end_time")
+        if not _inside_one_range(start, end, ranges) or not evidence_supported(step.get("evidence"), start, end):
+            raise ValueError("步骤缺少所属菜品字幕范围内的时间与原文证据，或跨越其他菜品片段")
+
+
+def _validate_scoped_raw_times(payload: dict) -> None:
+    # The legacy normalizer tolerates missing/reversed times. An isolated dish
+    # must not turn those guesses into apparently verified source boundaries.
+    for key, fields in (("ingredients", ("source_time",)), ("seasonings", ("source_time",)),
+                        ("steps", ("start_time", "end_time"))):
+        items = payload.get(key, [])
+        if not isinstance(items, list):
+            raise ValueError("按菜抽取的结构化内容格式无效")
+        for item in items:
+            if not isinstance(item, dict) or any(
+                isinstance(item.get(field), bool) or not isinstance(item.get(field), (int, float))
+                or not math.isfinite(item[field]) for field in fields
+            ):
+                raise ValueError("按菜抽取必须提供原字幕中的有效数值时间")
+            if key == "steps" and item["end_time"] < item["start_time"]:
+                raise ValueError("按菜抽取的步骤结束时间早于开始时间")
+
+
 def _normalize_recipe_payload(data: dict[str, Any], metadata: dict) -> dict[str, Any]:
     payload = dict(data)
-    payload["title"] = str(payload.get("title") or metadata.get("recipe_title") or metadata.get("video_title") or "未命名菜谱")
+    payload["title"] = str(metadata.get("target_dish_title") or payload.get("title") or metadata.get("recipe_title") or metadata.get("video_title") or "未命名菜谱")
     payload["source_url"] = str(metadata.get("source_url") or "")
     payload["video_title"] = metadata.get("video_title")
     payload["uploader"] = metadata.get("uploader")
+    payload.update(_source_dish_metadata(metadata))
     payload["extraction_method"] = "llm"
     raw_category = _clean_taxonomy_value(payload.get("category"))
     normalized_category = CATEGORY_ALIASES.get(raw_category, raw_category)
@@ -833,9 +965,20 @@ def extract_recipe_with_llm(
     cli_extra_instructions: str | None = None,
     max_steps: int = DEFAULT_MAX_RECIPE_STEPS,
     completion: Callable[[str], str | None] | None = None,
+    target_dish_title: str | None = None,
+    source_time_ranges: list[dict] | None = None,
 ) -> Recipe:
     if not any(segment.text.strip() for segment in transcript):
         raise ValueError("Cannot extract a recipe from an empty transcript")
+    metadata = dict(metadata)
+    if target_dish_title is not None:
+        metadata["target_dish_title"] = target_dish_title
+    if source_time_ranges is not None:
+        metadata["source_time_ranges"] = source_time_ranges
+    scope = _validated_source_ranges(metadata.get("source_time_ranges"))
+    if scope is not None:
+        metadata["source_time_ranges"] = scope
+        _validate_scoped_transcript(transcript, scope)
 
     if completion is None:
         from .llm import complete_markdown_prompt, get_last_llm_error
@@ -859,7 +1002,11 @@ def extract_recipe_with_llm(
         if not raw:
             detail = get_last_llm_error() if completion is None else None
             raise RuntimeError(detail or f"{provider} returned no structured recipe")
-        payloads.append(_parse_llm_json(raw))
+        parsed = _parse_llm_json(raw)
+        if scope is not None:
+            _validate_scoped_raw_times(parsed)
+            _validate_scoped_payload(_normalize_recipe_payload(parsed, metadata), chunk, scope)
+        payloads.append(parsed)
 
     payload = _merge_recipe_payloads(payloads, metadata)
     if not payload["steps"]:

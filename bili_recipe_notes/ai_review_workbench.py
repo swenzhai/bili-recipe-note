@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .file_cache import read_json_cached
+from .legacy_access import require_legacy_admin_session
 from .review_policy import (
     complete_manual_ai_review,
     set_ai_review_classification,
@@ -96,6 +97,7 @@ def render_review_workbench(st, selected: dict[str, Any], *, next_folder: str | 
         current_classification = ""
 
     def save_classification():
+        require_legacy_admin_session(st)
         try:
             set_ai_review_classification(
                 folder, st.session_state[f"{prefix}_classification"] or None,
@@ -174,6 +176,7 @@ def render_review_workbench(st, selected: dict[str, Any], *, next_folder: str | 
                 st.write("人工备注：" + str(decision.get("comment") or "无"))
 
         def save_item():
+            require_legacy_admin_session(st)
             try:
                 quote = st.session_state[f"{prefix}_{item_id}_quote"].strip()
                 set_ai_review_item_decision(

@@ -7,12 +7,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
 from bili_recipe_notes import admin_menu, admin_settings
-from bili_recipe_notes.admin_common import AdminContext
+from bili_recipe_notes.admin_common import AdminContext, require_admin_request
 from bili_recipe_notes.config import UIConfig, save_config
 from bili_recipe_notes.data_paths import state_dir
 from bili_recipe_notes.menu_image import MenuImageFile, MenuImageResult
@@ -20,7 +20,7 @@ from bili_recipe_notes.mobile_sync import MobileSyncStore
 
 
 @pytest.fixture
-def setup(tmp_path, monkeypatch):
+def setup(tmp_path, monkeypatch, authorize_client):
     monkeypatch.delenv("BILI_RECIPE_DATA_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
     out = tmp_path / "data" / "recipes"
@@ -41,9 +41,9 @@ def setup(tmp_path, monkeypatch):
     ctx.rows = lambda: [{**row, "hidden": row["title"] == "隐藏内容"} for row in original_rows()]
     rows = {row["title"]: row for row in ctx.rows()}
     app = FastAPI()
-    app.include_router(admin_settings.create_router(ctx), prefix="/api/admin/v1")
-    app.include_router(admin_menu.create_router(ctx), prefix="/api/admin/v1")
-    client = TestClient(app)
+    app.include_router(admin_settings.create_router(ctx), prefix="/api/admin/v1", dependencies=[Depends(require_admin_request)])
+    app.include_router(admin_menu.create_router(ctx), prefix="/api/admin/v1", dependencies=[Depends(require_admin_request)])
+    client = authorize_client(TestClient(app), tmp_path)
     yield SimpleNamespace(client=client, ctx=ctx, root=tmp_path, rows=rows, originals=originals)
     for path, worker in list(admin_settings._RUNNING.items()):
         if path.startswith(str(tmp_path)):

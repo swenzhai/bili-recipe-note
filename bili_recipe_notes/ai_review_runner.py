@@ -124,6 +124,14 @@ def _counts(state: dict) -> dict:
 
 
 def _write(root: Path, state: dict) -> dict:
+    # Also covers interruptions reported directly by ai_review_worker. Closing
+    # the run together with the state prevents paused time inflating durations.
+    if state.get("status") in {"paused", "completed", "completed_with_errors", "interrupted"}:
+        state["finished_at"] = state.get("finished_at") or _now()
+        for run in state.get("runs", []):
+            if run.get("run_token") == state.get("run_token") and not run.get("finished_at"):
+                run.update(status=state["status"], finished_at=state["finished_at"],
+                           run_processed=state.get("run_processed", 0))
     _counts(state)
     atomic_write_json(_state_path(root, state["batch_id"]), state, backup=False)
     return state
@@ -198,12 +206,30 @@ def _launch(root: Path, state: dict) -> dict:
     log_path = root / ".ai-review" / f"{batch_id}.log"
     if log_path.is_symlink():
         raise ValueError("审核任务日志不能是符号链接")
+    # Older versions left runs open after pausing. Use recorded boundaries, not
+    # the new launch time, so an idle interval is not charged to the old run.
+    runs = state.get("runs", [])
+    for index, run in enumerate(runs):
+        if run.get("finished_at"):
+            continue
+        current_run = run.get("run_token") == state.get("run_token")
+        attempts = [attempt for item in state["items"] for attempt in item.get("attempts", [])
+                    if attempt.get("run_token") == run.get("run_token") and attempt.get("finished_at")]
+        next_start = next((later["started_at"] for later in runs[index + 1:] if later.get("started_at")), None)
+        recorded_end = (state.get("finished_at") or state.get("updated_at")) if current_run else None
+        run["finished_at"] = (recorded_end or max((attempt["finished_at"] for attempt in attempts), default=None)
+                              or next_start or state.get("finished_at") or state.get("updated_at")
+                              or run.get("started_at") or _now())
+        if current_run:
+            run.update(status=state["status"], run_processed=state.get("run_processed", 0))
     state.update(status="queued", pid=os.getpid(), process_start_id=_identity(os.getpid()), run_token=uuid.uuid4().hex,
                  stop_requested=False, current_folder=None, error=None, finished_at=None, pause_reason=None,
-                 consecutive_failures=0)
+                 consecutive_failures=0, run_processed=0)
+    state.setdefault("run_limit", 0)
     state.setdefault("runs", []).append({"run_token": state["run_token"], "started_at": _now(),
         "provider": state["provider"], "llm_options": dict(state["llm_options"]),
-        "max_attempts": state.get("max_attempts", 3), "consecutive_failure_limit": state.get("consecutive_failure_limit", 5)})
+        "max_attempts": state.get("max_attempts", 3), "consecutive_failure_limit": state.get("consecutive_failure_limit", 5),
+        "run_limit": state["run_limit"]})
     _write(root, state)
     args = [str(root), batch_id, state["run_token"]]
     command = ([sys.executable, "--ai-review-worker", *args] if getattr(sys, "frozen", False)
@@ -234,6 +260,8 @@ def start_ai_review_batch(
     *,
     provider: str = "codex",
     limit: int | None = None,
+    create_only: bool = False,
+    run_limit: int = 0,
     only_pending: bool = True,
     retry_failed: bool = False,
     folders: list[str | Path] | None = None,
@@ -247,6 +275,10 @@ def start_ai_review_batch(
         raise ValueError("请先选择可用的 AI 服务")
     if limit is not None and (type(limit) is not int or limit <= 0):
         raise ValueError("审核数量限制必须为正整数")
+    if type(create_only) is not bool:
+        raise ValueError("仅创建任务必须为布尔值")
+    if type(run_limit) is not int or run_limit < 0:
+        raise ValueError("本轮审核数量必须为非负整数，0 表示不限")
     if set(llm_options) - _OPTIONS:
         raise ValueError("未知的 AI 模型配置")
     if type(max_attempts) is not int or not 1 <= max_attempts <= 5:
@@ -258,7 +290,7 @@ def start_ai_review_batch(
     with file_lock(root / ".ai-review" / "control", timeout=15):
         batches = list_ai_review_batches(root)
         active = next((state for state in batches if state["active"]), None)
-        if active:
+        if active and not create_only:
             return active
         candidates = ([_folder(root, item) for item in folders] if folders is not None else
                       [_folder(root, path) for path in sorted(iter_output_folders(root))
@@ -281,11 +313,15 @@ def start_ai_review_batch(
             "llm_options": llm_options, "only_pending": only_pending, "stop_requested": False,
             "max_attempts": max_attempts, "consecutive_failure_limit": consecutive_failure_limit,
             "retry_base_seconds": retry_base_seconds, "consecutive_failures": 0,
+            "run_limit": run_limit, "run_processed": 0,
             "pid": None, "process_start_id": None, "current_folder": None,
             "items": [{"folder": path.relative_to(root).as_posix(), "status": "pending", "error": None} for path in candidates],
         }
         if not candidates:
             state["finished_at"] = _now()
+            return _decorate(_write(root, state))
+        if create_only:
+            state["status"] = "pending"
             return _decorate(_write(root, state))
         return _launch(root, state)
 
@@ -303,10 +339,12 @@ def request_stop_ai_review_batch(out_dir: str | Path, batch_id: str) -> dict:
 
 
 def resume_ai_review_batch(out_dir: str | Path, batch_id: str, *, retry_failed: bool = False,
-                          provider: str | None = None, **llm_options: Any) -> dict:
+                          provider: str | None = None, run_limit: int | None = None, **llm_options: Any) -> dict:
     root = _root(out_dir)
     if provider is not None and provider not in SUPPORTED_LLM_PROVIDERS - {"none"}:
         raise ValueError("请先选择可用的 AI 服务")
+    if run_limit is not None and (type(run_limit) is not int or run_limit < 0):
+        raise ValueError("本轮审核数量必须为非负整数，0 表示不限")
     if set(llm_options) - _OPTIONS:
         raise ValueError("未知的 AI 模型配置")
     with file_lock(root / ".ai-review" / "control", timeout=15):
@@ -321,6 +359,8 @@ def resume_ai_review_batch(out_dir: str | Path, batch_id: str, *, retry_failed: 
             raise ValueError("AI 审核任务不存在")
         if provider is not None:
             state["provider"] = provider
+        if run_limit is not None:
+            state["run_limit"] = run_limit
         state["llm_options"] = {**state.get("llm_options", {}), **llm_options}
         for item in state["items"]:
             if item["status"] == "running" or (retry_failed and item["status"] == "failed"):
@@ -329,7 +369,7 @@ def resume_ai_review_batch(out_dir: str | Path, batch_id: str, *, retry_failed: 
                         attempt.update(status="interrupted", finished_at=_now(), error="后台进程中断")
                 item.update(status="pending", error=None)
         if not any(item["status"] == "pending" for item in state["items"]):
-            return state
+            return _decorate(_write(root, state))
         return _launch(root, state)
 
 
@@ -368,11 +408,15 @@ def run_ai_review_batch(out_dir: str | Path, batch_id: str, run_token: str) -> d
         if state.get("run_token") != run_token:
             return state
         pending = next((index for index, item in enumerate(state["items"]) if item["status"] == "pending"), None)
-        if pending is None or state.get("stop_requested"):
+        limit_reached = (state.get("run_limit", 0) > 0 and
+                         state.get("run_processed", 0) >= state["run_limit"])
+        if pending is None or state.get("stop_requested") or limit_reached:
             def finish(current: dict) -> None:
                 current.update(status=("paused" if pending is not None else
                                        "completed_with_errors" if current["failed"] else "completed"),
-                               current_folder=None, finished_at=_now())
+                               current_folder=None, finished_at=_now(),
+                               pause_reason=("requested" if current.get("stop_requested") else "batch_limit")
+                               if pending is not None else None)
             return _update(root, batch_id, finish)
         name = state["items"][pending]["folder"]
         def starting(current: dict) -> None:
@@ -420,6 +464,7 @@ def run_ai_review_batch(out_dir: str | Path, batch_id: str, run_token: str) -> d
             if current.get("run_token") != run_token:
                 raise RuntimeError("审核 worker 标识已过期")
             current["items"][pending].update(result, finished_at=_now())
+            current["run_processed"] = current.get("run_processed", 0) + 1
             current["current_folder"] = None
             current["consecutive_failures"] = current.get("consecutive_failures", 0) + 1 if result["status"] == "failed" else 0
             if (result.get("error_kind") == "configuration" or

@@ -55,7 +55,8 @@ export default function AcquisitionPage({ navigate }: PageProps) {
         ...(model.trim() && ['codex', 'openai'].includes(provider) ? { [provider === 'codex' ? 'codex_model' : 'openai_model']: model.trim() } : {}),
         ...(whisper.trim() ? { whisper_model: whisper.trim() } : {}) };
       const task = await post<TaskSummary>('/tasks', { kind: 'generation', urls: uniqueUrls, target_stage: stage, create_only: createOnly, creator_name: creatorName.trim() || null, options });
-      navigate(`/tasks?kind=generation&id=${encodeURIComponent(task.id)}`);
+      const reuseNotice = task.reused ? `&reused=${task.status === 'completed' ? 'completed' : 'pending'}` : '';
+      navigate(`/tasks?kind=generation&id=${encodeURIComponent(task.id)}${reuseNotice}`);
     } catch (err) { setError(errorText(err)); }
     finally { setBusy(false); }
   }

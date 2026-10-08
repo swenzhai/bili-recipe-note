@@ -128,7 +128,7 @@ def test_optimize_existing_note_failure_does_not_overwrite(monkeypatch, tmp_path
 def test_run_batch_persists_new_batch_state(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
 
-    def _generate(options, log=None):
+    def _generate(options, log=None, **kwargs):
         folder = tmp_path / "outputs" / options.url.rsplit("/", 1)[-1]
         _write_recipe(folder)
         return RecipeJobResult(
@@ -212,7 +212,7 @@ def test_run_batch_resume_unfinished_processes_pending_and_failed(monkeypatch, t
 
     processed: list[str] = []
 
-    def _generate(options, log=None):
+    def _generate(options, log=None, **kwargs):
         processed.append(options.url)
         folder = tmp_path / "outputs" / options.url.rsplit("/", 1)[-1]
         _write_recipe(folder)
@@ -236,7 +236,7 @@ def test_run_batch_retry_failed_only_processes_failed(monkeypatch, tmp_path) -> 
     save_batch_state(state, project_root=tmp_path)
     processed: list[str] = []
 
-    def _generate(options, log=None):
+    def _generate(options, log=None, **kwargs):
         processed.append(options.url)
         folder = tmp_path / "outputs" / "failed"
         _write_recipe(folder)

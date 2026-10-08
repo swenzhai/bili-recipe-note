@@ -278,6 +278,10 @@ def _state_files(project_root: Path, output_root: Path) -> list[tuple[str, bytes
     files: list[tuple[str, bytes]] = []
     for path in sorted(config_root.rglob("*")):
         relative = path.relative_to(config_root)
+        # Access is initialized separately on the destination. Exporting live
+        # sessions or the first-owner setup token would clone server access.
+        if path.name.startswith(("access-control.json", "admin-setup-token")):
+            continue
         if "cookies" in relative.parts or path.name.endswith(("-wal", "-shm")):
             continue
         # Keep recoverable JSON backups; transient locks and exports are omitted.

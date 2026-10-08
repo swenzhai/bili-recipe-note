@@ -2,6 +2,7 @@ import { Component, Suspense, lazy, useCallback, useEffect, useRef, useState, ty
 import HomePage from "./HomePage";
 import LibraryPage from "./LibraryPage";
 import RecipePage from "./RecipePage";
+import { accessRequest, notifyAccessChanged } from "../access";
 import "./admin.css";
 
 const TasksPage = lazy(() => import("./TasksPage"));
@@ -51,6 +52,8 @@ function currentLocation() { return window.location.pathname.replace(/^\/admin(?
 export default function AdminApp() {
   const [location, setLocation] = useState(currentLocation);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [logoutError, setLogoutError] = useState("");
+  const [loggingOut, setLoggingOut] = useState(false);
   const [narrow, setNarrow] = useState(() => window.matchMedia("(max-width: 760px)").matches);
   const menuWasOpen = useRef(false);
   const contentRef = useRef<HTMLElement>(null);
@@ -88,6 +91,13 @@ export default function AdminApp() {
   const active = pathname.startsWith("/recipes") || pathname === "/drafts" ? navigation[1] : pathname === "/acquisition" ? navigation[3] : navigation.find(item => item.path !== "/" && pathname.startsWith(item.path)) || navigation[0];
   useEffect(() => { document.title = `${secondaryTitle || active.title} · Chef Zhai`; }, [active.title, secondaryTitle]);
   const props = { navigate };
+  const logout = async () => {
+    if (!window.dispatchEvent(new Event("admin:before-navigate", { cancelable: true }))) return;
+    setLoggingOut(true); setLogoutError("");
+    try { await accessRequest("/admin/logout", { method: "POST" }); notifyAccessChanged(); }
+    catch (cause) { setLogoutError(cause instanceof Error ? cause.message : "退出失败，请重试。"); }
+    finally { setLoggingOut(false); }
+  };
   let page: ReactNode;
   if (pathname === "/") page = <HomePage {...props}/>;
   else if (pathname === "/library") page = <LibraryPage {...props}/>;
@@ -112,7 +122,8 @@ export default function AdminApp() {
       <nav aria-label="管理导航">{navigation.map(item => <a key={item.path} className={`adm-nav-item ${active.path === item.path && !secondaryTitle ? "active" : ""}`} aria-current={active.path === item.path && !secondaryTitle ? "page" : undefined} href={`/admin${item.path}`} onClick={event => { if (!event.ctrlKey && !event.metaKey) { event.preventDefault(); navigate(item.path); } }}><Icon name={item.icon}/><span>{item.title}</span>{active.path === item.path && !secondaryTitle && <i/>}</a>)}</nav>
       <div className="adm-sidebar-bottom">{[{ path: "/curation", title: "菜谱版本整理", icon: "check" }, { path: "/drafts", title: "草稿与归档", icon: "book" }, { path: "/knowledge", title: "厨房知识库", icon: "leaf" }].map(item => <a key={item.path} className={`adm-nav-item ${pathname === item.path ? "active" : ""}`} href={`/admin${item.path}`} onClick={event => { if (!event.ctrlKey && !event.metaKey) { event.preventDefault(); navigate(item.path); } }}><Icon name={item.icon}/>{item.title}</a>)}<div className="adm-sidebar-note"><span className="adm-status-dot"/><span>好好吃饭，慢慢积累<small>你的菜谱与厨房灵感</small></span></div></div>
     </aside>
-    <div className="adm-workspace" inert={narrow && menuOpen}><header className="adm-topbar"><div className="adm-topbar-start"><button className="adm-mobile-menu" aria-label="打开管理导航" aria-expanded={menuOpen} onClick={() => setMenuOpen(!menuOpen)}>☰</button><span className="adm-breadcrumb">我的厨房<span>/</span><b>{secondaryTitle || active.title}</b></span></div><a className="adm-order-link" href="/">开始点餐 <span aria-hidden="true">↗</span></a></header>
+    <div className="adm-workspace" inert={narrow && menuOpen}><header className="adm-topbar"><div className="adm-topbar-start"><button className="adm-mobile-menu" aria-label="打开管理导航" aria-expanded={menuOpen} onClick={() => setMenuOpen(!menuOpen)}>☰</button><span className="adm-breadcrumb">我的厨房<span>/</span><b>{secondaryTitle || active.title}</b></span></div><div className="adm-actions"><a className="adm-order-link" href="/">开始点餐 <span aria-hidden="true">↗</span></a><button className="adm-btn small" disabled={loggingOut} onClick={() => void logout()}>{loggingOut ? "正在退出…" : "退出登录"}</button></div></header>
+      {logoutError && <p className="adm-error" role="alert">{logoutError}</p>}
       <main className="adm-content" id="admin-content" ref={contentRef} tabIndex={-1}><PageBoundary key={pathname}><Suspense fallback={<div className="adm-loading" role="status"><span className="adm-spinner"/>正在打开厨房…</div>}>{page}</Suspense></PageBoundary></main>
       <footer className="adm-footer">CHEF ZHAI <span>把喜欢的味道，留在自己的厨房。</span></footer>
     </div>

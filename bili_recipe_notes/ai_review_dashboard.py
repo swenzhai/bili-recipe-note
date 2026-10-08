@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .ai_review_runner import list_ai_review_batches
+from .legacy_access import require_legacy_admin_session
 
 
 STATUS_LABELS = {
@@ -126,6 +127,7 @@ def render_ai_review_dashboard(st, out_dir: str | Path, *, key_prefix: str = "ai
     # batch can start work without causing a full rerun of this page.
     @st.fragment(run_every=f"{refresh_seconds}s" if refresh_seconds else None)
     def live_progress() -> None:
+        require_legacy_admin_session(st)
         st.button("刷新审核仪表盘", key=f"{key_prefix}_dashboard_refresh")
         if refresh_seconds:
             st.caption(f"每 {refresh_seconds} 秒自动刷新，优先显示正在运行的审核任务。")

@@ -45,7 +45,7 @@ def prepare(monkeypatch, root, **options):
     def launch(out_dir, state):
         token = f"testing-{len(state.get('runs', [])) + 1}"
         state.update(status="paused", run_token=token, pid=None, process_start_id=None,
-                     stop_requested=False, pause_reason=None, error=None, consecutive_failures=0)
+                     stop_requested=False, pause_reason=None, error=None, consecutive_failures=0, run_processed=0)
         state.setdefault("runs", []).append({"run_token": token, "started_at": runner._now(),
                                              "llm_options": dict(state["options"])})
         return runner._write(out_dir, state)
@@ -60,6 +60,87 @@ def run(root, state):
 def original_bytes(root):
     return {path.relative_to(root): path.read_bytes() for path in root.rglob("*")
             if path.is_file() and not any(part.startswith(".") for part in path.relative_to(root).parts)}
+
+
+def test_all_items_are_queued_and_execution_limit_resets_on_resume(monkeypatch, tmp_path):
+    for name in "abcdef":
+        recipe(tmp_path, name)
+    state = prepare(monkeypatch, tmp_path, limit=None, run_limit=2, create_only=True)
+    before = original_bytes(tmp_path)
+    calls = []
+    monkeypatch.setattr(runner, "generate_dish_info", lambda folder, **kwargs: calls.append(folder.name) or {})
+    assert state["total"] == 6 and state["pending"] == 6
+    assert state["status"] == "pending" and not state.get("run_token")
+    state = runner.resume_dish_info_batch(tmp_path, state["batch_id"])
+    paused = run(tmp_path, state)
+    assert (paused["status"], paused["pause_reason"], paused["run_processed"], paused["pending"]) == ("paused", "batch_limit", 2, 4)
+    assert paused["runs"][-1]["run_processed"] == 2
+    resumed = runner.resume_dish_info_batch(tmp_path, state["batch_id"])
+    assert resumed["run_limit"] == 2 and resumed["run_processed"] == 0
+    paused = run(tmp_path, resumed)
+    assert paused["completed"] == 4 and paused["pending"] == 2
+    final = run(tmp_path, runner.resume_dish_info_batch(tmp_path, state["batch_id"], run_limit=0))
+    assert final["status"] == "completed" and final["run_limit"] == 0 and final["run_processed"] == 2
+    assert calls == list("abcdef")
+    assert original_bytes(tmp_path) == before
+
+
+def test_execution_limit_counts_failed_and_skipped_items_once(monkeypatch, tmp_path):
+    for name in "abcd":
+        recipe(tmp_path, name)
+    state = prepare(monkeypatch, tmp_path, run_limit=3)
+    set_ai_review_visibility(tmp_path / "c", "hidden")
+    calls = []
+    def generate(folder, **kwargs):
+        calls.append(folder.name)
+        if folder.name == "a":
+            raise TimeoutError("timed out")
+        return {}
+    monkeypatch.setattr(runner, "generate_dish_info", generate)
+    monkeypatch.setattr(runner.time, "sleep", lambda _: None)
+    paused = run(tmp_path, state)
+    assert calls == ["a", "a", "a", "b"]
+    assert (paused["run_processed"], paused["failed"], paused["completed"], paused["skipped"], paused["pending"]) == (3, 1, 1, 1, 1)
+    assert paused["pause_reason"] == "batch_limit"
+
+
+def test_exact_execution_limit_completes_the_queue(monkeypatch, tmp_path):
+    recipe(tmp_path, "a")
+    recipe(tmp_path, "b")
+    state = prepare(monkeypatch, tmp_path, run_limit=2)
+    monkeypatch.setattr(runner, "generate_dish_info", lambda *args, **kwargs: {})
+    final = run(tmp_path, state)
+    assert final["status"] == "completed" and final["pause_reason"] is None and final["run_processed"] == 2
+
+
+def test_create_only_queues_without_launch_even_with_active_task(monkeypatch, tmp_path):
+    recipe(tmp_path)
+    active = prepare(monkeypatch, tmp_path)
+    active.update(status="running", pid=os.getpid(), process_start_id=runner._identity(os.getpid()))
+    runner._write(tmp_path, active)
+    original = runner._path(tmp_path, active["batch_id"]).read_bytes()
+    monkeypatch.setattr(runner, "_launch", lambda *args: pytest.fail("create-only must not launch"))
+    created = runner.start_dish_info_batch(tmp_path, provider="local", create_only=True, limit=None, run_limit=2)
+    assert created["batch_id"] != active["batch_id"]
+    assert created["status"] == "pending" and created["pending"] == 1 and created["run_processed"] == 0
+    assert not created["active"] and not created.get("run_token")
+    assert runner._path(tmp_path, active["batch_id"]).read_bytes() == original
+    assert runner.start_dish_info_batch(tmp_path, provider="local")["batch_id"] == active["batch_id"]
+    empty = runner.start_dish_info_batch(tmp_path, provider="local", create_only=True, folders=[])
+    assert empty["status"] == "completed" and empty["total"] == 0
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, "2"])
+def test_invalid_execution_limit_does_not_create_or_change_tasks(monkeypatch, tmp_path, value):
+    recipe(tmp_path)
+    state = prepare(monkeypatch, tmp_path, create_only=True)
+    path = runner._path(tmp_path, state["batch_id"])
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="每次执行"):
+        runner.start_dish_info_batch(tmp_path, provider="local", run_limit=value)
+    with pytest.raises(ValueError, match="每次执行"):
+        runner.resume_dish_info_batch(tmp_path, state["batch_id"], run_limit=value)
+    assert path.read_bytes() == before
 
 
 def test_selection_honors_visibility_publication_scope_and_limit(monkeypatch, tmp_path):
@@ -396,6 +477,7 @@ def test_frozen_launch_sets_absolute_data_root_and_worker_arguments(monkeypatch,
     recipe(tmp_path)
     launch = runner._launch
     state = prepare(monkeypatch, tmp_path)
+    state.update(run_limit=3, run_processed=3)
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     seen = {}
     def popen(command, **options):
@@ -406,6 +488,7 @@ def test_frozen_launch_sets_absolute_data_root_and_worker_arguments(monkeypatch,
     assert seen["command"] == [sys.executable, "--dish-info-worker", str(tmp_path), state["batch_id"], launched["run_token"]]
     assert seen["options"]["env"]["BILI_RECIPE_DATA_DIR"] == str(tmp_path / "data")
     assert Path(seen["options"]["cwd"]).is_absolute()
+    assert launched["run_processed"] == 0 and launched["runs"][-1]["run_limit"] == 3
 
 
 def test_worker_reports_failure_and_bad_arguments(monkeypatch, tmp_path):

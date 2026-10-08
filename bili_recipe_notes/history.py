@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .output_layout import iter_output_folders
+from .output_layout import iter_output_folders, iter_dish_output_folders, load_dish_plan, source_output_folder
 from .data_paths import resolve_stored_path
 
 import json
@@ -41,6 +41,11 @@ class HistoryItem:
     taste_rating: int | None = None
     difficulty_rating: int | None = None
     time_rating: int | None = None
+    dish_id: str | None = None
+    dish_count: int = 0
+    completed_dish_count: int = 0
+    dishes: list[dict[str, Any]] | None = None
+    source_output_folder: Path | None = None
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -82,7 +87,22 @@ def _has_usable_recipe(path: Path) -> bool:
 def is_complete_output(folder: str | Path) -> bool:
     """Return whether a folder is safe to treat as a completed batch item."""
     output_folder = Path(folder)
+    if output_folder.is_symlink() or (output_folder.parent.name == "dishes" and output_folder.parent.is_symlink()):
+        return False
     job = _read_json(output_folder / "job.json")
+    try:
+        plan = load_dish_plan(output_folder)
+    except (OSError, ValueError, UnicodeError):
+        return False
+    if len((plan or {}).get("dishes", [])) > 1 or (output_folder / "dishes").is_dir():
+        # A finished child never establishes that the whole source is complete.
+        dishes = (plan or {}).get("dishes") or []
+        return bool(job.get("status") == "done" and (plan or {}).get("status") == "identified" and dishes
+                    and _has_usable_transcript(output_folder / "transcript.json")
+                    and all(dish.get("status") == "done"
+                            and _read_json(output_folder / "dishes" / dish["dish_id"] / "recipe.json").get("dish_id") == dish["dish_id"]
+                            and is_complete_output(output_folder / "dishes" / dish["dish_id"])
+                            for dish in dishes))
     return bool(
         job.get("status") == "done"
         and _has_usable_recipe(output_folder / "recipe.json")
@@ -100,6 +120,14 @@ def is_raw_output(folder: str | Path) -> bool:
     status_ok = raw_stage.get("status") == "done" or job.get("status") in {"raw_ready", "done"}
     metadata_ok = bool(_read_json(output_folder / "source.json") or job.get("source_url"))
     return bool(status_ok and metadata_ok and _has_usable_transcript(output_folder / "transcript.json"))
+
+
+def completed_recipe_folders(folder: str | Path) -> list[Path]:
+    """Return completed individual dishes, including a partial video's good work."""
+    output = Path(folder)
+    children = list(iter_dish_output_folders(output))
+    candidates = children if (output / "dishes").is_dir() else [output]
+    return [candidate for candidate in candidates if is_complete_output(candidate)]
 
 
 def scan_history(out_dir: str | Path) -> list[HistoryItem]:
@@ -132,6 +160,17 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
             except Exception:
                 normalized_recipe = None
         job = _read_json(job_path) if job_path.exists() else {}
+        source = _read_json(folder / "source.json")
+        try:
+            plan = load_dish_plan(folder)
+        except (OSError, ValueError, UnicodeError):
+            plan = None
+        children = (plan or {}).get("dishes") or []
+        if len(children) <= 1 and not (folder / "dishes").is_dir():
+            children = []
+        child_states = [{**dish, "output_folder": str(folder / "dishes" / dish["dish_id"]),
+                         "complete": is_complete_output(folder / "dishes" / dish["dish_id"])}
+                        for dish in children]
         archive = _read_json(folder / "archive.json")
         workflow_status = recipe_archive_status(folder)
         quality = load_quality_report(folder)
@@ -141,8 +180,8 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
         if not recipe and not note_path.exists() and not transcript_path.exists() and not job:
             continue
 
-        title = str(recipe.get("title") or job.get("title") or folder.name)
-        source_url = str(recipe.get("source_url") or job.get("source_url") or "")
+        title = str(recipe.get("title") or job.get("title") or source.get("video_title") or folder.name)
+        source_url = str(recipe.get("source_url") or job.get("source_url") or source.get("source_url") or "")
         status = str(job.get("status") or ("legacy" if note_path.exists() else "unknown"))
         if status == "done" and not is_complete_output(folder):
             status = "incomplete"
@@ -172,6 +211,11 @@ def scan_history(out_dir: str | Path) -> list[HistoryItem]:
                 taste_rating=normalized_recipe.taste_rating if normalized_recipe else None,
                 difficulty_rating=normalized_recipe.difficulty_rating if normalized_recipe else None,
                 time_rating=normalized_recipe.time_rating if normalized_recipe else None,
+                dish_id=recipe.get("dish_id") or source.get("dish_id") or job.get("dish_id"),
+                dish_count=len(children),
+                completed_dish_count=sum(bool(dish["complete"]) and dish.get("status") == "done" for dish in child_states),
+                dishes=child_states or None,
+                source_output_folder=source_output_folder(folder),
             )
         )
     return items
@@ -182,7 +226,8 @@ def find_history_by_url(out_dir: str | Path, url: str) -> HistoryItem | None:
     if not target:
         return None
     for item in scan_history(out_dir):
-        if item.source_url.strip() == target and item.status == "done" and is_complete_output(item.output_folder):
+        if (source_output_folder(item.output_folder) == item.output_folder and item.source_url.strip() == target
+                and item.status == "done" and is_complete_output(item.output_folder)):
             return item
     return None
 
@@ -193,7 +238,7 @@ def find_history_record_by_url(out_dir: str | Path, url: str) -> HistoryItem | N
     if not target:
         return None
     for item in scan_history(out_dir):
-        if item.source_url.strip() == target and (
+        if source_output_folder(item.output_folder) == item.output_folder and item.source_url.strip() == target and (
             is_complete_output(item.output_folder) or is_raw_output(item.output_folder)
         ):
             return item

@@ -27,8 +27,10 @@ _RECIPE_FIELDS = (
     "title", "source_url", "video_title", "uploader", "creator_name",
     "servings", "total_time", "difficulty", "ingredients", "seasonings", "tools", "prep_items",
     "shopping_list", "steps", "summary_tips", "uncertain_points",
+    "dish_id", "source_time_ranges", "source_segment_ranges",
 )
-_SOURCE_FIELDS = ("title", "video_title", "description", "source_url", "webpage_url", "url", "id", "bvid", "uploader", "creator_name", "duration")
+_SOURCE_FIELDS = ("title", "video_title", "description", "source_url", "webpage_url", "url", "id", "bvid", "uploader", "creator_name", "duration",
+                  "dish_id", "source_time_ranges", "source_segment_ranges")
 
 
 def _now() -> str:

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, errorMessage, post } from "./api";
 import type { PageProps } from "./types";
+import AccessSettings from "./AccessSettings";
 import "./admin-settings.css";
 
 type Config = Record<string, string | boolean | number | null>;
@@ -49,7 +50,7 @@ export function fileBase64(file: File, maximum: number): Promise<string> {
 export default function SettingsPage({ navigate }: PageProps) {
   const [settings, setSettings] = useState<Settings>();
   const [config, setConfig] = useState<Config>({});
-  const [tab, setTab] = useState("general");
+  const [tab, setTab] = useState("access");
   const [devices, setDevices] = useState<Device[]>([]);
   const [checks, setChecks] = useState<Check[]>([]);
   const [operations, setOperations] = useState<Operation[]>([]);
@@ -79,7 +80,8 @@ export default function SettingsPage({ navigate }: PageProps) {
     {error && <p role="alert" className="adm-error">{error}</p>}{notice && <p role="status" className="adm-notice">{notice}</p>}
     {!settings ? <div className="adm-empty">正在读取设置…</div> : <>
       {settings.restart_required && <p className="adm-notice">新菜谱目录已保存，等待服务重启。当前菜谱库：{settings.active_out_dir}</p>}
-      <nav className="adm-tabs" aria-label="设置分类">{[["general", "厨房与生成"], ["models", "模型与登录"], ["devices", "设备管理"], ["data", "数据与交接"], ["environment", "环境检查"]].map(([value, label]) => <button key={value} className={`adm-btn ${tab === value ? "primary" : "secondary"}`} aria-pressed={tab === value} onClick={() => setTab(value)}>{label}</button>)}</nav>
+      <nav className="adm-tabs" aria-label="设置分类">{[["access", "访问与密码"], ["general", "厨房与生成"], ["models", "模型与登录"], ["devices", "设备管理"], ["data", "数据与交接"], ["environment", "环境检查"]].map(([value, label]) => <button key={value} className={`adm-btn ${tab === value ? "primary" : "secondary"}`} aria-pressed={tab === value} onClick={() => setTab(value)}>{label}</button>)}</nav>
+      {tab === "access" && <AccessSettings />}
       {tab === "general" && <div className="adm-grid adm-settings-grid"><section className="adm-panel"><h2>厨房品牌</h2><div className="adm-form-grid">{input("restaurant_name", "餐厅名称")}{input("restaurant_subtitle", "副标题")}</div><div className="adm-logo-tools">{settings.branding.has_logo && <img src={`/api/v1/branding/logo?v=${notice}`} alt="当前餐厅 Logo" />}<label className="adm-field">上传 Logo<input type="file" accept="image/png,image/jpeg,image/webp" disabled={!!busy || dirty} onChange={e => { const file = e.target.files?.[0]; if (file) void run("logo", async () => { const data = await post<Settings>("/settings/logo", { content: await fileBase64(file, 5 * 1024 * 1024) }); setSettings(data); setConfig(data.config); setNotice("Logo 已更新。"); }); }} /><small className="adm-muted">PNG、JPG、WebP，最大 5 MiB。请先保存表单修改。</small></label><button className="adm-btn danger small" disabled={!!busy || dirty || !settings.branding.has_logo} onClick={() => void run("logo", async () => { const data = await api<Settings>("/settings/logo", { method: "DELETE" }); setSettings(data); setConfig(data.config); setNotice("Logo 已移除。"); })}>移除 Logo</button></div></section>
         <section className="adm-panel"><h2>生成偏好</h2><div className="adm-form-grid">{input("language", "字幕语言")}{select("whisper_model", "转写模型", ["tiny", "base", "small", "medium", "large-v3"])}{input("max_recipe_steps", "最多关键步骤", { type: "number", min: 4, max: 12 })}{input("max_step_images", "最多步骤图片", { type: "number", min: 1, max: 4 })}</div><div className="adm-check-list">{toggle("enable_screenshot", "生成步骤截图")}{toggle("enable_llm_summary", "使用文本模型整理菜谱")}{toggle("keep_media", "保留临时音视频")}{toggle("enable_recipe_review", "生成旧版逐项审核文件")}</div></section>
         <section className="adm-panel"><h2>归档</h2>{input("obsidian_vault_dir", "Obsidian 知识库目录")}<div className="adm-check-list">{toggle("auto_archive_after_generation", "生成后自动归档")}{toggle("archive_knowledge_with_recipe", "同时归档已确认的相关知识")}</div></section></div>}

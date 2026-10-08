@@ -13,12 +13,13 @@ from fastapi.testclient import TestClient
 from bili_recipe_notes.mobile_api import create_app
 
 
-def test_health_pair_auth_and_asset_roundtrip(tmp_path: Path) -> None:
+def test_health_pair_auth_and_asset_roundtrip(tmp_path: Path, authorize_client) -> None:
     app = create_app(tmp_path, start_background_indexer=False)
     store = app.state.store
     credential = store.issue_pairing_credential("http://192.168.1.2:8765")
 
     with TestClient(app) as client:
+        authorize_client(client, ordering=True)
         health = client.get("/api/v1/health")
         assert health.status_code == 200
         assert health.json()["server_id"] == store.server_id
@@ -71,11 +72,12 @@ def test_static_client_is_served_after_api_routes(tmp_path: Path) -> None:
         assert client.get("/api/v1/health").headers["content-type"].startswith("application/json")
 
 
-def test_self_join_can_be_locked_without_revoking_existing_devices(tmp_path: Path) -> None:
+def test_self_join_can_be_locked_without_revoking_existing_devices(tmp_path: Path, authorize_client) -> None:
     app = create_app(tmp_path, start_background_indexer=False)
     store = app.state.store
 
     with TestClient(app) as client:
+        authorize_client(client, ordering=True)
         assert client.get("/api/v1/health").json()["self_join_enabled"] is True
         joined = client.post("/api/v1/join", json={"device_name": "客厅平板"})
         assert joined.status_code == 200
@@ -87,7 +89,7 @@ def test_self_join_can_be_locked_without_revoking_existing_devices(tmp_path: Pat
         assert client.post("/api/v1/sync", headers=headers, json={"cursor": 0, "operations": []}).status_code == 200
 
 
-def test_api_starts_degraded_and_health_remains_available_when_index_fails(tmp_path: Path, monkeypatch) -> None:
+def test_api_starts_degraded_and_health_remains_available_when_index_fails(tmp_path: Path, monkeypatch, authorize_client) -> None:
     app = create_app(tmp_path, start_background_indexer=False)
 
     def failing_index():
@@ -95,6 +97,7 @@ def test_api_starts_degraded_and_health_remains_available_when_index_fails(tmp_p
 
     monkeypatch.setattr(app.state.store, "index_recipes", failing_index)
     with TestClient(app) as client:
+        authorize_client(client, ordering=True)
         response = client.get("/api/v1/health")
         assert response.status_code == 200
         state = response.json()["indexing"]
@@ -104,7 +107,7 @@ def test_api_starts_degraded_and_health_remains_available_when_index_fails(tmp_p
         assert "unavailable disk" in state["last_error"]
 
 
-def test_background_cold_scan_does_not_block_static_page_health_or_existing_menu(tmp_path: Path, monkeypatch) -> None:
+def test_background_cold_scan_does_not_block_static_page_health_or_existing_menu(tmp_path: Path, monkeypatch, authorize_client) -> None:
     static = tmp_path / "web"
     static.mkdir()
     (static / "index.html").write_text("<h1>菜单</h1>", encoding="utf-8")
@@ -131,6 +134,7 @@ def test_background_cold_scan_does_not_block_static_page_health_or_existing_menu
 
     def request_page():
         with TestClient(app) as client:
+            authorize_client(client, ordering=True)
             responses.extend([
                 client.get("/"), client.get("/api/v1/health"),
                 client.post("/api/v1/sync", headers={"Authorization": f"Bearer {device['access_token']}"},

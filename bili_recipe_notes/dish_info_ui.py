@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .ai_review_dashboard import _duration, preferred_review_batch, review_batch_summary
 from .config import UIConfig
+from .legacy_access import require_legacy_admin_session
 from .dish_info_runner import (
     list_dish_info_batches, resume_dish_info_batch, start_dish_info_batch, stop_dish_info_batch,
 )
@@ -32,6 +33,7 @@ def render_dish_info_dashboard(st, out_dir: str | Path, *, key_prefix: str = "di
 
     @st.fragment(run_every=f"{refresh_seconds}s" if refresh_seconds else None)
     def live() -> None:
+        require_legacy_admin_session(st)
         st.button("刷新介绍任务", key=f"{key_prefix}_refresh")
         try:
             batches = list_dish_info_batches(out_dir) if Path(out_dir).expanduser().is_dir() else []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 from dataclasses import asdict, dataclass, field
@@ -12,7 +13,8 @@ from urllib.parse import parse_qs, urlparse
 from .batch_queue import create_batch_state, load_batch_state, save_batch_state, selectable_items
 from .creator_paths import creator_directory, creator_uid
 from .data_paths import creators_dir, data_root, ensure_data_layout, recipes_dir
-from .history import find_history_by_url, find_history_record_by_url, is_raw_output
+from .history import find_history_by_url, find_history_record_by_url, is_raw_output, is_complete_output
+from .dish_recognition import PROMPT_VERSION as DISH_PROMPT_VERSION, identify_dishes, transcript_for_dish, dish_source_ranges, validate_dish_plan
 from .downloader import (
     CreatorCrawlResult,
     crawl_creator_videos,
@@ -30,7 +32,7 @@ from .llm import (
 )
 from .markdown_writer import render_markdown
 from .output_folders import rename_completed_output_folder
-from .output_layout import iter_output_folders
+from .output_layout import iter_output_folders, iter_source_output_folders, source_output_folder, load_dish_plan
 from .quality import write_quality_report
 from .recipe_extractor import Recipe, TranscriptSegment, extract_recipe_rule_based, extract_recipe_with_llm
 from .recipe_review import create_recipe_review
@@ -50,7 +52,7 @@ from .screenshot import (
     finished_dish_candidate_timestamps,
     step_candidate_timestamps,
 )
-from .storage import atomic_write_bytes, atomic_write_json, atomic_write_text
+from .storage import atomic_write_bytes, atomic_write_json, atomic_write_text, read_json
 from .subtitle import parse_subtitle_file
 from .transcriber import transcribe_audio
 from .utils import build_output_folder_name, ensure_dir
@@ -91,6 +93,7 @@ class RecipeJobResult:
     final_note: str
     job_path: Path | None = None
     stage_errors: list[str] | None = None
+    recipes: list[RecipeJobResult] = field(default_factory=list)
 
 
 @dataclass
@@ -280,6 +283,26 @@ def _has_existing_step_images(folder: Path, recipe: Recipe) -> bool:
 
 
 def _recipe_output_meets_requirements(folder: Path, options: RecipeJobOptions) -> bool:
+    plan_path = folder / "dish-plan.json"
+    if plan_path.exists():
+        try:
+            plan = load_dish_plan(folder)
+            transcript = _load_transcript(folder / "transcript.json")
+            metadata = _load_source_metadata(folder, options.url)
+            validate_dish_plan(plan, transcript, metadata)
+            if plan.get("input_fingerprint") != _dish_plan_fingerprint(transcript, metadata):
+                return False
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+        dishes = plan.get("dishes") or []
+        if plan.get("status") != "identified":
+            return False
+        if len(dishes) > 1:
+            return all(
+                is_complete_output(folder / "dishes" / str(dish["dish_id"]))
+                and _recipe_output_meets_requirements(folder / "dishes" / str(dish["dish_id"]), options)
+                for dish in dishes
+            )
     if not (options.require_llm or options.require_screenshot):
         return True
     job = _read_json_object(folder / "job.json")
@@ -382,7 +405,7 @@ def capture_raw_material(
         # separate migration and must not happen as a side effect of capture.
         existing_folder = next(
             (
-                candidate for candidate in iter_output_folders(options.out)
+                candidate for candidate in iter_source_output_folders(options.out)
                 if any(
                     str(_read_json_object(candidate / filename).get("source_url") or "").strip()
                     == options.url.strip()
@@ -497,7 +520,8 @@ def _load_source_metadata(folder: Path, fallback_url: str = "") -> dict:
         metadata = {
             key: job.get(key)
             for key in (
-                "source_url", "video_title", "uploader", "creator_name", "creator_uid", "bvid", "cid", "part_id", "part_label", "duration"
+                "source_url", "video_title", "uploader", "creator_name", "creator_uid", "bvid", "cid", "part_id", "part_label", "duration",
+                "dish_id", "target_dish_title", "source_time_ranges", "source_segment_ranges", "dish_index", "dish_count",
             )
         }
     if not metadata.get("source_url"):
@@ -505,22 +529,31 @@ def _load_source_metadata(folder: Path, fallback_url: str = "") -> dict:
     return metadata
 
 
-def generate_recipe_from_raw(
+def _generate_single_recipe_from_raw(
     output_folder: str | Path,
     options: RecipeJobOptions,
     log: LogCallback | None = None,
+    *,
+    selected_transcript: list[TranscriptSegment] | None = None,
+    selected_metadata: dict | None = None,
+    shared_media_dir: Path | None = None,
+    video_loader: Callable[[], Path] | None = None,
 ) -> RecipeJobResult:
     """Generate recipe artifacts from a previously completed raw stage."""
     folder = Path(output_folder)
+    if (folder / "recipe.json").exists():
+        # A crash can leave a saved recipe before note/job completion. It may
+        # already have been edited in the library; resume only missing artifacts.
+        return _complete_saved_recipe(folder, options)
     transcript_path = folder / "transcript.json"
-    transcript = _usable_transcript(_load_transcript(transcript_path))
+    transcript = selected_transcript if selected_transcript is not None else _usable_transcript(_load_transcript(transcript_path))
     if not transcript:
         raise PipelineStageError("load_raw", "transcript contains no usable text")
-    metadata = _load_source_metadata(folder, options.url)
+    metadata = dict(selected_metadata) if selected_metadata is not None else _load_source_metadata(folder, options.url)
     if options.creator_name:
         metadata["creator_name"] = options.creator_name
     source_url = str(metadata.get("source_url") or options.url)
-    media_dir = ensure_dir(folder / "media")
+    media_dir = ensure_dir(shared_media_dir or (folder / "media"))
     stage_errors: list[str] = []
     job = _read_json_object(folder / "job.json") or {
         "source_url": source_url,
@@ -562,19 +595,28 @@ def generate_recipe_from_raw(
             except Exception as exc:  # noqa: BLE001
                 raise PipelineStageError("extract_recipe", str(exc)) from exc
         recipe.creator_name = options.creator_name or str(metadata.get("creator_name") or metadata.get("uploader") or "") or None
+        # Source identity and boundaries are assigned by the validated discovery
+        # plan, never by the extraction model.
+        for key in ("dish_id", "dish_index", "dish_count", "source_time_ranges", "source_segment_ranges"):
+            if key in metadata:
+                setattr(recipe, key, metadata[key])
+        if metadata.get("target_dish_title"):
+            recipe.title = str(metadata["target_dish_title"])
 
         if options.require_screenshot and options.no_screenshot:
             raise PipelineStageError("screenshot", "step screenshots are required but disabled")
         if not options.no_screenshot and recipe.steps:
             try:
                 _emit(log, "Capturing step screenshots...")
-                video = download_lowres_video(source_url, media_dir, cookies=options.cookies)
-                capture_step_screenshots(video, recipe.steps, folder / "images", max_images=options.max_step_images)
+                video = video_loader() if video_loader else download_lowres_video(source_url, media_dir, cookies=options.cookies)
+                range_options = {"time_ranges": recipe.source_time_ranges} if recipe.source_time_ranges is not None else {}
+                capture_step_screenshots(video, recipe.steps, folder / "images", max_images=options.max_step_images, **range_options)
                 cover = capture_finished_dish_cover(
                     video,
                     recipe.steps,
                     folder / "images",
                     video_duration=float(metadata["duration"]) if metadata.get("duration") else None,
+                    **range_options,
                 )
                 if cover and (folder / "images" / "cover.jpg").is_file():
                     recipe.cover_image_path = "images/cover.jpg"
@@ -620,7 +662,7 @@ def generate_recipe_from_raw(
         )
         job_path = _write_job(folder, job)
         try:
-            renamed_folder = rename_completed_output_folder(folder)
+            renamed_folder = folder if metadata.get("dish_id") else rename_completed_output_folder(folder)
         except Exception as exc:  # noqa: BLE001
             stage_errors.append(f"output_folder: {exc}")
             job["stage_errors"] = stage_errors
@@ -641,12 +683,232 @@ def generate_recipe_from_raw(
         _write_job(folder, job)
         raise
     finally:
-        if not options.keep_media:
+        if not options.keep_media and shared_media_dir is None:
             shutil.rmtree(media_dir, ignore_errors=True)
 
 
-def generate_recipe_note(options: RecipeJobOptions, log: LogCallback | None = None) -> RecipeJobResult:
+def _dish_plan_fingerprint(transcript: list[TranscriptSegment], metadata: dict) -> str:
+    payload = {
+        "prompt_version": DISH_PROMPT_VERSION,
+        "source": {key: metadata.get(key) for key in ("source_url", "video_title", "description", "bvid", "cid", "part_id")},
+        "transcript": [_model_dump(segment) for segment in transcript],
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def _dish_metadata(metadata: dict, transcript: list[TranscriptSegment], dish: dict, index: int, count: int) -> dict:
+    ranges = dish_source_ranges(transcript, dish)
+    return {
+        **metadata,
+        "target_dish_title": dish["title"],
+        "dish_id": dish["dish_id"] if count > 1 else "",
+        "dish_index": index,
+        "dish_count": count,
+        "source_segment_ranges": dish["segment_ranges"],
+        "source_time_ranges": [{"start": span["start"], "end": span["end"]} for span in ranges],
+    }
+
+
+def _existing_recipe_result(folder: Path) -> RecipeJobResult:
+    return RecipeJobResult(
+        folder, folder / "note.md", folder / "recipe.json", folder / "transcript.json",
+        (folder / "note.md").read_text(encoding="utf-8"), folder / "job.json",
+        _read_json_object(folder / "job.json").get("stage_errors") or [],
+    )
+
+
+def _complete_saved_recipe(folder: Path, options: RecipeJobOptions) -> RecipeJobResult:
+    recipe = _load_recipe(folder / "recipe.json")
+    transcript = _load_transcript(folder / "transcript.json")
+    if not recipe.steps or not _usable_transcript(transcript):
+        raise PipelineStageError("validate_output", "已有草稿或字幕不完整，已保留现有内容，请先核对")
+    if not _recipe_output_meets_requirements(folder, options):
+        raise PipelineStageError("validate_output", "已有草稿未满足新的生成要求，已保留现有内容与人工决定")
+    note_path = folder / "note.md"
+    final_note = note_path.read_text(encoding="utf-8") if note_path.exists() else ""
+    if not final_note.strip():
+        final_note = normalize_markdown_image_paths(render_markdown(recipe))
+        atomic_write_text(note_path, final_note)
+    if options.enable_recipe_review and not (folder / "recipe.review.json").exists():
+        create_recipe_review(recipe, folder)
+    if not (folder / "quality.json").exists():
+        write_quality_report(folder)
+    job = _read_json_object(folder / "job.json")
+    _set_job_stage(job, "raw", "done")
+    _set_job_stage(job, "recipe", "done")
+    job.update({"status": "done", "error": None, "finished_at": _now(),
+                "note_path": str(note_path), "recipe_path": str(folder / "recipe.json"),
+                "transcript_path": str(folder / "transcript.json")})
+    _write_job(folder, job)
+    return _existing_recipe_result(folder)
+
+
+def generate_recipe_from_raw(
+    output_folder: str | Path,
+    options: RecipeJobOptions,
+    log: LogCallback | None = None,
+) -> RecipeJobResult:
+    """Discover dishes, then generate independently with durable per-dish progress."""
+    folder = Path(output_folder)
+    metadata = _load_source_metadata(folder, options.url)
+    # A child already has a validated scope. Legacy rule-only generation remains
+    # available when the user explicitly disables AI, but cannot bypass a plan.
+    plan_path = folder / "dish-plan.json"
+    if (folder / "dishes").exists() and not plan_path.exists():
+        raise PipelineStageError("identify_dishes", "已有分菜结果但识别计划缺失；已保留现有内容，请先恢复 dish-plan.json")
+    if (folder / "recipe.json").is_file() and is_complete_output(folder):
+        if plan_path.exists():
+            saved_transcript = _load_transcript(folder / "transcript.json")
+            saved_plan = read_json(plan_path, expected_type=dict)
+            validate_dish_plan(saved_plan, saved_transcript, metadata)
+            if saved_plan.get("input_fingerprint") != _dish_plan_fingerprint(saved_transcript, metadata):
+                raise PipelineStageError("identify_dishes", "原字幕或识别规则已变化，已保留生成结果，请在新的输出中重新识别")
+        if not _recipe_output_meets_requirements(folder, options):
+            raise PipelineStageError("validate_output", "已有菜谱未满足新的生成要求，已保留现有内容与人工决定")
+        return _existing_recipe_result(folder)
+    if metadata.get("dish_id") or (not _llm_extraction_enabled(options) and not plan_path.exists()):
+        if not metadata.get("dish_id"):
+            _emit(log, "未启用 AI：本次使用规则生成，未识别视频中的独立菜品数量。")
+        return _generate_single_recipe_from_raw(folder, options, log=log)
+    # Existing generated recipes are not silently split on an upgrade/retry.
+    if (folder / "recipe.json").is_file() and not plan_path.exists():
+        return _generate_single_recipe_from_raw(folder, options, log=log)
+
+    transcript = _load_transcript(folder / "transcript.json")
+    if not _usable_transcript(transcript):
+        raise PipelineStageError("load_raw", "transcript contains no usable text")
+    job = _read_json_object(folder / "job.json") or {"source_url": options.url, "started_at": _now()}
+    _set_job_stage(job, "raw", "done")
+    _set_job_stage(job, "recipe", "running")
+    job.update({"status": "recipe_running", "error": None, "finished_at": None})
+    _write_job(folder, job)
+    try:
+        fingerprint = _dish_plan_fingerprint(transcript, metadata)
+        plan = read_json(plan_path, expected_type=dict) if plan_path.exists() else {}
+        if plan and plan.get("input_fingerprint") != fingerprint and (folder / "dishes").exists():
+            raise PipelineStageError("identify_dishes", "字幕或识别规则已变化；已生成的分菜结果保留，请在新的输出中重新识别。")
+        if not plan or plan.get("status") != "identified" or plan.get("input_fingerprint") != fingerprint:
+            _emit(log, "正在识别字幕中独立制作的菜品及各自片段…")
+            plan = identify_dishes(
+                transcript, metadata, provider=options.llm_provider if _llm_extraction_enabled(options) else "none",
+                openai_model=options.openai_model, local_llm_command=options.local_llm_command,
+                codex_model=options.codex_model, codex_profile=options.codex_profile,
+                cli_extra_instructions=options.llm_cli_extra_instructions,
+            )
+            plan["input_fingerprint"] = fingerprint
+            plan["created_at"] = _now()
+            for dish in plan.get("dishes") or []:
+                dish.update({"output_folder": f"dishes/{dish['dish_id']}" if len(plan["dishes"]) > 1 else ".",
+                             "status": "pending", "error": None})
+            atomic_write_json(plan_path, plan)
+        if plan.get("status") != "identified" or not plan.get("dishes"):
+            raise PipelineStageError("identify_dishes", str(plan.get("reason") or "菜品数量或边界待确认"))
+        try:
+            validate_dish_plan(plan, transcript, metadata)
+        except ValueError as exc:
+            raise PipelineStageError("identify_dishes", f"菜品识别计划校验失败：{exc}") from exc
+        dishes = plan["dishes"]
+        # Check persisted IDs before using them as paths, including resumed plans.
+        if any(not re.fullmatch(r"dish-[a-f0-9]{12}", str(dish.get("dish_id", ""))) for dish in dishes):
+            raise PipelineStageError("identify_dishes", "已保存的菜品标识无效")
+        if len({dish["dish_id"] for dish in dishes}) != len(dishes):
+            raise PipelineStageError("identify_dishes", "已保存的菜品标识重复")
+        _emit(log, f"识别到 {len(dishes)} 道菜：" + "、".join(dish["title"] for dish in dishes))
+        if len(dishes) == 1:
+            result = _generate_single_recipe_from_raw(
+                folder, options, log=log,
+                selected_transcript=transcript_for_dish(transcript, dishes[0]),
+                selected_metadata=_dish_metadata(metadata, transcript, dishes[0], 1, 1),
+            )
+            dishes[0].update({"status": "done", "error": None})
+            atomic_write_json(result.output_folder / "dish-plan.json", plan)
+            return result
+
+        results: list[RecipeJobResult] = []
+        errors: list[str] = []
+        video: Path | None = None
+        media_dir = folder / "media"
+
+        def load_video() -> Path:
+            nonlocal video
+            if video is None:
+                video = download_lowres_video(str(metadata.get("source_url") or options.url), ensure_dir(media_dir), cookies=options.cookies)
+            return video
+
+        for index, dish in enumerate(dishes, start=1):
+            child = folder / "dishes" / dish["dish_id"]
+            if child.is_symlink() or (folder / "dishes").is_symlink():
+                raise PipelineStageError("identify_dishes", "菜品输出目录不能是符号链接")
+            dish.update({"status": "running", "error": None})
+            atomic_write_json(plan_path, plan)
+            _emit(log, f"[{index}/{len(dishes)}] 正在生成：{dish['title']}")
+            try:
+                scoped = transcript_for_dish(transcript, dish)
+                source = _dish_metadata(metadata, transcript, dish, index, len(dishes))
+                ensure_dir(child)
+                for name, value in (("source.json", source), ("transcript.json", [_model_dump(s) for s in scoped])):
+                    target = child / name
+                    if target.exists():
+                        if read_json(target) != value:
+                            raise PipelineStageError("identify_dishes", "子菜谱来源与已保存的识别计划不一致，已保留现有结果")
+                    else:
+                        atomic_write_json(target, value)
+                if is_complete_output(child):
+                    if not _recipe_output_meets_requirements(child, options):
+                        raise PipelineStageError("validate_output", "已有菜谱未满足新的生成要求，已保留现有内容与人工决定")
+                    _emit(log, f"[{index}/{len(dishes)}] 保留已完成菜谱：{dish['title']}")
+                    dish.update({"status": "done", "error": None})
+                    results.append(_existing_recipe_result(child))
+                    atomic_write_json(plan_path, plan)
+                    continue
+                if not (child / "job.json").exists():
+                    child_job = {**source, "status": "raw_ready", "started_at": _now()}
+                    _set_job_stage(child_job, "raw", "done")
+                    _write_job(child, child_job)
+                result = _generate_single_recipe_from_raw(
+                    child, options, log=log, shared_media_dir=media_dir, video_loader=load_video,
+                )
+                results.append(result)
+                dish.update({"status": "done", "error": None})
+            except Exception as exc:
+                dish.update({"status": "failed", "error": str(exc)})
+                errors.append(f"{dish['title']}: {exc}")
+                _emit(log, f"本菜生成失败，继续其余菜品：{errors[-1]}")
+            atomic_write_json(plan_path, plan)
+        job.update({"dish_count": len(dishes), "recipe_count": len(results), "dish_plan_path": "dish-plan.json"})
+        if errors:
+            raise PipelineStageError("generate_dishes", f"已完成 {len(results)}/{len(dishes)} 道；" + "；".join(errors))
+        _set_job_stage(job, "recipe", "done")
+        job.update({"status": "done", "error": None, "finished_at": _now()})
+        _write_job(folder, job)
+        first = results[0]
+        return RecipeJobResult(folder, first.note_path, first.recipe_path, folder / "transcript.json",
+                               first.final_note, folder / "job.json", [], recipes=results)
+    except Exception as exc:
+        _set_job_stage(job, "recipe", "failed", str(exc))
+        job.update({"status": "failed", "error": str(exc), "finished_at": _now()})
+        _write_job(folder, job)
+        raise
+    finally:
+        if not options.keep_media:
+            shutil.rmtree(folder / "media", ignore_errors=True)
+
+
+def generate_recipe_note(
+    options: RecipeJobOptions, log: LogCallback | None = None, *,
+    stage_callback: StageCallback | None = None,
+) -> RecipeJobResult:
+    existing = find_history_record_by_url(options.out, options.url)
+    if existing is not None and is_raw_output(existing.output_folder):
+        _emit(log, f"复用已有字幕和来源：{existing.output_folder}")
+        if stage_callback:
+            stage_callback("raw", "done", existing.output_folder, None)
+            stage_callback("recipe", "running", existing.output_folder, None)
+        return generate_recipe_from_raw(existing.output_folder, options, log=log)
     raw = capture_raw_material(options, log=log, preserve_media=options.keep_media)
+    if stage_callback:
+        stage_callback("raw", "done", raw.output_folder, None)
+        stage_callback("recipe", "running", raw.output_folder, None)
     return generate_recipe_from_raw(raw.output_folder, options, log=log)
 
 
@@ -764,14 +1026,14 @@ def _process_batch_url(
             note_path=complete_existing.note_path,
         )
     existing = find_history_record_by_url(options.out, url) if options.skip_existing else None
-    folder = output_folder or (existing.output_folder if existing else None)
+    folder = source_output_folder(output_folder) if output_folder else (existing.output_folder if existing else None)
     try:
         if folder and is_raw_output(folder):
             notify("raw", "done", folder)
         else:
             notify("raw", "running", folder)
             if options.target_stage == "recipe":
-                result = generate_recipe_note(job_options, log=log)
+                result = generate_recipe_note(job_options, log=log, stage_callback=notify)
                 folder = result.output_folder
                 notify("raw", "done", folder)
                 notify("recipe", "done", folder)
@@ -800,6 +1062,9 @@ def _process_batch_url(
         notify("recipe", "done", folder)
         return BatchJobItemResult(url=url, status="done", output_folder=folder, note_path=result.note_path)
     except Exception as exc:  # noqa: BLE001
+        if folder is None:
+            recovered = find_history_record_by_url(options.out, url)
+            folder = recovered.output_folder if recovered else None
         failed_stage = "recipe" if folder and is_raw_output(folder) and options.target_stage == "recipe" else "raw"
         notify(failed_stage, "failed", folder, str(exc))
         _emit(log, f"Failed: {exc}")
@@ -865,7 +1130,7 @@ def _run_persistent_batch(options: BatchJobOptions, log: LogCallback | None = No
     if isinstance(stage_options, dict):
         stage_options[options.target_stage] = _batch_options_snapshot(options)
 
-    if options.target_stage == "recipe" and (options.require_llm or options.require_screenshot):
+    if options.target_stage == "recipe":
         for item in state.items:
             if (
                 item.stages["raw"].status != "done"
@@ -920,6 +1185,7 @@ def _run_persistent_batch(options: BatchJobOptions, log: LogCallback | None = No
             if folder:
                 item.output_folder = str(folder)
             item.error = error
+            save_batch_state(state)
 
         result = _process_batch_url(
             options,
@@ -1040,6 +1306,15 @@ def regenerate_recipe_from_transcript(output_folder: str | Path) -> RecipeJobRes
         "uploader": old_recipe.uploader if old_recipe else None,
         "recipe_title": old_recipe.title if old_recipe else folder.name,
     }
+    if old_recipe is not None:
+        for key in ("dish_id", "dish_index", "dish_count", "source_time_ranges", "source_segment_ranges", "creator_name"):
+            metadata[key] = getattr(old_recipe, key)
+        if old_recipe.source_time_ranges is not None:
+            transcript = [segment for segment in transcript if any(
+                span["start"] <= segment.start < span["end"] and segment.end <= span["end"]
+                for span in old_recipe.source_time_ranges
+            )]
+            metadata["target_dish_title"] = old_recipe.title
     recipe = extract_recipe_rule_based(transcript, metadata)
     atomic_write_json(recipe_path, _model_dump(recipe))
     final_note = normalize_markdown_image_paths(render_markdown(recipe))
@@ -1118,7 +1393,8 @@ def suggest_step_screenshots(
     step = recipe.steps[step_index - 1]
     next_start = recipe.steps[step_index].start_time if step_index < len(recipe.steps) else None
     try:
-        return generate_screenshot_candidates(video, step_candidate_timestamps(step, next_start))
+        range_options = {"time_ranges": recipe.source_time_ranges} if recipe.source_time_ranges is not None else {}
+        return generate_screenshot_candidates(video, step_candidate_timestamps(step, next_start, **range_options))
     finally:
         _cleanup_temporary_screenshot_video(video, downloaded, keep_video)
 
@@ -1126,12 +1402,19 @@ def suggest_step_screenshots(
 def recipe_cover_candidate_timestamps(recipe: Recipe, video_duration: float | None = None) -> list[float]:
     """Build a compact review set from the opening reveal and finished-dish stages."""
 
-    timestamps = finished_dish_candidate_timestamps(recipe.steps, video_duration)
+    range_options = {"time_ranges": recipe.source_time_ranges} if recipe.source_time_ranges is not None else {}
+    timestamps = finished_dish_candidate_timestamps(recipe.steps, video_duration, **range_options)
     opening = [2.0, 4.5, 7.0, 10.0, 15.0]
+    if recipe.source_time_ranges is not None:
+        opening = [float(span["start"]) + offset for span in recipe.source_time_ranges for offset in (0.0, 2.0, 4.5)
+                   if float(span["start"]) + offset < float(span["end"])]
     if video_duration:
         opening = [value for value in opening if value < max(1.0, video_duration - 1.0)]
     timestamps.extend(opening)
-    return sorted({round(max(0.0, value), 2) for value in timestamps})[:16]
+    values = sorted({round(max(0.0, value), 2) for value in timestamps})
+    if recipe.source_time_ranges is not None:
+        values = [value for value in values if any(float(span["start"]) <= value < float(span["end"]) for span in recipe.source_time_ranges)]
+    return values[:16]
 
 
 def suggest_recipe_cover_screenshots(

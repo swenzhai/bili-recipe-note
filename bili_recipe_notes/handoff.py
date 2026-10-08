@@ -24,10 +24,10 @@ from .batch_queue import (
     now_utc,
     save_batch_state,
 )
-from .history import is_complete_output, is_raw_output
+from .history import completed_recipe_folders, is_complete_output, is_raw_output
 from .creator_paths import creator_directory
 from .data_paths import creators_dir, exports_dir, state_dir
-from .output_layout import iter_output_folders
+from .output_layout import iter_output_folders, iter_source_output_folders, load_dish_plan, source_output_folder
 from .storage import CorruptDataError, atomic_write_json, backup_path, read_json
 from .utils import sanitize_filename
 
@@ -46,6 +46,8 @@ PORTABLE_FILE_NAMES = {
     "note.md",
     "quality.json",
     "recipe.review.json",
+    "recipe.ai-review.json",
+    "dish-plan.json",
     "recipe.dish-info.json",
     "extra_analysis.md",
     "extra_analysis.json",
@@ -153,7 +155,8 @@ def _portable_files(folder: Path) -> list[Path]:
         relative = path.relative_to(folder)
         if any(part.startswith(".") for part in relative.parts) or path.name.endswith((".bak", ".tmp", ".lock")):
             continue
-        if path.name in PORTABLE_FILE_NAMES or (relative.parts and relative.parts[0] == "images"):
+        dish_image = len(relative.parts) >= 4 and relative.parts[0] == "dishes" and relative.parts[2] == "images"
+        if path.name in PORTABLE_FILE_NAMES or (relative.parts and relative.parts[0] == "images") or dish_image:
             files.append(path)
     return files
 
@@ -216,6 +219,8 @@ def export_batch_handoff(
     raw_count = 0
     for index, item in enumerate(state.items, start=1):
         folder = _resolve_output_folder(item.output_folder, root)
+        if folder is not None:
+            folder = source_output_folder(folder)
         stage = _artifact_stage(folder)
         archive_folder: str | None = None
         folder_name: str | None = None
@@ -415,7 +420,7 @@ def _existing_source_url(folder: Path) -> str:
 
 
 def _destination_folder(out_dir: Path, folder_name: str, url: str, metadata: dict[str, Any]) -> Path:
-    existing = next((folder for folder in iter_output_folders(out_dir) if _existing_source_url(folder) == url), None)
+    existing = next((folder for folder in iter_source_output_folders(out_dir) if _existing_source_url(folder) == url), None)
     if existing is not None:
         return existing
     parent = creator_directory(out_dir, metadata)
@@ -438,7 +443,13 @@ def _archive_creator_metadata(archive: zipfile.ZipFile, archive_folder: str) -> 
     return metadata
 
 
-def _restore_job_paths(folder: Path) -> None:
+def _restore_job_paths(folder: Path, *, skip_folders: set[Path] | None = None) -> None:
+    for output in iter_output_folders(folder):
+        if output not in (skip_folders or set()):
+            _restore_one_job_paths(output)
+
+
+def _restore_one_job_paths(folder: Path) -> None:
     path = folder / "job.json"
     if not path.is_file():
         return
@@ -557,6 +568,8 @@ def import_handoff_bundle(
             folder_name = str(raw_item.get("folder_name") or "")
             existing = existing_by_url.get(url)
             existing_folder = _resolve_output_folder(existing.output_folder, root) if existing else None
+            if existing_folder is not None:
+                existing_folder = source_output_folder(existing_folder)
             folder: Path | None = None
             imported_stage: str | None = None
             if declared_stage in {"raw", "recipe"} and archive_folder and folder_name:
@@ -576,13 +589,28 @@ def import_handoff_bundle(
                 local_rank = 2 if is_complete_output(folder) else 1 if is_raw_output(folder) else 0
                 incoming_rank = 2 if declared_stage == "recipe" else 1
                 if incoming_rank >= local_rank:
+                    preserved_dishes = {child for child in completed_recipe_folders(folder)
+                                        if source_output_folder(child) == folder and child != folder}
                     for name, info in members:
                         relative = PurePosixPath(name).relative_to(PurePosixPath(archive_folder))
                         destination = folder.joinpath(*relative.parts)
+                        if len(relative.parts) >= 3 and relative.parts[0] == "dishes":
+                            child = folder / "dishes" / relative.parts[1]
+                            if child in preserved_dishes:
+                                continue
+                            if destination.exists() and relative.name in {"recipe.ai-review.json", "recipe.review.json", "sync-meta.json", "archive.json"}:
+                                continue
                         if destination.exists():
                             backup_count += 1
                         _copy_member(archive, info, destination)
-                    _restore_job_paths(folder)
+                    if preserved_dishes:
+                        plan = load_dish_plan(folder)
+                        if plan:
+                            for dish in plan["dishes"]:
+                                if folder / "dishes" / dish["dish_id"] in preserved_dishes:
+                                    dish.update(status="done", error=None)
+                            atomic_write_json(folder / "dish-plan.json", plan)
+                    _restore_job_paths(folder, skip_folders=preserved_dishes)
                     restored_count += 1
                 imported_stage = _artifact_stage(folder)
 

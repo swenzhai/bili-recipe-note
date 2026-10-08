@@ -8,6 +8,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -23,6 +24,7 @@ from .mobile_sync import (
 from .branding import branding_payload, configured_logo_path
 from .config import load_config
 from .indexing_service import RecipeIndexSupervisor
+from .access_control import AccessControl, create_access_router
 
 
 class PairRequest(BaseModel):
@@ -54,6 +56,7 @@ def create_app(
     start_background_indexer: bool = True,
 ) -> FastAPI:
     store = MobileSyncStore(project_root, out_dir=out_dir, database_path=database_path)
+    access = AccessControl(store.project_root)
 
     indexer = RecipeIndexSupervisor(store)
 
@@ -76,13 +79,43 @@ def create_app(
     app.add_middleware(GZipMiddleware, minimum_size=1000)
     app.state.store = store
     app.state.indexer = indexer
+    app.state.access_control = access
+    app.include_router(create_access_router(access))
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError):
+        # Pydantic's default error payload includes rejected input. Passwords
+        # and setup tokens must never be echoed to a client or a proxy log.
+        return JSONResponse(status_code=422, content={"detail": [
+            {"loc": list(error["loc"]), "msg": error["msg"], "type": error["type"]}
+            for error in exc.errors()
+        ]})
 
     @app.middleware("http")
     async def private_network_only(request: Request, call_next):
         client_host = request.client.host if request.client else "127.0.0.1"
         if not is_private_client(client_host):
             return Response(status_code=status.HTTP_403_FORBIDDEN, content="Private network access only")
-        return await call_next(request)
+        try:
+            if request.url.path.startswith("/api/v1/") and request.url.path not in {
+                "/api/v1/health", "/api/v1/branding", "/api/v1/branding/logo",
+            }:
+                access.require_ordering(request)
+                origin = request.headers.get("origin")
+                if (request.headers.get("sec-fetch-site") == "cross-site"
+                        or (origin and origin != str(request.base_url).rstrip("/"))):
+                    raise HTTPException(403, "请从当前服务器页面访问点餐接口")
+            if request.url.path in {"/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"}:
+                access.require_admin(request)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail},
+                                headers={"Cache-Control": "no-store", "X-Kitchen-Access": "denied", **(exc.headers or {})})
+        response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "same-origin"
+        return response
 
     def authenticated_device(authorization: str | None = Header(default=None)) -> dict[str, Any]:
         if not authorization or not authorization.startswith("Bearer "):
@@ -93,15 +126,15 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
 
     @app.get("/api/v1/health")
-    def health() -> dict[str, Any]:
-        return {
+    def health(request: Request) -> dict[str, Any]:
+        result = {
             "schema_version": SCHEMA_VERSION,
             "protocol_version": PROTOCOL_VERSION,
-            "server_id": store.server_id,
-            "revision": store.current_revision(),
-            "self_join_enabled": store.self_join_enabled(),
-            "indexing": indexer.snapshot(),
         }
+        if access.ordering_access_allowed(request):
+            result.update(server_id=store.server_id, revision=store.current_revision(),
+                          self_join_enabled=store.self_join_enabled(), indexing=indexer.snapshot())
+        return result
 
     @app.get("/api/v1/index-status")
     def index_status(device: dict[str, Any] = Depends(authenticated_device)) -> dict[str, Any]:
@@ -156,12 +189,13 @@ def create_app(
         request: Request,
         device: dict[str, Any] = Depends(authenticated_device),
     ) -> StreamingResponse:
-        del device
-
         async def stream():
             last_revision = -1
             heartbeat = 0
             while not await request.is_disconnected():
+                if not await asyncio.to_thread(access.ordering_access_allowed, request):
+                    yield "event: access-denied\ndata: {}\n\n"
+                    break
                 revision = await asyncio.to_thread(store.current_revision)
                 if revision != last_revision:
                     yield f"event: revision\ndata: {json.dumps({'revision': revision})}\n\n"

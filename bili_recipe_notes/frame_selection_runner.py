@@ -15,12 +15,13 @@ from .ai_review_runner import _error_kind as _shared_error_kind, _identity
 from .batch_runner import _pid_is_alive
 from .cover_policy import has_manually_approved_cover
 from .data_paths import DATA_DIR_ENV, data_root, relocate_value
+from .frame_selection_eligibility import frame_selection_eligibility
 from .mobile_sync import recipe_visibility_states
 from .storage import atomic_write_json, file_lock, read_json
 
 _PROCESSES: dict[str, subprocess.Popen] = {}
 _ACTIVE = {"queued", "running"}
-_ITEM_STATES = {"pending", "running", "completed", "not_found", "skipped", "failed"}
+_ITEM_STATES = {"pending", "running", "completed", "not_found", "needs_review", "skipped", "failed"}
 
 
 
@@ -96,8 +97,11 @@ def _preflight_options(options: dict) -> dict:
 
 
 def _has_matching_candidate(root: Path, folder: Path, options: dict) -> bool:
+    from .frame_selection_service import SELECTION_STRATEGY_VERSION
+
     candidate = load_frame_candidate(root, folder)
-    if candidate is None or not isinstance(candidate.get("options"), dict):
+    if (candidate is None or not isinstance(candidate.get("options"), dict)
+            or candidate.get("selection_strategy_version") != SELECTION_STRATEGY_VERSION):
         return False
     try:
         previous = _normalize_options(candidate["options"])
@@ -122,11 +126,10 @@ def _active(state: dict) -> bool:
 
 def _write(root: Path, state: dict) -> dict:
     state.update(updated_at=_now(), total=len(state["items"]))
-    for status in ("completed", "failed", "skipped"):
+    for status in ("completed", "failed", "skipped", "not_found", "needs_review"):
         state[status] = sum(item["status"] == status for item in state["items"])
-    state["completed"] += sum(item["status"] == "not_found" for item in state["items"])
+    state["processed"] = sum(state[status] for status in ("completed", "failed", "skipped", "not_found", "needs_review"))
     state["pending"] = sum(item["status"] in {"pending", "running"} for item in state["items"])
-    state["not_found"] = sum(item["status"] == "not_found" for item in state["items"])
     atomic_write_json(_path(root, state["batch_id"]), state, backup=False)
     return state
 
@@ -153,7 +156,7 @@ def _finish(state: dict, status: str, **updates) -> None:
     state.update(status=status, current_folder=None, current_progress=None, finished_at=_now(), **updates)
     for run in state.get("runs", []):
         if run.get("run_token") == state.get("run_token"):
-            run.update(status=status, finished_at=state["finished_at"])
+            run.update(status=status, finished_at=state["finished_at"], run_processed=state.get("run_processed", 0))
 
 
 def list_frame_selection_batches(out_dir: str | Path) -> list[dict]:
@@ -177,8 +180,11 @@ def _launch(root: Path, state: dict) -> dict:
     token = uuid.uuid4().hex
     state.update(status="queued", run_token=token, pid=os.getpid(), process_start_id=_identity(os.getpid()),
                  stop_requested=False, current_folder=None, current_progress=None, error=None, pause_reason=None,
-                 finished_at=None, consecutive_failures=0)
-    state.setdefault("runs", []).append({"run_token": token, "started_at": _now(), "options": dict(state["options"])})
+                 finished_at=None, consecutive_failures=0, run_processed=0)
+    state.setdefault("run_limit", 0)
+    state.setdefault("runs", []).append({"run_token": token, "started_at": _now(), "options": dict(state["options"]),
+                                       "run_limit": state["run_limit"], "run_scope": state.get("run_scope", "pending"),
+                                       "run_targets": list(state.get("run_targets", []))})
     with file_lock(_path(root, state["batch_id"])):
         _write(root, state)
     args = [str(root), state["batch_id"], token]
@@ -208,24 +214,30 @@ def _manual_cover(folder: Path) -> bool:
 
 def start_frame_selection_batch(out_dir: str | Path, *, limit: int | None = 10, only_pending: bool = True,
                                 folders: list[str | Path] | None = None, published_only: bool = True,
-                                skip_confirmed: bool = True, **options) -> dict:
+                                skip_confirmed: bool = True, create_only: bool = False,
+                                run_limit: int = 0, **options) -> dict:
     root = _root(out_dir)
     options = _normalize_options(options)
     if limit is not None and (type(limit) is not int or limit <= 0):
         raise ValueError("本轮数量必须为正整数")
-    if any(type(value) is not bool for value in (only_pending, published_only, skip_confirmed)):
+    if type(run_limit) is not int or run_limit < 0:
+        raise ValueError("每次执行数量必须为非负整数，0 表示不限")
+    if any(type(value) is not bool for value in (only_pending, published_only, skip_confirmed, create_only)):
         raise ValueError("选帧范围设置必须为布尔值")
     with file_lock(_tasks(root) / "control", timeout=15):
         active = next((state for state in list_frame_selection_batches(root) if state["active"]), None)
-        if active:
+        if active and not create_only:
             return {**active, "already_running": True}
-        options = _preflight_options(options)
+        if not create_only:
+            options = _preflight_options(options)
         selected = [_folder(root, folder) for folder in folders] if folders is not None else None
         candidates = []
         for value, visible in recipe_visibility_states(root, folders=selected).items():
             if not visible.get("content_visible") or (published_only and not visible.get("published", True)):
                 continue
             folder = _folder(root, value)
+            if frame_selection_eligibility(folder, options["requirement"], visible):
+                continue
             # Errors in an individual recipe are persisted by the worker.
             try:
                 if skip_confirmed and _manual_cover(folder):
@@ -240,11 +252,14 @@ def start_frame_selection_batch(out_dir: str | Path, *, limit: int | None = 10, 
         state = {"schema_version": 1, "batch_id": "frame-" + uuid.uuid4().hex[:16], "out_dir": str(root),
                  "created_at": _now(), "status": "completed", "options": options, "only_pending": only_pending,
                  "published_only": published_only, "skip_confirmed": skip_confirmed, "stop_requested": False,
-                 "current_folder": None, "current_progress": None,
+                 "current_folder": None, "current_progress": None, "run_limit": run_limit, "run_processed": 0,
                  "items": [{"folder": folder.relative_to(root).as_posix(), "status": "pending"} for folder in candidates]}
-        if candidates:
+        if candidates and not create_only:
             return _launch(root, state)
-        _finish(state, "completed")
+        if candidates:
+            state["status"] = "pending"
+        else:
+            _finish(state, "completed")
         with file_lock(_path(root, state["batch_id"])):
             return {**_write(root, state), "active": False}
 
@@ -256,23 +271,50 @@ def stop_frame_selection_batch(out_dir: str | Path, batch_id: str) -> dict:
     return {**state, "active": _active(state)}
 
 
-def resume_frame_selection_batch(out_dir: str | Path, batch_id: str, *, retry_failed: bool = False, **options) -> dict:
+def resume_frame_selection_batch(out_dir: str | Path, batch_id: str, *, retry_failed: bool = False,
+                                 retry_not_found: bool = False, run_limit: int | None = None, **options) -> dict:
     root = _root(out_dir)
+    if run_limit is not None and (type(run_limit) is not int or run_limit < 0):
+        raise ValueError("每次执行数量必须为非负整数，0 表示不限")
+    if type(retry_not_found) is not bool or (retry_not_found and retry_failed):
+        raise ValueError("无匹配重试必须单独执行")
     with file_lock(_tasks(root) / "control", timeout=15):
         active = next((state for state in list_frame_selection_batches(root) if state["active"]), None)
         if active:
+            if retry_not_found:
+                raise RuntimeError("选帧任务正在运行，请暂停后再重试无匹配项")
             if active["batch_id"] != batch_id:
                 raise RuntimeError("当前目录已有选帧任务运行")
             return active
         state = _read(root, batch_id)
         state["options"] = _preflight_options(_normalize_options({**state["options"], **options}))
+        state["run_limit"] = state.get("run_limit", 0) if run_limit is None else run_limit
+        previous_targets = set(state.get("run_targets", [])) if state.get("run_scope") == "not_found" else set()
         for item in state["items"]:
             if item["status"] == "running" or (retry_failed and item["status"] == "failed"):
                 for attempt in item.get("attempts", []):
                     if not attempt.get("finished_at"):
                         attempt.update(status="interrupted", finished_at=_now())
-                item.update(status="pending", error=None, error_kind=None, finished_at=None)
-        return _launch(root, state) if any(item["status"] == "pending" for item in state["items"]) else {**state, "active": False}
+                item.update(status="not_found" if item["folder"] in previous_targets else "pending",
+                            error=None, error_kind=None, finished_at=None)
+        if retry_not_found:
+            # Resume an unfinished targeted round before retrying its already
+            # checked no-matches again. Original pending items stay untouched.
+            remaining = [item["folder"] for item in state["items"]
+                         if item["status"] == "not_found" and item["folder"] in previous_targets]
+            targets = remaining or [item["folder"] for item in state["items"] if item["status"] == "not_found"]
+            state.update(run_scope="not_found", run_targets=targets)
+        else:
+            state.update(run_scope="pending", run_targets=[])
+        return _launch(root, state) if _next_item_index(state) is not None else {**state, "active": False}
+
+
+def _next_item_index(state: dict) -> int | None:
+    if state.get("run_scope") == "not_found":
+        targets = set(state.get("run_targets", []))
+        return next((index for index, item in enumerate(state["items"])
+                     if item["status"] == "not_found" and item["folder"] in targets), None)
+    return next((index for index, item in enumerate(state["items"]) if item["status"] == "pending"), None)
 
 
 def _error_kind(exc: Exception) -> str:
@@ -306,11 +348,16 @@ def run_frame_selection_batch(out_dir: str | Path, batch_id: str, token: str) ->
         state = _read(root, batch_id)
         if state.get("run_token") != token:
             return state
-        index = next((i for i, item in enumerate(state["items"]) if item["status"] == "pending"), None)
-        if index is None or state.get("stop_requested"):
+        index = _next_item_index(state)
+        limit_reached = bool(state.get("run_limit") and state.get("run_processed", 0) >= state["run_limit"])
+        if index is None or state.get("stop_requested") or limit_reached:
+            has_pending = any(item["status"] == "pending" for item in state["items"])
+            paused = index is not None or has_pending
+            reason = ("requested" if state.get("stop_requested") else "batch_limit" if index is not None
+                      else "retry_scope_completed") if paused else None
             return _update(root, batch_id, lambda current: _finish(current,
-                "paused" if index is not None else "completed_with_errors" if current["failed"] else "completed",
-                pause_reason="requested" if index is not None else None), token=token)
+                "paused" if paused else "completed_with_errors" if current["failed"] else "completed",
+                pause_reason=reason), token=token)
         name = state["items"][index]["folder"]
 
         def starting(current):
@@ -341,15 +388,18 @@ def run_frame_selection_batch(out_dir: str | Path, batch_id: str, token: str) ->
                 visible = recipe_visibility_states(root, folders=[folder])[str(folder)]
                 if not visible.get("content_visible") or (state["published_only"] and not visible.get("published", True)):
                     result = {"status": "skipped", "error": None, "skip_reason": "not_visible_or_published"}
+                elif reason := frame_selection_eligibility(folder, state["options"]["requirement"], visible):
+                    result = {"status": "skipped", "error": None, "skip_reason": reason}
                 elif state["skip_confirmed"] and _manual_cover(folder):
                     result = {"status": "skipped", "error": None, "skip_reason": "manually_confirmed"}
-                elif state["only_pending"] and _has_matching_candidate(root, folder, state["options"]):
+                elif (state.get("run_scope") != "not_found" and state["only_pending"]
+                      and _has_matching_candidate(root, folder, state["options"])):
                     result = {"status": "skipped", "error": None, "skip_reason": "valid_candidate"}
                 else:
                     candidate = generate_frame_candidate(folder, out_dir=root, options=state["options"], progress=progress)
-                    if candidate.get("status") not in {"ok", "not_found"}:
+                    if candidate.get("status") not in {"ok", "not_found", "needs_review"}:
                         raise ValueError("选帧结果状态无效")
-                    result = {"status": "not_found" if candidate["status"] == "not_found" else "completed", "error": None, "result_status": candidate["status"],
+                    result = {"status": "completed" if candidate["status"] == "ok" else candidate["status"], "error": None, "result_status": candidate["status"],
                               **{key: candidate.get(key) for key in ("image_path", "timestamp", "reason", "run_id", "result_path", "stdout_path", "stderr_path")}}
             except Exception as exc:
                 result = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"[:2000], "error_kind": _error_kind(exc)}
@@ -366,7 +416,10 @@ def run_frame_selection_batch(out_dir: str | Path, batch_id: str, token: str) ->
 
         def finished(current):
             current["items"][index].update(result, finished_at=_now())
+            if current.get("run_scope") == "not_found":
+                current["run_targets"] = [folder for folder in current.get("run_targets", []) if folder != name]
             current.update(current_folder=None, current_progress=None)
+            current["run_processed"] = current.get("run_processed", 0) + 1
             current["consecutive_failures"] = current.get("consecutive_failures", 0) + 1 if result["status"] == "failed" else 0
             if result.get("error_kind") == "configuration" or current["consecutive_failures"] >= 5:
                 _finish(current, "paused", error="连续失败或选帧环境配置有误，请检查后重试",

@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from conftest import authenticate_streamlit_app
+
 from bili_recipe_notes import ai_review_ui, ai_review_dashboard
 from bili_recipe_notes.history import scan_history
 from bili_recipe_notes.review_policy import (
@@ -52,6 +54,7 @@ def _open_page(out_dir: Path, **state) -> AppTest:
         "render_ai_review_page(st, UIConfig(out_dir=st.session_state['test_out_dir']))\n",
         default_timeout=15,
     )
+    authenticate_streamlit_app(at)
     at.session_state["test_out_dir"] = str(out_dir)
     for key, value in state.items():
         at.session_state[key] = value
@@ -260,10 +263,18 @@ def test_next_pending_record_clears_search_and_moves_to_review_queue(tmp_path: P
 
 
 def test_public_pages_hide_ai_classified_content_by_default(tmp_path: Path) -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from conftest import authenticate_business_client
     from bili_recipe_notes import ui
 
     _write_recipe(tmp_path, "探店", hidden=True)
-    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20).run()
+    with TestClient(FastAPI()) as client:
+        authenticate_business_client(client, Path.cwd())
+        token = client.cookies.get("chef_admin_session")
+    at = AppTest.from_file(str(Path(ui.__file__)), default_timeout=20)
+    at.session_state["_legacy_admin_session"] = token
+    at.run()
     next(widget for widget in at.text_input if widget.label == "输出目录").set_value(str(tmp_path))
     at.selectbox(key="main_page").set_value("菜谱库全览").run()
     assert not at.exception

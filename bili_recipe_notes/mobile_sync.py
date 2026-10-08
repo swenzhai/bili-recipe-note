@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .output_layout import iter_output_folders
+from .output_layout import DISH_PLAN_FILE_NAME, iter_output_folders, load_dish_plan, source_output_folder
 
 import hashlib
 import hmac
@@ -570,6 +570,19 @@ class MobileSyncStore:
 
     # Recipe indexing
     def _source_identity(self, recipe: dict[str, Any], job: dict[str, Any]) -> str | None:
+        identity = self._video_identity(recipe, job)
+        identities = [value for value in (recipe.get("dish_id"), job.get("dish_id")) if value is not None]
+        if any(not isinstance(value, str) for value in identities):
+            raise ValueError("菜品标识必须是字符串")
+        identities = [value.strip() for value in identities if value.strip()]
+        if len(set(identities)) > 1:
+            raise ValueError("菜谱与任务的菜品标识不一致")
+        dish_id = next(iter(identities), None)
+        if dish_id and identity:
+            return f"{identity}:dish:{dish_id.strip()}"
+        return identity
+
+    def _video_identity(self, recipe: dict[str, Any], job: dict[str, Any]) -> str | None:
         bvid = str(job.get("bvid") or "").strip().lower()
         cid = str(job.get("cid") or "").strip()
         part_id = str(job.get("part_id") or "").strip()
@@ -592,12 +605,16 @@ class MobileSyncStore:
         metadata_path = folder / SYNC_META_FILE_NAME
         metadata = _read_object(metadata_path)
         existing = str(metadata.get("recipe_id") or "").strip()
+        identity = self._source_identity(recipe, job)
+        if source_output_folder(folder) != folder and not (recipe.get("dish_id") or job.get("dish_id")):
+            raise ValueError("子菜谱缺少稳定菜品标识，保留已有菜单并等待修复")
+        if existing and source_output_folder(folder) != folder and metadata.get("source_identity") != identity:
+            raise ValueError("子菜谱同步标识与来源不匹配，保留已有菜单并等待修复")
         try:
             if existing:
                 return str(uuid.UUID(existing))
         except ValueError:
             pass
-        identity = self._source_identity(recipe, job)
         recipe_id = str(uuid.uuid5(RECIPE_NAMESPACE, identity)) if identity else str(uuid.uuid4())
         atomic_write_json(
             metadata_path,
@@ -686,6 +703,7 @@ class MobileSyncStore:
             "recipe.json", "source.json", "job.json", AI_REVIEW_FILE_NAME,
             "transcript.json", "note.md", SYNC_META_FILE_NAME, DISH_INFO_FILE_NAME,
         )]
+        dependencies.append(source_output_folder(folder) / DISH_PLAN_FILE_NAME)
         images = [step.get("screenshot_path") for step in recipe["steps"] if isinstance(step, dict)]
         if has_manually_approved_cover(recipe):
             images.append(recipe.get("cover_image_path"))
@@ -741,6 +759,7 @@ class MobileSyncStore:
     def _index_recipes(self) -> dict[str, Any]:
         candidates: dict[str, list[_RecipeCandidate]] = {}
         failed_folders: set[Path] = set()
+        failed_collections: set[Path] = set()
         protected_ids: set[str] = set()
         errors: list[dict[str, str]] = []
         cache_hits = rebuilt = 0
@@ -761,6 +780,23 @@ class MobileSyncStore:
                 raise OSError("菜谱输出目录暂不可用，保留现有菜单")
             folders = []
         observed: set[Path] = set()
+        for folder in folders:
+            if source_output_folder(folder) != folder:
+                continue
+            try:
+                plan = load_dish_plan(folder)
+                if (folder / "dishes").is_dir() and plan is None:
+                    raise ValueError("多菜来源缺少菜品计划，保留此前索引")
+                if len((plan or {}).get("dishes", [])) > 1:
+                    for dish in plan["dishes"]:
+                        child = folder / "dishes" / dish["dish_id"]
+                        if not (child / "recipe.json").is_file():
+                            failed_folders.add(child)
+                            if dish.get("status") == "done":
+                                errors.append({"folder": str(child), "error": "已完成的子菜谱暂不可读，保留此前索引"})
+            except (OSError, UnicodeError, ValueError, TypeError) as exc:
+                failed_collections.add(folder)
+                errors.append({"folder": str(folder), "error": f"{type(exc).__name__}: {exc}"})
         for folder in folders:
             if folder.name.startswith("."):
                 continue
@@ -801,7 +837,9 @@ class MobileSyncStore:
         with self._write_connection() as connection:
             existing = {str(row["id"]): row for row in connection.execute("SELECT * FROM recipes")}
             protected_ids.update(
-                recipe_id for recipe_id, row in existing.items() if Path(row["output_folder"]) in failed_folders
+                recipe_id for recipe_id, row in existing.items()
+                if Path(row["output_folder"]) in failed_folders
+                or source_output_folder(Path(row["output_folder"])) in failed_collections
             )
             # A broken recipe must not erase its last good payload, but an
             # explicit human hide still applies to that retained payload.

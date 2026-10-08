@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import math
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -293,12 +294,61 @@ def screenshot_preference_score(candidate: ScreenshotCandidate) -> float:
     return candidate.score - SUBTITLE_SCORE_PENALTY * candidate.subtitle_score
 
 
+def _validated_time_ranges(time_ranges: list[dict] | None) -> list[dict] | None:
+    if time_ranges is None:
+        return None
+    if not isinstance(time_ranges, list) or not time_ranges:
+        raise ValueError("截图的菜品时间范围不能为空")
+    ranges = []
+    for span in time_ranges:
+        if not isinstance(span, dict):
+            raise ValueError("截图的菜品时间范围无效")
+        start, end = span.get("start"), span.get("end")
+        if (any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+                for value in (start, end)) or start < 0 or end <= start):
+            raise ValueError("截图的菜品时间范围无效")
+        if ranges and start < ranges[-1]["end"]:
+            raise ValueError("截图的菜品时间范围重叠或乱序")
+        ranges.append({"start": float(start), "end": float(end)})
+    return ranges
+
+
+def _rounded_inside(value: float, start: float, end: float) -> float:
+    rounded = round(value, 2)
+    # Tiny subtitle spans still need a value strictly before the next dish. Do
+    # not round a legal timestamp onto the exclusive end (or before the start).
+    return rounded if start <= rounded < end else min(max(value, start), math.nextafter(end, start))
+
+
 def step_candidate_timestamps(
     step: RecipeStep,
     next_step_start: float | None = None,
     *,
     count: int = DEFAULT_CANDIDATES_PER_STEP,
+    time_ranges: list[dict] | None = None,
 ) -> list[float]:
+    ranges = _validated_time_ranges(time_ranges)
+    if ranges is not None:
+        start = float(step.start_time)
+        if not math.isfinite(start) or start < 0:
+            raise ValueError("截图步骤时间无效")
+        span = next((span for span in ranges if span["start"] <= start < span["end"]), None)
+        if span is None:
+            return []
+        end = step.end_time if step.end_time is not None and step.end_time > start else next_step_start
+        if end is None or end <= start:
+            end = start + 7.0
+        if not math.isfinite(end):
+            raise ValueError("截图步骤时间无效")
+        # next_step_start can refer to the same dish after another dish's scene.
+        end = min(float(end), span["end"])
+        width = end - start
+        lower = start + min(0.6, width * 0.2)
+        upper = end - min(0.35, width * 0.1)
+        count = max(1, int(count))
+        values = ([(lower + upper) / 2] if count == 1 else
+                  [lower + (upper - lower) * index / (count - 1) for index in range(count)])
+        return sorted({_rounded_inside(value, start, end) for value in values})
     start = max(0.0, float(step.start_time))
     explicit_end = float(step.end_time) if step.end_time is not None else None
     end = explicit_end if explicit_end is not None and explicit_end > start + 0.5 else next_step_start
@@ -342,16 +392,19 @@ def generate_screenshot_candidates(
 def finished_dish_candidate_timestamps(
     steps: list[RecipeStep],
     video_duration: float | None = None,
+    *,
+    time_ranges: list[dict] | None = None,
 ) -> list[float]:
     """Choose late, food-relevant moments instead of early preparation frames."""
 
+    ranges = _validated_time_ranges(time_ranges)
     timestamps: list[float] = []
     for reverse_index, step_index in enumerate(range(len(steps) - 1, -1, -1)):
         step = steps[step_index]
         text = f"{step.title} {step.action}"
         if reverse_index < 2 or any(keyword in text for keyword in FINISHED_DISH_KEYWORDS):
             next_start = steps[step_index + 1].start_time if step_index + 1 < len(steps) else None
-            candidates = step_candidate_timestamps(step, next_start, count=4)
+            candidates = step_candidate_timestamps(step, next_start, count=4, time_ranges=ranges)
             timestamps.extend(candidates[-2:])
         if len(timestamps) >= 5:
             break
@@ -359,6 +412,15 @@ def finished_dish_candidate_timestamps(
     if steps:
         final_step = steps[-1]
         final_step_end = float(final_step.end_time or (final_step.start_time + 7.0))
+    if ranges is not None:
+        final_span = ranges[-1]
+        start, end = final_span["start"], final_span["end"]
+        if final_step_end >= start + (end - start) * 0.55:
+            timestamps.extend(_rounded_inside(start + (end - start) * ratio, start, end)
+                              for ratio in (0.72, 0.82, 0.9, 0.95))
+        return sorted({value for value in timestamps
+                       if (video_duration is None or value < video_duration)
+                       and any(span["start"] <= value < span["end"] for span in ranges)})
     if video_duration and video_duration > 10 and final_step_end >= video_duration * 0.55:
         timestamps.extend(video_duration * ratio for ratio in (0.72, 0.82, 0.9, 0.95))
     return sorted({round(max(0.0, value), 2) for value in timestamps})
@@ -370,12 +432,13 @@ def capture_finished_dish_cover(
     images_dir: Path,
     *,
     video_duration: float | None = None,
+    time_ranges: list[dict] | None = None,
 ) -> ScreenshotCandidate | None:
     """Capture a dedicated menu cover, biased toward the finished dish."""
 
+    timestamps = finished_dish_candidate_timestamps(steps, video_duration, time_ranges=time_ranges)
     cover_path = images_dir / "cover.jpg"
     cover_path.unlink(missing_ok=True)
-    timestamps = finished_dish_candidate_timestamps(steps, video_duration)
     candidates = generate_screenshot_candidates(
         video_path,
         timestamps,
@@ -432,7 +495,15 @@ def capture_step_screenshots(
     steps: list[RecipeStep],
     images_dir: Path,
     max_images: int = DEFAULT_MAX_STEP_IMAGES,
+    *,
+    time_ranges: list[dict] | None = None,
 ) -> None:
+    ranges = _validated_time_ranges(time_ranges)
+    selections = [
+        (index, step_candidate_timestamps(steps[index], steps[index + 1].start_time if index + 1 < len(steps) else None,
+                                         time_ranges=ranges))
+        for index in select_key_step_indices(steps, max_images=max_images)
+    ]
     images_dir.mkdir(parents=True, exist_ok=True)
     for pattern in ("step_*.jpg", "key_*.jpg"):
         for old_image in images_dir.glob(pattern):
@@ -442,10 +513,8 @@ def capture_step_screenshots(
         step.screenshot_time = None
         step.screenshot_status = None
         step.screenshot_score = None
-    for step_index in select_key_step_indices(steps, max_images=max_images):
+    for step_index, timestamps in selections:
         step = steps[step_index]
-        next_start = steps[step_index + 1].start_time if step_index + 1 < len(steps) else None
-        timestamps = step_candidate_timestamps(step, next_start)
         candidates = generate_screenshot_candidates(video_path, timestamps)
         best = candidates[0] if candidates else None
         if best is None or best.score < MIN_AUTOMATIC_SCREENSHOT_SCORE:
