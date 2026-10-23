@@ -456,6 +456,14 @@ Windows PowerShell 将最后一行替换为 `.\.venv\Scripts\python.exe -m bili_
 
 脚本会检查网页构建产物，创建 `.venv` 并安装需要的 Python 依赖，然后监听 `0.0.0.0:8765`。首次使用前先完成上述网页构建。Linux/macOS 若缺少执行权限，可对对应脚本运行 `chmod +x`。Linux/macOS 的服务输出追加到 `data/logs/admin-web.log`；后台任务仍使用各自持久状态。
 
+Linux 一键关闭网页后台（包含本工程的新版服务和旧版 Streamlit 管理页）：
+
+```bash
+./stop-ui-linux.sh
+```
+
+可从任意目录通过脚本的绝对路径执行。脚本按工程目录、当前用户和服务启动命令识别进程，发送正常退出信号，默认等待 15 秒；重复执行也可用。`--dry-run` 只查看将关闭的服务，`--timeout 30` 可延长等待；卡住时可用 `--force` 在等待超时后强制退出。独立生成、审核、介绍、选图和 UP 主清单任务会继续运行，需要暂停时先在任务中心操作；服务内的数据导出等任务会随服务退出而中断，可重启后继续或重试。
+
 默认配置保存到 `data/state/config.json`。完整页面映射、模块职责、数据位置和验证命令见 [React 管理界面说明](docs/react-admin-migration.md)，前端开发方式见 [web/README.md](web/README.md)。
 
 ### 旧版 Streamlit 管理页
