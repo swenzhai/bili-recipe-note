@@ -421,9 +421,9 @@ def run_frame_selection_batch(out_dir: str | Path, batch_id: str, token: str) ->
             current.update(current_folder=None, current_progress=None)
             current["run_processed"] = current.get("run_processed", 0) + 1
             current["consecutive_failures"] = current.get("consecutive_failures", 0) + 1 if result["status"] == "failed" else 0
-            if result.get("error_kind") == "configuration" or current["consecutive_failures"] >= 5:
-                _finish(current, "paused", error="连续失败或选帧环境配置有误，请检查后重试",
-                        pause_reason="configuration" if result.get("error_kind") == "configuration" else "consecutive_failures")
+            if result.get("error_kind") == "configuration":
+                _finish(current, "paused", error="选帧环境不可用，请检查后重试",
+                        pause_reason="configuration")
         state = _update(root, batch_id, finished, token=token)
         print(f"{_now()} {name}: {result.get('result_status', result['status'])}", flush=True)
         if state["status"] == "paused":

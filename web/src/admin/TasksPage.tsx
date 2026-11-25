@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { api, ApiError, post } from './api';
 import type { PageProps, TaskSummary } from './types';
 import './admin-tasks.css';
+import FrameEstimate from './FrameEstimate';
 
 const kinds: Record<string, string> = { generation: '采集与生成', review: 'AI 审核', frames: 'AI 选图', 'dish-info': '菜品介绍', creators: 'UP 主更新', settings: '数据与知识库' };
 const statuses: Record<string, string> = { pending: '待开始', queued: '排队中', running: '进行中', pausing: '完成当前条后暂停', paused: '已暂停', interrupted: '运行中断', completed: '已完成', completed_with_errors: '部分失败', failed: '失败', skipped: '已跳过', not_found: '无匹配画面', needs_review: '候选待确认', done: '已完成', raw_ready: '原始资料就绪' };
@@ -74,6 +75,9 @@ export default function TasksPage({ navigate }: PageProps) {
   const [provider, setProvider] = useState('');
   const [model, setModel] = useState('');
   const [requirement, setRequirement] = useState('找到一张制作完成的菜品特写，主体清晰；优先选择无遮挡、构图完整的画面，手、餐具或字幕仅在遮挡菜品主体时影响评价。');
+  const [generateCover, setGenerateCover] = useState(query.get('mode') === 'generate');
+  const [generationPrompt, setGenerationPrompt] = useState('Natural light, appetizing food photography, plain plate, no text.');
+  const [generationReference, setGenerationReference] = useState(true);
   const [frameModel, setFrameModel] = useState('');
   const [python, setPython] = useState('');
   const [device, setDevice] = useState('cpu');
@@ -91,7 +95,7 @@ export default function TasksPage({ navigate }: PageProps) {
   useEffect(() => {
     const create = new URLSearchParams(window.location.search).get('create');
     if (create) {
-      setShowCreate(true); setKind(create);
+      setShowCreate(true); setKind(create); setGenerateCover(new URLSearchParams(window.location.search).get('mode') === 'generate');
       const ids = (new URLSearchParams(window.location.search).get('recipe_ids') || new URLSearchParams(window.location.search).get('ids') || '').split(',').filter(Boolean);
       setLimit(0); setRunLimit(Math.min(10, ids.length || 10));
     }
@@ -151,7 +155,7 @@ export default function TasksPage({ navigate }: PageProps) {
     setBusy(true); setError(''); setNotice('');
     try {
       const options: Record<string, unknown> = kind === 'frames'
-        ? { requirement, device, threads, coarse_limit: coarse, fine_limit: fine, keep_video: keepVideo, skip_confirmed: skipConfirmed,
+        ? generateCover ? { backend: 'flux', generation_prompt: generationPrompt, generation_reference: generationReference, generation_auto_reference: generationReference, skip_confirmed: false, published_only: false } : { requirement, device, threads, coarse_limit: coarse, fine_limit: fine, keep_video: keepVideo, skip_confirmed: skipConfirmed,
             ...(frameModel.trim() ? { model: frameModel.trim() } : {}), ...(python.trim() ? { python_executable: python.trim() } : {}) }
         : { ...(provider ? { provider } : {}), ...(kind === 'dish-info' ? { web_search: webSearch } : {}),
             ...(model.trim() && ['codex', 'openai'].includes(provider) ? { [provider === 'codex' ? 'codex_model' : 'openai_model']: model.trim() } : {}) };
@@ -179,12 +183,13 @@ export default function TasksPage({ navigate }: PageProps) {
         <label className="adm-field">本批执行数量（0 表示全部）<input type="number" min="0" max="10000" value={runLimit} onChange={event => setRunLimit(Number(event.target.value))} /></label></div>
       <p className="adm-muted">默认将当前范围全部加入列表，先执行 10 条；达到本批数量后自动暂停，其余条目保留待执行。可在任务详情调整下一批数量并继续。</p>
       <label className="adm-task-check"><input type="checkbox" checked={onlyPending} onChange={event => setOnlyPending(event.target.checked)} />跳过已有有效结果</label>
-      {kind === 'frames' ? <><label className="adm-field">想选取什么画面<textarea value={requirement} required rows={2} onChange={event => setRequirement(event.target.value)} /></label>
+      {kind === 'frames' ? <><label className="adm-field">封面任务模式<select value={generateCover ? 'generate' : 'select'} onChange={event => setGenerateCover(event.target.value === 'generate')}><option value="select">从视频或 PDF 选图</option><option value="generate">AI 生成示意封面</option></select></label>{generateCover ? <><label className="adm-field">画面风格与补充要求<textarea value={generationPrompt} maxLength={2000} required onChange={event => setGenerationPrompt(event.target.value)} /></label><label className="adm-task-check"><input type="checkbox" checked={generationReference} onChange={event => setGenerationReference(event.target.checked)} />优先使用当前封面作为参考图，无图时按提示词生成</label><p className="adm-notice">每道菜生成 1 张 1024×1024 示意图，自动结合菜名、食材和做法；为所有可展示菜品生成独立候选，保留人工确认的封面。结果需在封面审核中确认，不是实拍照片。</p><p className="adm-muted">A30 单次实测约 40–90 秒/道（含加载，仅供参考）。预计本批：{duration((runLimit || limit || recipeIds.length) * 90 || null)}；启动后按实际完成耗时更新剩余时间。</p></> : <><label className="adm-field">想选取什么画面<textarea value={requirement} required rows={2} onChange={event => setRequirement(event.target.value)} /></label>
         <label className="adm-task-check"><input type="checkbox" checked={skipConfirmed} onChange={event => setSkipConfirmed(event.target.checked)} />保留已人工确认的封面</label>
         <p className="adm-muted">生成的候选图会等待人工裁剪与确认；“无匹配画面”会单独记录。</p>
-        <details><summary>视觉模型与采样设置</summary><div className="adm-form-grid"><label className="adm-field">本地视觉模型目录<input value={frameModel} placeholder="留空使用已配置模型" onChange={event => setFrameModel(event.target.value)} /></label><label className="adm-field">选帧 Python 解释器<input value={python} placeholder="留空使用独立选帧环境" onChange={event => setPython(event.target.value)} /></label><label className="adm-field">运行设备<select value={device} onChange={event => setDevice(event.target.value)}><option value="cpu">CPU</option><option value="cuda">CUDA</option></select></label><label className="adm-field">线程数<input type="number" min="1" value={threads} onChange={event => setThreads(Number(event.target.value))} /></label><label className="adm-field">粗筛候选帧数<input type="number" min="2" value={coarse} onChange={event => setCoarse(Number(event.target.value))} /></label><label className="adm-field">精筛候选帧数<input type="number" min="1" value={fine} onChange={event => setFine(Number(event.target.value))} /></label></div><label className="adm-task-check"><input type="checkbox" checked={keepVideo} onChange={event => setKeepVideo(event.target.checked)} />保留本次下载的视频，便于后续手工选图</label></details></>
+        <details><summary>视觉模型与采样设置</summary><div className="adm-form-grid"><label className="adm-field">本地视觉模型目录<input value={frameModel} placeholder="留空使用已配置模型" onChange={event => setFrameModel(event.target.value)} /></label><label className="adm-field">选帧 Python 解释器<input value={python} placeholder="留空使用独立选帧环境" onChange={event => setPython(event.target.value)} /></label><label className="adm-field">运行设备<select value={device} onChange={event => setDevice(event.target.value)}><option value="cpu">CPU</option><option value="cuda">CUDA</option></select></label><label className="adm-field">线程数<input type="number" min="1" value={threads} onChange={event => setThreads(Number(event.target.value))} /></label><label className="adm-field">粗筛候选帧数<input type="number" min="2" value={coarse} onChange={event => setCoarse(Number(event.target.value))} /></label><label className="adm-field">精筛候选帧数<input type="number" min="1" value={fine} onChange={event => setFine(Number(event.target.value))} /></label></div><label className="adm-task-check"><input type="checkbox" checked={keepVideo} onChange={event => setKeepVideo(event.target.checked)} />保留本次下载的视频，便于后续手工选图</label></details></>}</>
         : <><div className="adm-form-grid"><label className="adm-field">模型服务<select value={provider} onChange={event => setProvider(event.target.value)}><option value="">使用设置中的服务</option><option value="codex">Codex CLI</option><option value="opencode">OpenCode</option><option value="openai">OpenAI API</option><option value="local">本地命令</option></select></label>{['codex', 'openai'].includes(provider) && <label className="adm-field">模型名称<input value={model} placeholder="留空沿用设置" onChange={event => setModel(event.target.value)} /></label>}</div>
           {kind === 'dish-info' && <><label className="adm-task-check"><input type="checkbox" checked={webSearch} onChange={event => setWebSearch(event.target.checked)} />联网查找背景与起源</label><p className="adm-muted">联网结果保留出处和匹配提示；无法对应本菜时不补写背景。搜索失败仍会生成本菜简介。</p></>}</>}
+      {kind === 'frames' && !generateCover && <FrameEstimate total={recipeIds.length ? (limit > 0 ? Math.min(limit, recipeIds.length) : recipeIds.length) : limit > 0 ? limit : null} runLimit={runLimit} coarse={coarse} fine={fine} />}
       <div className="adm-actions"><button type="submit" value="run" className="adm-btn primary" disabled={busy}>{busy ? '正在安排…' : '加入并执行首批'}</button><button type="submit" value="queue" className="adm-btn secondary" disabled={busy}>仅加入待执行列表</button></div>
     </form>}
 

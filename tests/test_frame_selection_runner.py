@@ -456,7 +456,7 @@ def test_pause_during_retry_delay_does_not_restart_expensive_model(monkeypatch, 
     assert len(final["items"][0]["attempts"]) == 1
 
 
-def test_three_attempt_limit_and_five_consecutive_failures_pause(monkeypatch, tmp_path):
+def test_three_attempt_limit_and_consecutive_failures_continue(monkeypatch, tmp_path):
     for index in range(6):
         recipe(tmp_path, str(index))
     state = prepare(monkeypatch, tmp_path)
@@ -465,9 +465,9 @@ def test_three_attempt_limit_and_five_consecutive_failures_pause(monkeypatch, tm
     monkeypatch.setattr(runner, "generate_frame_candidate", generate)
     monkeypatch.setattr(runner.time, "sleep", lambda _: None)
     final = run(tmp_path, state)
-    assert final["status"] == "paused" and final["pause_reason"] == "consecutive_failures"
-    assert (final["failed"], final["pending"]) == (5, 1)
-    assert all(len(item["attempts"]) == 3 for item in final["items"][:5])
+    assert final["status"] == "completed_with_errors"
+    assert (final["failed"], final["pending"]) == (6, 0)
+    assert all(len(item["attempts"]) == 3 for item in final["items"])
 
 
 def test_crashed_worker_resumes_running_item_without_repeating_complete(monkeypatch, tmp_path):

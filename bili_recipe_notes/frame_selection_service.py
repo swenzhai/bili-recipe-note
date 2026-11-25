@@ -47,6 +47,16 @@ DEFAULT_OPTIONS = {
     "fine_limit": 8,
     "cookies": None,
     "keep_video": False,
+    "generation_prompt": "Natural light, appetizing food photography, plain plate, no text.",
+    "generation_seed": 42,
+    "generation_reference": False,
+    "generation_auto_reference": False,
+    "backend": "local",
+    "remote_acceleration": False,
+    "remote_engine": "auto",
+    "remote_host": None,
+    "remote_control_path": None,
+    "allow_fallback": False,
 }
 
 
@@ -66,6 +76,26 @@ def normalize_frame_options(options: dict | None = None) -> dict:
     if unknown:
         raise ValueError("未知选图参数：" + ", ".join(sorted(unknown)))
     values = {**DEFAULT_OPTIONS, **(options or {})}
+    if values["backend"] not in {"local", "remote", "flux"}:
+        raise ValueError("选图后端必须为 local、remote 或 flux")
+    if type(values["remote_acceleration"]) is not bool:
+        raise ValueError("remote_acceleration 必须是布尔值")
+    if values["remote_engine"] not in ("auto", "transformers", "vllm"):
+        raise ValueError("remote_engine 必须为 auto、transformers 或 vllm")
+    if values["remote_engine"] == "vllm" and values["remote_acceleration"]:
+        raise ValueError("vllm 使用独立环境，不能叠加 Transformers 加速依赖")
+    if type(values["allow_fallback"]) is not bool:
+        raise ValueError("allow_fallback 必须是布尔值")
+    if values["backend"] == "remote" and (not isinstance(values["remote_host"], str) or not re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+", values["remote_host"])):
+        raise ValueError("远端主机必须为 user@host")
+    if values["remote_control_path"] is not None and not isinstance(values["remote_control_path"], str):
+        raise ValueError("SSH control path 必须是字符串")
+    if not isinstance(values["generation_prompt"], str) or not 1 <= len(values["generation_prompt"].strip()) <= 2000:
+        raise ValueError("生成提示词必须为 1–2000 个字符")
+    if type(values["generation_seed"]) is not int or not 0 <= values["generation_seed"] <= 2147483640:
+        raise ValueError("生成种子无效")
+    if type(values["generation_reference"]) is not bool or type(values["generation_auto_reference"]) is not bool:
+        raise ValueError("参考图参数必须为布尔值")
     requirement = values["requirement"]
     if not isinstance(requirement, str) or not requirement.strip():
         raise ValueError("选图要求不能为空")
@@ -122,6 +152,9 @@ def _locations(out_dir: str | Path, folder: str | Path) -> tuple[Path, Path, Pat
 
 def _fingerprint(folder: Path) -> tuple[str, dict]:
     inputs = read_review_inputs(folder)
+    raw_recipe = _read_object(folder / "recipe.json")
+    if "pdf_pages" in raw_recipe:
+        inputs["recipe"]["pdf_pages"] = raw_recipe["pdf_pages"]
     return fingerprint_review_content(inputs), inputs
 
 
@@ -202,11 +235,15 @@ def _manifest_view(manifest: dict, selection: Path) -> dict:
         if not isinstance(relative, str) or Path(relative).is_absolute():
             raise ValueError("选图日志路径无效")
         result[field] = str(_inside(selection / relative, selection))
-    if result["status"] in {"ok", "needs_review"}:
+    if result["status"] in {"ok", "needs_review", "fallback"}:
         relative = result.get("image_path")
         if not isinstance(relative, str) or Path(relative).is_absolute():
             raise ValueError("选图图片路径无效")
         result["image_path"] = str(_image(selection / relative, selection, result.get("dimensions")))
+        if result.get("source_type") == "generated":
+            if result.get("timestamp") is not None or result.get("time_ranges") is not None:
+                raise ValueError("AI 生成图不能包含视频时间")
+            return result
         result["timestamp"] = _timestamp(result.get("timestamp"))
         if not _in_ranges(result["timestamp"], _time_ranges(result.get("time_ranges"))):
             raise ValueError("候选图片时间超出菜品视频范围")
@@ -222,7 +259,7 @@ def load_frame_candidate(out_dir: str | Path, folder: str | Path, *, include_sta
         path = _inside(selection / "candidates" / f"{key}.json", selection)
         manifest = _read_object(path)
         fingerprint, inputs = _fingerprint(folder)
-        time_ranges = _recipe_time_ranges(inputs["recipe"])
+        time_ranges = None if manifest.get("source_type") == "generated" else _recipe_time_ranges(inputs["recipe"])
         if (manifest.get("schema_version") != SCHEMA_VERSION
                 or manifest.get("folder") != folder.relative_to(root).as_posix()
                 or manifest.get("status") not in ("ok", "not_found", "needs_review")):
@@ -247,6 +284,12 @@ def load_frame_candidate(out_dir: str | Path, folder: str | Path, *, include_sta
 def validate_frame_environment(options: dict | None = None) -> dict:
     """Resolve an installed selector without starting it or downloading media."""
     options = normalize_frame_options(options)
+    if options["backend"] == "flux":
+        from .cover_generation import connection
+        connection()
+        return options
+    if options["backend"] == "remote":
+        return options
     script = frame_selection.TOOL_ROOT / "select_frame.py"
     model = Path(options["model"] or frame_selection.TOOL_ROOT / "models" / "Qwen2.5-VL-3B-Instruct").expanduser().resolve()
     try:
@@ -269,6 +312,8 @@ def _command(video: Path, output: Path, options: dict) -> list[str]:
               "--requirement", options["requirement"], "--model", options["model"]]
     for key in ("device", "threads", "interval", "coarse_limit", "fine_fps", "top_k", "fine_limit"):
         result.extend(("--" + key.replace("_", "-"), str(options[key])))
+    if options["allow_fallback"]:
+        result.append("--allow-fallback")
     return result
 
 
@@ -303,6 +348,7 @@ def _existing_video(folder: Path) -> Path | None:
             if path.is_file() and path.suffix.lower() not in (".part", ".ytdl", ".json"):
                 return _inside(path, folder)
     return None
+
 
 
 class _Progress:
@@ -502,8 +548,9 @@ def _validate_result(output: Path, video: Path, options: dict, exit_code: int,
     result = _read_object(path)
     status = result.get("status")
     if (result.get("schema_version") != SCHEMA_VERSION
-            or result.get("fallback") is not False
-            or status not in ("ok", "not_found", "needs_review")
+            or result.get("fallback") is not (status == "fallback")
+            or (status == "fallback" and not options.get("allow_fallback"))
+            or status not in ("ok", "not_found", "needs_review", "fallback")
             or exit_code != (2 if status == "not_found" else 0)):
         raise ValueError(f"选图退出码或结果状态异常：exit={exit_code}, status={status}")
     if result.get("input") != str(video) or result.get("requirement") != options["requirement"]:
@@ -513,7 +560,7 @@ def _validate_result(output: Path, video: Path, options: dict, exit_code: int,
     parameters = result.get("parameters") or {}
     if not isinstance(parameters, dict) or _time_ranges(parameters.get("time_ranges")) != time_ranges:
         raise ValueError("选图结果的视频时间范围与本次菜品不一致")
-    if status in {"ok", "needs_review"}:
+    if status in {"ok", "needs_review", "fallback"}:
         if not isinstance(result.get("image"), str) or not isinstance(result.get("selected"), dict):
             raise ValueError("选图结果缺少图片或所选帧")
         image = Path(result["image"])
@@ -530,7 +577,8 @@ def _validate_result(output: Path, video: Path, options: dict, exit_code: int,
                 or not isinstance(selected.get("judgment"), dict)):
             raise ValueError("所选帧的定位或匹配信息无效")
         judgment = selected["judgment"]
-        if status == "ok" and judgment.get("matches_requirement") is not True:
+        if ((status == "ok" and judgment.get("matches_requirement") is not True)
+                or (status == "fallback" and judgment.get("matches_requirement") is not False)):
             raise ValueError("所选帧的定位或匹配信息无效")
         if status == "needs_review" and not require_dish_assessment:
             raise ValueError("自定义选图要求未启用菜品待确认候选")
@@ -553,11 +601,18 @@ def generate_frame_candidate(folder: str | Path, *, out_dir: str | Path, options
                              progress: Callable[[dict], None] | None = None) -> dict:
     """Generate one independent candidate and atomically publish its manifest."""
     options = normalize_frame_options(options)
+    if options["backend"] == "flux":
+        from .cover_generation import generate
+        return generate(folder, out_dir=out_dir, options=options, progress=progress)
     root, folder, selection, key = _locations(out_dir, folder)
     fingerprint, inputs = _fingerprint(folder)
     recipe, source = inputs["recipe"], inputs["source"]
     time_ranges = _recipe_time_ranges(recipe)
     source_url = str(recipe.get("source_url") or source.get("webpage_url") or source.get("source_url") or source.get("url") or "")
+    from .frame_selection_pdf import is_pdf_source, prepare_pdf
+    pdf_source = is_pdf_source(source_url)
+    if pdf_source:
+        time_ranges = None
     run = _inside(selection / "runs" / key / uuid.uuid4().hex, selection)
     run.mkdir(parents=True, exist_ok=False)
     work = run / "download"
@@ -580,7 +635,7 @@ def generate_frame_candidate(folder: str | Path, *, out_dir: str | Path, options
         attempt["options"] = public_options
         atomic_write_json(run / "run.json", attempt, backup=False)
         effective_options = {**options, "requirement": effective_requirement}
-        command = _command(Path("/unused"), output, effective_options)
+        command = _command(Path("/unused"), output, effective_options) if options["backend"] == "local" else []
         if time_ranges is not None:
             ranges_path = run / "time-ranges.json"
             atomic_write_json(ranges_path, {"schema_version": 1, "ranges": time_ranges}, backup=False)
@@ -589,19 +644,41 @@ def generate_frame_candidate(folder: str | Path, *, out_dir: str | Path, options
             context_path = run / "dish-context.json"
             atomic_write_json(context_path, _dish_context(inputs), backup=False)
             command.extend(("--dish-context", str(context_path), "--review-uncertain"))
-        video = _existing_video(folder)
+        video = None if pdf_source else _existing_video(folder)
+        pdf_pages = []
         if video is None:
             if not source_url:
                 raise FrameSelectionError("菜谱没有本地视频或来源链接")
-            from .downloader import download_cover_video
-
             work.mkdir(exist_ok=False)
-            reporter.emit("downloading", "下载用于选图的视频")
-            video = _inside(Path(download_cover_video(source_url, work, cookies=options["cookies"])), work)
+            if pdf_source:
+                reporter.emit("downloading", "下载并渲染用于选图的 PDF")
+                video, pdf_pages = prepare_pdf(source_url, recipe, work)
+                effective_options.update(interval=1.0, coarse_limit=max(options["coarse_limit"], len(pdf_pages)))
+                options = {**options, **effective_options}
+                if options["backend"] == "local":
+                    command[command.index("--interval") + 1] = "1.0"
+                    command[command.index("--coarse-limit") + 1] = str(options["coarse_limit"])
+            else:
+                from .downloader import download_cover_video
+                reporter.emit("downloading", "下载用于选图的视频")
+                video = _inside(Path(download_cover_video(source_url, work, cookies=options["cookies"])), work)
             if not video.is_file():
                 raise FrameSelectionError("视频下载没有生成可读取的文件")
-        command[command.index("--input") + 1] = str(video)
-        exit_code = _run_selector(command, run, reporter)
+        remote = None
+        if options["backend"] == "remote":
+            from .frame_selection_remote import session
+            reporter.emit("loading", "连接远端按需模型会话")
+            try:
+                remote = session(options)
+            except Exception as exc:
+                raise FrameSelectionConfigurationError(str(exc)) from exc
+        if options["backend"] == "remote":
+            exit_code = remote.select(video, output, run, options,
+                _dish_context(inputs) if options["requirement"] == frame_selection.DEFAULT_REQUIREMENT else None,
+                time_ranges, reporter)
+        else:
+            command[command.index("--input") + 1] = str(video)
+            exit_code = _run_selector(command, run, reporter)
         if exit_code not in (0, 2):
             details = (run / "stderr.log").read_text(encoding="utf-8", errors="replace")[-4000:]
             error_class = FrameSelectionConfigurationError if any(marker in details for marker in (
@@ -613,17 +690,30 @@ def generate_frame_candidate(folder: str | Path, *, out_dir: str | Path, options
         result = _validate_result(output, video, effective_options, exit_code,
                                   require_dish_assessment=options["requirement"] == frame_selection.DEFAULT_REQUIREMENT,
                                   time_ranges=time_ranges)
+        if pdf_pages and result.get("timestamp") is not None:
+            index = int(result["timestamp"])
+            if not 0 <= index < len(pdf_pages):
+                raise FrameSelectionError("PDF 所选页面超出本次候选范围")
+            page = pdf_pages[index]
+            shutil.copyfile(page["path"], result["image"])
+            result.update(page_number=page["page_number"], source_type="pdf",
+                          dimensions=page["dimensions"])
+            _image(Path(result["image"]), output, result["dimensions"])
+            atomic_write_json(output / "result.json", result, backup=False)
         current, _ = _fingerprint(folder)
         if current != fingerprint:
             raise FrameSelectionError("选图期间菜谱、字幕或来源已改变，结果未应用")
-        manifest = {"schema_version": SCHEMA_VERSION, "status": result["status"],
+        manifest = {"schema_version": SCHEMA_VERSION, "status": "needs_review" if result["status"] == "fallback" else result["status"],
                     "selection_strategy_version": SELECTION_STRATEGY_VERSION,
                     "time_ranges": time_ranges,
                     "folder": folder.relative_to(root).as_posix(), "fingerprint": fingerprint,
                     "title": str(recipe.get("title") or folder.name), "source_url": source_url,
                     "image_path": Path(result["image"]).relative_to(selection).as_posix() if result.get("image") else None,
                     "timestamp": result["timestamp"], "dimensions": result["dimensions"],
-                    "reason": result["reason"], "generated_at": _now(), "options": public_options,
+                    "page_number": result.get("page_number"),
+                    "source_type": "pdf" if pdf_source else "video",
+                    "fallback": result.get("fallback", False),
+                    "reason": ("降级候选（未完全符合要求）：" if result.get("fallback") else "") + result["reason"], "generated_at": _now(), "options": public_options,
                     "run_id": run.name, "run_dir": run.relative_to(selection).as_posix(),
                     "result_path": (output / "result.json").relative_to(selection).as_posix(),
                     "stdout_path": (run / "stdout.log").relative_to(selection).as_posix(),

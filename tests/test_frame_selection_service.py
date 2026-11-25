@@ -608,7 +608,7 @@ def test_relative_python_override_preserves_virtual_environment_path(setup, monk
     assert command[0] == sys.executable
 
 
-@pytest.mark.parametrize("options", [{"allow_fallback": True}, {"coarse_limit": 1}, {"fine_limit": 0}, {"threads": True}, {"interval": float("inf")}, {"device": "auto"}, {"keep_video": "yes"}, {"requirement": " "}])
+@pytest.mark.parametrize("options", [{"allow_fallback": "yes"}, {"coarse_limit": 1}, {"fine_limit": 0}, {"threads": True}, {"interval": float("inf")}, {"device": "auto"}, {"keep_video": "yes"}, {"requirement": " "}])
 def test_invalid_options_fail_before_work(options):
     with pytest.raises(ValueError):
         service.normalize_frame_options(options)
@@ -687,3 +687,75 @@ def test_parent_death_stops_model_and_allows_safe_restart(setup, tmp_path):
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5)
+
+def test_remote_backend_uses_service_validation_and_publishes_fallback_for_review(setup, monkeypatch):
+    root, folder, _, scenario = setup
+    before = {str(p):p.read_bytes() for p in folder.rglob('*') if p.is_file()}
+    from bili_recipe_notes import frame_selection_remote
+    calls=[]
+    class Remote:
+        def select(self, video, output, run, options, context, ranges, progress):
+            from PIL import Image
+            calls.append((context, ranges, options))
+            output.mkdir()
+            image=output/'best_frame.png'
+            Image.new('RGB',(24,12)).save(image)
+            result=dict(schema_version=1,status='fallback',fallback=True,input=str(video),
+                requirement=options['requirement'],metadata=str(output/'result.json'),image=str(image),
+                dimensions=[24,12],reason='closest frame, still cooking',parameters={'time_ranges':None},
+                selected=dict(relative_timestamp_seconds=2.5,timestamp_seconds=2.5,frame_index=25,
+                    pts=2500,time_base='1/1000',judgment=dict(matches_requirement=False,decision='reject',
+                    dish_assessment=dict(food_visible=True,completion='cooking',identity='uncertain',
+                        presentation='process',constraints_satisfied=True))))
+            (output/'result.json').write_text(json.dumps(result))
+            (run/'stdout.log').write_text('');(run/'stderr.log').write_text('')
+            return 0
+    monkeypatch.setattr(frame_selection_remote,'session',lambda options:Remote())
+    options=dict(backend='remote',remote_host='user@host',allow_fallback=True)
+    result=service.generate_frame_candidate(folder,out_dir=root,options=options)
+    assert result['status']=='needs_review' and result['fallback'] is True
+    assert service.load_frame_candidate(root,folder)['fallback'] is True
+    assert calls[0][0]['dish_title']=='合成菜谱'
+    assert calls[0][2]['coarse_limit']==24 and calls[0][2]['fine_limit']==8
+    assert before=={str(p):p.read_bytes() for p in folder.rglob('*') if p.is_file()}
+
+
+def test_fallback_option_is_explicit(setup):
+    _,_,options,_=setup
+    assert '--allow-fallback' in service._command(Path('/video'),Path('/output'),{**options,'allow_fallback':True})
+    assert '--allow-fallback' not in service._command(Path('/video'),Path('/output'),options)
+
+
+@pytest.mark.parametrize("remote", [False, True])
+def test_pdf_official_selection_preserves_sources_and_page_number(setup, monkeypatch, remote):
+    from reportlab.pdfgen.canvas import Canvas
+    root, folder, options, scenario = setup
+    pdf = root / 'book.pdf'
+    canvas = Canvas(str(pdf), pagesize=(75, 100))
+    for number in range(4):
+        canvas.drawString(5, 50, str(number))
+        canvas.showPage()
+    canvas.save()
+    recipe_path = folder / 'recipe.json'
+    recipe = json.loads(recipe_path.read_text())
+    recipe.update(source_url=pdf.as_uri().replace('file:', 'pdf:') + '#page=2',
+                  pdf_pages={'start': 2, 'end': 4})
+    recipe_path.write_text(json.dumps(recipe))
+    before = _snapshot(folder)
+    if remote:
+        from bili_recipe_notes import frame_selection_remote
+        class Remote:
+            def select(self, video, output, run, remote_options, context, ranges, reporter):
+                assert remote_options["interval"] == 1.0
+                assert ranges is None
+                command = service._command(video, output, {**options, "requirement": remote_options["requirement"]})
+                command.extend(["--dish-context", str(run / "dish-context.json")])
+                return service._run_selector(command, run, reporter)
+        monkeypatch.setattr(frame_selection_remote, "session", lambda _: Remote())
+        options = {**options, "backend": "remote", "remote_host": "user@host"}
+    result = service.generate_frame_candidate(folder, out_dir=root, options=options)
+    assert result['page_number'] == 4
+    assert result['source_type'] == 'pdf'
+    assert result['dimensions'] != [24, 12]
+    assert _snapshot(folder) == before
+    assert not (Path(result['run_dir']) / 'download').exists()

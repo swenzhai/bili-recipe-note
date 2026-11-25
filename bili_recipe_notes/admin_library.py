@@ -186,7 +186,7 @@ def create_router(ctx: AdminContext) -> APIRouter:
         policy = ctx.store.recipe_visibility_states([folder]).get(str(folder), {})
         candidate = load_frame_candidate(ctx.root, folder, include_stale=True)
         if candidate:
-            candidate = {key: candidate.get(key) for key in ("status", "timestamp", "reason", "dimensions", "run_id", "fingerprint")}
+            candidate = {key: candidate.get(key) for key in ("status", "timestamp", "reason", "dimensions", "run_id", "fingerprint", "source_type", "synthetic", "label", "page_number")}
             if candidate["status"] in {"ok", "needs_review"}:
                 image = load_frame_candidate(ctx.root, folder)
                 candidate["url"] = media_url(recipe_id, "ai", str(image.get("run_id", "")))
@@ -309,6 +309,9 @@ def create_router(ctx: AdminContext) -> APIRouter:
                     if _frame_revision(candidate, content) != body.candidate_revision:
                         raise HTTPException(409, "AI 候选已更新，请刷新后重新裁剪")
                     timestamp, label = candidate.get("timestamp"), "AI 候选，经人工裁剪确认"
+                    if candidate.get("source_type") == "generated":
+                        label = "AI 生成示意图（非实拍），经人工裁剪确认"
+                        source_kind = "ai_generated"
                 elif body.source.startswith("candidate-"):
                     token = body.source[10:]
                     if len(token) != 32 or not all(ch in "0123456789abcdef" for ch in token):
@@ -343,7 +346,7 @@ def create_router(ctx: AdminContext) -> APIRouter:
                     raise HTTPException(422, "裁剪范围超出图片")
                 content = crop_screenshot_box_content(content, crop)
                 save_recipe_cover_content(folder, content, timestamp=timestamp, status="manual_crop",
-                                          source_kind=source_kind, source_label=label, source_url=recipe.get("source_url"),
+                                          source_kind=source_kind, source_label=label, source_url=None if source_kind == "ai_generated" else recipe.get("source_url"),
                                           source_step_index=step_index, original_size={"width": width, "height": height}, crop_box=crop)
         warning = ctx.index_after_save()
         return {**detail(recipe_id), "sync_warning": warning}

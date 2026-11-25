@@ -203,3 +203,37 @@ test("recipe cards expose independent menu and visibility states with direct det
   assert.doesNotMatch(html, /菜单在售/);
   assert.equal(taskPath({ kind: "frames", id: "a/b" }), "/tasks?kind=frames&id=a%2Fb");
 });
+
+const { default: FrameEstimate, estimateFrameTime, frameBenchmarks } = await import(await compiledModule("FrameEstimate.tsx"));
+test("frame experience estimate respects queue size, quota and unknown hardware", () => {
+  assert.equal(estimateFrameTime('cpu', 500, 10, 24, 8), null);
+  assert.equal(estimateFrameTime('3080ti', 500, 10, 24, 8), null);
+  assert.equal(estimateFrameTime('a30', 500, 10, 24, 8), null);
+  const batch = estimateFrameTime('a100-vllm', 500, 10, 24, 8);
+  assert.equal(batch.batch, 3037.3);
+  assert.equal(batch.total, 151865);
+  assert.equal(estimateFrameTime('a100-vllm', 3, 10, 24, 8).count, 3);
+  assert.equal(estimateFrameTime('a100-vllm', 500, 0, 24, 8).count, 500);
+  assert.equal(estimateFrameTime('a100-vllm', null, 0, 24, 8).batch, null);
+  assert.equal(estimateFrameTime('a100-vllm', null, 10, 24, 8).total, null);
+  assert.equal(estimateFrameTime('a100-vllm', 0, 10, 24, 8).batch, 0);
+  assert.equal(estimateFrameTime('cpu', 10, 0, 24, 8, 30).batch, 18000);
+  assert.equal(estimateFrameTime('cpu', 10, 0, 48, 16, 30).batch, 36000);
+  for (const bad of [NaN, Infinity, -1, 0]) assert.equal(estimateFrameTime('cpu', 10, 10, 24, 8, bad), null);
+  assert.equal(estimateFrameTime('a100-vllm', 10, -1, 24, 8), null);
+  assert.equal(estimateFrameTime('a100-vllm', 10, 1, 1, 8), null);
+  assert.equal(frameBenchmarks.find(x => x.id === 'a100-vllm').samples, 44);
+});
+test("pre-start estimate does not pretend to detect or change actual hardware", () => {
+  const html = renderToStaticMarkup(React.createElement(FrameEstimate, { total: 500, runLimit: 10 }));
+  assert.match(html, /启动前 · 经验耗时预估/);
+  assert.match(html, /暂无可信耗时估计/);
+  assert.match(html, /不会切换任务/);
+  assert.match(html, /CPU/);
+});
+
+test('generated covers are labeled synthetic and have no video timestamp', () => {
+  const candidates = aiFrameCandidates({status:'needs_review', source_type:'generated', url:'/image', timestamp:null, candidate_revision:'r'});
+  assert.equal(candidates[0].label, 'AI 生成示意图 · 非实拍');
+  assert.equal(candidates[0].timestamp, null);
+});

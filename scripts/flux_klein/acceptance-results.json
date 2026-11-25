@@ -1,0 +1,36 @@
+{
+  "text_to_image": {
+    "job_id": "f386404b09b44aa589f7935180a61ba5",
+    "status": "completed",
+    "model": "black-forest-labs/FLUX.2-klein-4B",
+    "gpu": "NVIDIA A30",
+    "load_seconds": 5.540059198858216,
+    "total_seconds": 79.2022810250055,
+    "images": [
+      {
+        "file": "image-0.png",
+        "seconds": 73.66219358681701,
+        "seed": 42
+      }
+    ],
+    "peak_allocated_mib": 7995.76611328125,
+    "http_seconds": 87.07354622101411
+  },
+  "image_edit": {
+    "job_id": "2ccee94200db445da2f79e066f1f3537",
+    "status": "completed",
+    "model": "black-forest-labs/FLUX.2-klein-4B",
+    "gpu": "NVIDIA A30",
+    "load_seconds": 1.527811705833301,
+    "total_seconds": 31.594197667902336,
+    "images": [
+      {
+        "file": "image-0.png",
+        "seconds": 30.01753907906823,
+        "seed": 43
+      }
+    ],
+    "peak_allocated_mib": 9451.6318359375,
+    "http_seconds": 39.769899029051885
+  }
+}

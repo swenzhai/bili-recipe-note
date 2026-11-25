@@ -150,9 +150,21 @@ def summarize(kind: str, state: dict, *, detail: bool = False, log: str = "") ->
             remaining = min(remaining, max(0, run_limit - run_processed))
         eta = run_elapsed / run_processed * remaining if active and run_elapsed and run_processed else None
     options = state.get("options") or {"provider": state.get("provider"), **state.get("llm_options", {})}
+    if kind == "frames" and options.get("backend") == "flux" and active:
+        durations = []
+        for item in items:
+            if item.get("status") != "needs_review":
+                continue
+            start, end = _stamp(item.get("started_at")), _stamp(item.get("finished_at"))
+            if start and end:
+                durations.append(max(1, (end-start).total_seconds()))
+        remaining = sum(item.get("status") in {"pending", "running"} for item in items)
+        if run_limit:
+            remaining = min(remaining, max(0, run_limit-run_processed))
+        eta = remaining * (sum(durations)/len(durations) if durations else 90)
     resumable = any(item.get("status") in {"pending", "running"}
                     and not (scoped_retry and item.get("folder") in state.get("run_targets", [])) for item in items)
-    result = {"id": state["batch_id"], "kind": kind, "title": KINDS[kind], "status": status,
+    result = {"id": state["batch_id"], "kind": kind, "title": "AI 生成示意封面" if kind == "frames" and options.get("backend") == "flux" else KINDS[kind], "status": status,
               "total": total, "processed": processed, "completed": completed, "failed": failed,
               "skipped": skipped, "not_found": not_found, "needs_review": needs_review,
               "pending": pending, "run_limit": run_limit, "run_processed": run_processed,

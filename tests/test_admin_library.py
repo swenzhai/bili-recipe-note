@@ -339,3 +339,22 @@ def test_ai_candidate_replacement_requires_refresh_even_with_same_pixels(library
     response = client.post(ROOT + f"/recipes/{recipe_id}/cover", json={"revision": detail["revision"], "source": "ai", "candidate_revision": detail["frame_candidate"]["candidate_revision"]})
     assert response.status_code == 409
     assert (folder / "recipe.json").read_bytes() == original
+
+
+def test_generated_candidate_confirmation_keeps_synthetic_provenance(library):
+    app, client, folder, recipe_id = library
+    path, _ = synthetic_uncertain_frame(app, folder)
+    manifest=json.loads(path.read_text())
+    manifest.update(source_type='generated', synthetic=True, timestamp=None, time_ranges=None)
+    path.write_text(json.dumps(manifest))
+    detail=client.get(ROOT+f'/recipes/{recipe_id}').json()
+    candidate=detail['frame_candidate']
+    assert candidate['source_type']=='generated' and candidate['timestamp'] is None
+    response=client.post(ROOT+f'/recipes/{recipe_id}/cover',json={
+        'revision':detail['revision'],'source':'ai','candidate_revision':candidate['candidate_revision']})
+    assert response.status_code==200, response.text
+    value=json.loads((folder/'recipe.json').read_text())
+    assert value['cover_source_kind']=='ai_generated'
+    assert '非实拍' in value['cover_source_label']
+    assert value['cover_source_url'] is None
+    assert value['cover_image_time'] is None
