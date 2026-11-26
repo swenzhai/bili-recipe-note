@@ -30,3 +30,5 @@ tail -f /data04/swenz/flux-klein/logs/service.log
 真实 HTTP API：文生图和单参考图编辑均成功（1024×1024，4 步，A30 动态选卡）。文生图 HTTP 87.07 秒，模型加载与推理 79.20 秒；编辑 HTTP 39.77 秒，模型加载与推理 31.59 秒。峰值 PyTorch 分配显存分别 7996 / 9452 MiB，不含全部 CUDA 开销。单次冷启动数据不可外推为稳定吞吐。详情见 `acceptance-results.json`。
 
 目视检查：生成了番茄和鸡蛋的白盘照片；编辑保留主体布局并换成蓝盘、浅色木桌面。不过番茄呈生切片外观，仍需菜谱做法一致性审核，不能因图片美观就自动确认封面。任务结束后 A30 显存恢复到 1 MiB。服务存储约 15 GiB，原菜谱未修改。
+
+连续 HTTP 请求现在复用持久 worker，保留官方 CPU offload；结果记录 worker_pid、session_request 和 load_seconds。队列暂停/结束调用认证的 POST /release；空闲 120 秒或父进程退出自动释放 GPU 锁与显存。

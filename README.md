@@ -746,6 +746,6 @@ chmod +x package-ui-mac.command
 
 复用正式封面持久队列，支持执行数量限制、暂停、续跑和失败重试，单条失败继续下一道。默认保留人工确认封面。生成结果独立存储在 `.frame-selection/runs/`，新结果成为最新候选，旧候选文件仍保留；不会自动写入菜谱封面。到“审核工作台 → 成品图”核对标有“AI 生成示意图 · 非实拍”的图片，再裁剪确认。确认后的来源保留 `ai_generated` 标记和非实拍说明。
 
-后端从当前数据目录 `state/cover-generation.json` 读取 `url` 和 `token`，也支持 `BILI_COVER_GENERATION_URL` / `BILI_COVER_GENERATION_TOKEN` 环境变量。配置文件权限应为 600；令牌不传给前端、不写入任务记录。当前连接 `http://10.21.176.48:8766`，配置文件已在本机设置。服务端部署见 [Klein 服务说明](scripts/flux_klein/README.md)。远端每道请求加载模型，完成后释放显存；不承诺整个菜谱批次保持显存驻留。
+后端从当前数据目录 `state/cover-generation.json` 读取 `url` 和 `token`，也支持 `BILI_COVER_GENERATION_URL` / `BILI_COVER_GENERATION_TOKEN` 环境变量。配置文件权限应为 600；令牌不传给前端、不写入任务记录。当前连接 `http://10.21.176.48:8766`，配置文件已在本机设置。服务端部署见 [Klein 服务说明](scripts/flux_klein/README.md)。远端连续请求复用同一模型进程，队列结束或暂停主动释放；连接异常或无请求 120 秒后自动释放。
 
 生成封面默认优先使用已有封面作参考，无图时自动改为文生图；覆盖所有可展示菜品（含手动下架），已有人工封面仅作为参考，不自动替换。AI 来源标记保存在候选记录、PNG 元数据和人工确认后的 cover_source_kind=ai_generated 字段中，不在图片像素上叠加标签。提示词明确禁止生成文字，并要求去除参考图中的字幕、包装文字和水印；模型仍可能不完全遵循，需在确认封面时检查。任务详情按成功条目的实测耗时估计剩余时间，首条完成前采用 90 秒/道经验值；无空闲 GPU 时暂停，可稍后恢复。

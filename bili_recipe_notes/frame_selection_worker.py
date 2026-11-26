@@ -32,6 +32,15 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             return 1
     finally:
+        try:
+            from .storage import read_json
+            from pathlib import Path
+            state_record = read_json(Path(root) / '.frame-selection' / 'tasks' / (batch_id + '.json'), expected_type=dict)
+            if state_record.get('options', {}).get('backend') == 'flux':
+                from .cover_generation import request
+                request('/release', {})
+        except Exception as exc:
+            print('生成模型释放请求未成功，将由服务空闲超时释放：' + str(exc), file=sys.stderr)
         from .frame_selection_remote import close_sessions
         try:
             close_sessions()

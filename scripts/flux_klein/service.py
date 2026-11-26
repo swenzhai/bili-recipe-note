@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import uuid
+import time
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -17,6 +18,40 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parent
 TOKEN = (ROOT / 'api-token').read_text().strip()
 LOCK = threading.Lock()
+WORKER = None
+WORKER_LOG = None
+
+def close_worker():
+    global WORKER, WORKER_LOG
+    if WORKER is not None:
+        if WORKER.stdin: WORKER.stdin.close()
+        try: WORKER.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            WORKER.kill(); WORKER.wait()
+        WORKER = None
+    if WORKER_LOG is not None:
+        WORKER_LOG.close(); WORKER_LOG = None
+
+def run_job(job):
+    global WORKER, WORKER_LOG
+    if WORKER is None or WORKER.poll() is not None:
+        close_worker()
+        WORKER_LOG = (job/'worker.log').open('w')
+        WORKER = subprocess.Popen([sys.executable,str(ROOT/'worker.py')], stdin=subprocess.PIPE,
+            stdout=WORKER_LOG, stderr=subprocess.STDOUT, text=True)
+    try:
+        WORKER.stdin.write(str(job)+'\n'); WORKER.stdin.flush()
+        deadline = time.monotonic()+1800
+        while not (job/'result.json').exists():
+            if (job/'error.json').exists() or WORKER.poll() is not None:
+                raise HTTPException(503, {'job_id':job.name,'error':'Model worker unavailable; check server logs'})
+            if time.monotonic()>deadline:
+                raise HTTPException(504, 'Generation timed out')
+            time.sleep(0.2)
+    except BaseException:
+        close_worker()
+        raise
+
 app = FastAPI(title='FLUX.2 Klein 4B cover generation')
 
 def auth(authorization: str = Header(default='')):
@@ -57,13 +92,7 @@ def generate(body: Generate):
             name=f'reference-{index}.png'; image.save(job/name); refs.append(name)
         data=body.model_dump(exclude={'reference_images'});data['reference_files']=refs
         (job/'request.json').write_text(json.dumps(data,ensure_ascii=False))
-        with (job/'worker.log').open('w') as log:
-            result=subprocess.run([sys.executable,str(ROOT/'worker.py'),str(job)],
-                                  stdout=log,stderr=subprocess.STDOUT,timeout=1800)
-        if result.returncode:
-            message=(job/'worker.log').read_text(errors='replace')[-2000:]
-            raise HTTPException(503 if 'No idle GPU' in message else 500,
-                                {'job_id':job_id,'error':message})
+        run_job(job)
         return {'job_id':job_id,**json.loads((job/'result.json').read_text())}
     except subprocess.TimeoutExpired as exc:
         raise HTTPException(504,'Generation exceeded 30 minutes; worker terminated') from exc
@@ -77,3 +106,13 @@ def image(job_id: str,index: int):
     path=ROOT/'outputs'/job_id/f'image-{index}.png'
     if not path.is_file():raise HTTPException(404)
     return FileResponse(path, media_type='image/png')
+
+@app.post('/release', dependencies=[Depends(auth)])
+def release():
+    if not LOCK.acquire(blocking=False):
+        raise HTTPException(409, 'Generator is busy')
+    try:
+        close_worker()
+        return {'status':'released'}
+    finally:
+        LOCK.release()
