@@ -82,7 +82,7 @@ def test_http_error_does_not_leak_server_response(monkeypatch):
     assert '显卡' in str(error.value) and 'secret' not in str(error.value)
 
 
-def test_generated_image_has_visible_label_and_auto_reference_fallback(tmp_path, monkeypatch):
+def test_generated_image_has_metadata_only_and_auto_reference_fallback(tmp_path, monkeypatch):
     recipe(tmp_path, 'dish')
     calls = fake_service(monkeypatch)
     result = service.generate_frame_candidate(tmp_path/'dish', out_dir=tmp_path, options={
@@ -91,4 +91,6 @@ def test_generated_image_has_visible_label_and_auto_reference_fallback(tmp_path,
     assert result['label'] == 'AI生成示意图（非实拍）'
     with Image.open(result['image_path']) as image:
         assert 'AI generated' in image.info['Source']
-        assert image.getpixel((25,990)) != image.getpixel((25,900))
+        assert image.getpixel((25,990)) == image.getpixel((25,900))
+    assert 'no visible text' in calls[0][1]['prompts'][0]
+    assert 'remove all of them' in calls[0][1]['prompts'][0]
